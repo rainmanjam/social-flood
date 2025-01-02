@@ -1,0 +1,20 @@
+fastapi
+uvicorn
+requests
+pydantic
+pytest
+celery
+redis
+psycopg2-binary  # PostgreSQL adapter
+qdrant-client
+loguru  # Logging
+docker  # For Docker operations
+trendspy
+gnews
+newspaper4k
+lxml_html_clean
+selectolax
+nltk
+httpx
+asyncio
+email-validator

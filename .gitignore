@@ -1,0 +1,90 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environment
+venv/
+.env
+.venv/
+ENV/
+env.bak/
+env/
+
+# VS Code settings
+.vscode/
+
+# Pytest cache and testing results
+.cache/
+.pytest_cache/
+
+# MyPy cache
+.mypy_cache/
+
+# Caches
+*.log
+*.tmp
+
+# IDE specific
+.idea/
+*.swp
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Docker files
+*.env
+docker-compose.override.yml
+
+# FastAPI / Uvicorn logs
+*.log
+logs/
+
+# Database
+*.db
+*.sqlite3
+
+# Redis dump files
+dump.rdb
+
+# Configurations and Keys
+config/config.py  # Assuming sensitive information is here
+
+# Environment variable files
+*.env
+!.env.*
+
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# macOS files
+.DS_Store
+
+# Testing outputs
+test_output/

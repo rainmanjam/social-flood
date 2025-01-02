@@ -1,0 +1,12 @@
+# .dockerignore
+.env
+__pycache__
+*.pyc
+.git
+.gitignore
+.vscode
+.DS_Store
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+venv/
