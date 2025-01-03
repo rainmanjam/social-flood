@@ -1,10 +1,12 @@
-# main.py
 from fastapi import FastAPI, Depends, Request
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError, HTTPException
+
 from app.api.google_news.google_news_api import gnews_router, setup_nltk
+from app.api.google_trends.google_trends_api import google_trends_router
 from app.core.auth import get_api_key
 
+# Create the FastAPI app
 app = FastAPI(
     title="Social Flood",
     description="This API allows you to reference endpoints from social platforms.",
@@ -21,19 +23,31 @@ app = FastAPI(
     },
 )
 
-@app.on_event("startup")
+# Startup event to load any dependencies or data
 async def on_startup():
     await setup_nltk()
 
-# Register the routers with API key dependency
+app.add_event_handler("startup", on_startup)
+
+# Include the Google News router
 app.include_router(
     gnews_router,
+    prefix="/google-news",
     tags=["Google News API"],
     dependencies=[Depends(get_api_key)]
 )
 
-# Global exception handlers
+# Include the Google Trends router, mounted at /google-trends
+app.include_router(
+    google_trends_router,
+    prefix="/google-trends",
+    tags=["Google Trends API"],
+    dependencies=[Depends(get_api_key)]
+)
 
+# -------------------------------------------------------------------------
+# Exception Handlers
+# -------------------------------------------------------------------------
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(
@@ -54,3 +68,10 @@ async def general_exception_handler(request: Request, exc: Exception):
         status_code=500,
         content={"detail": "Internal Server Error"},
     )
+
+# -------------------------------------------------------------------------
+# Run the application
+# -------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

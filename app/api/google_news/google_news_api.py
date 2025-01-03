@@ -267,21 +267,21 @@ async def get_gnews_instance(
 # -----------------------------------------------------------------------------
 # Endpoints
 # -----------------------------------------------------------------------------
-@gnews_router.get("/google-news/available-languages/", summary="Get Available Languages")
+@gnews_router.get("/available-languages/", summary="Get Available Languages")
 async def get_languages():
     """
     Get a list of available languages for Google News.
     """
     return {"available_languages": AVAILABLE_LANGUAGES}
 
-@gnews_router.get("/google-news/available-countries/", summary="Get Available Countries")
+@gnews_router.get("/available-countries/", summary="Get Available Countries")
 async def get_available_countries():
     """
     Get a list of available countries for Google News.
     """
     return {"available_countries": AVAILABLE_COUNTRIES}
 
-@gnews_router.get("/google-news/search/", summary="Search Google News")
+@gnews_router.get("/search/", summary="Search Google News")
 async def search_google_news(
     query: str,
     language: str = Query("en", description="Language for the news results."),
@@ -340,7 +340,7 @@ async def search_google_news(
         logger.error(f"Error fetching Google News for query '{query}': {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
-@gnews_router.get("/google-news/top/", summary="Get Top Google News")
+@gnews_router.get("/top/", summary="Get Top Google News")
 async def get_top_google_news(
     language: str = Query("en", description="Language for the news results."),
     country: str = Query("US", description="Country for the news results."),
@@ -384,7 +384,7 @@ async def get_top_google_news(
         logger.error(f"Error fetching top Google News: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
-@gnews_router.get("/google-news/topic/", summary="Get Google News by Topic")
+@gnews_router.get("/topic/", summary="Get Google News by Topic")
 async def get_news_by_topic(
     topic: str,
     language: str = Query("en", description="Language for the news results."),
@@ -444,7 +444,7 @@ async def get_news_by_topic(
         logger.error(f"Error fetching Google News for topic '{topic}': {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
-@gnews_router.get("/google-news/location/", summary="Get Google News by Location")
+@gnews_router.get("/location/", summary="Get Google News by Location")
 async def get_news_by_location(
     location: str,
     language: str = Query("en", description="Language for the news results."),
@@ -499,7 +499,7 @@ async def get_news_by_location(
         logger.error(f"Error fetching Google News for location '{location}': {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
-@gnews_router.get("/google-news/source/", summary="Get Google News by Source")
+@gnews_router.get("/source/", summary="Get Google News by Source")
 async def get_news_by_source(
     source: str = Query(..., description="Source domain or full URL (e.g., 'msnbc.com' or 'https://www.msnbc.com')"),
     language: str = Query("en", description="Language for the news results."),
@@ -581,7 +581,7 @@ async def get_news_by_source(
         logger.error(f"Unexpected error fetching Google News for source '{source}': {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
-@gnews_router.get("/google-news/articles/", summary="Get Google News Articles in Bulk")
+@gnews_router.get("/articles/", summary="Get Google News Articles in Bulk")
 async def get_google_news_articles(
     query: str = Query("news", description="Search query for the news articles."),
     country: str = Query("US", description="Country for the news results."),
@@ -626,7 +626,7 @@ async def get_google_news_articles(
         logger.error(f"Error fetching Google News articles: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
-@gnews_router.get("/google-news/article-details/", summary="Get Article Details")
+@gnews_router.get("/article-details/", summary="Get Article Details")
 async def get_article_details(url: str):
     """
     Get detailed information about a specific article.
