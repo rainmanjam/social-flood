@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError, HTTPException
 
 from app.api.google_news.google_news_api import gnews_router, setup_nltk
+from app.api.google_autocomplete.google_autocomplete_api import router as google_autocomplete_router
 from app.api.google_trends.google_trends_api import google_trends_router
 from app.api.youtube_transcripts.youtube_transcripts_api import youtube_transcripts_router
 from app.core.auth import get_api_key
@@ -43,6 +44,13 @@ app.include_router(
     google_trends_router,
     prefix="/google-trends",
     tags=["Google Trends API"],
+    dependencies=[Depends(get_api_key)]
+)
+
+app.include_router(
+    google_autocomplete_router,
+    prefix="/google-search", 
+    tags=["Google Search"],
     dependencies=[Depends(get_api_key)]
 )
 
