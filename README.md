@@ -8,7 +8,7 @@
 
 - **Google Ads API (coming soon)**: Manage and retrieve detailed data on ad accounts, ad groups, conversions, campaigns, and more.
 - **Google News API**: Fetch, decode, and analyze news articles categorized by topics, regions, or sources.
-- **Google Trends API (coming soon)**: Analyze search trends over time, by region, and by related queries or topics.
+- **Google Trends API**: Analyze search trends over time, by region, and by related queries or topics.
 - **Proxy Support**: Configurable proxies enhance security and manage network requests.
 - **Asynchronous Database Access (coming soon)**: Efficiently manage data with async SQLAlchemy.
 - **CLI Access**: Quickly interact with Google Trends data via the command-line interface.
