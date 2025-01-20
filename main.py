@@ -12,7 +12,7 @@ from app.core.auth import get_api_key
 app = FastAPI(
     title="Social Flood",
     description="This API allows you to reference endpoints from social platforms.",
-    version="1.0.0",
+    version="0.0.1",
     terms_of_service="https://socialflood.com/terms/",
     contact={
         "name": "API Support",
@@ -23,6 +23,16 @@ app = FastAPI(
         "name": "Apache 2.0",
         "url": "http://www.apache.org/licenses/LICENSE-2.0.html",
     },
+    docs_url="/docs",                     # URL for the interactive docs
+    redoc_url="/redoc",                   # URL for the ReDoc docs
+    openapi_url="/openapi.json",          # URL for the OpenAPI schema
+    openapi_tags=[                        # Custom tags for grouping endpoints
+        {
+            "name": "users",
+            "description": "Operations with users."
+        }
+    ],
+    debug=True
 )
 
 # Startup event to load any dependencies or data
