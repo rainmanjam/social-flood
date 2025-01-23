@@ -60,14 +60,14 @@ app.include_router(
 app.include_router(
     google_autocomplete_router,
     prefix="/google-search", 
-    tags=["Google Search"],
+    tags=["Google Search API"],
     dependencies=[Depends(get_api_key)]
 )
 
 app.include_router(
     youtube_transcripts_router,
     prefix="/youtube-transcripts", 
-    tags=["YouTube Transcripts"],
+    tags=["YouTube Transcripts API"],
     dependencies=[Depends(get_api_key)]
 )
 
