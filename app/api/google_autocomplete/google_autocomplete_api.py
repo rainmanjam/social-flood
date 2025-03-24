@@ -32,10 +32,6 @@ logging.basicConfig(level=logging.INFO)
 async def generate_keywords(
     input_keyword: str = Query(..., description="Base keyword to generate variations."),
     input_country: str = Query("US", description="Country code for Google Autocomplete."),
-    use_proxy: Optional[bool] = Query(
-        False,
-        description="Enable or disable the use of proxy service for this request. Defaults to disabled."
-    ),
     output: OutputFormat = Query(
         ..., 
         description="Output format for Google Autocomplete. Allowed values: 'firefox', 'toolbar', 'chrome', 'xml', 'safari', 'opera'."
@@ -60,7 +56,6 @@ async def generate_keywords(
 
     - **input_keyword**: The base keyword for which variations are to be generated.
     - **input_country**: The country code to tailor autocomplete suggestions.
-    - **use_proxy**: Optional boolean to enable/disable proxy usage for this request.
     - **output**: The desired output format for the autocomplete response. Allowed values: 'firefox', 'toolbar', 'chrome', 'xml', 'safari', 'opera'.
     - **spell**: Controls spell-checking in autocomplete suggestions. `1` to enable, `0` to disable.
     - **hl**: The UI language setting (e.g., English, Spanish). Example: &hl=en or &hl=es
@@ -71,10 +66,11 @@ async def generate_keywords(
         if output not in OutputFormat:
             raise HTTPException(status_code=400, detail="Invalid output format.")
         
-        # Determine whether to use proxy based on the 'use_proxy' parameter
-        proxy_url = await get_proxy() if use_proxy else None
-        if use_proxy and proxy_url:
-            logger.debug(f"Proxy enabled for this request: {proxy_url}")
+        # Always get proxy configuration from environment variables
+        proxy_url = await get_proxy()
+        
+        if proxy_url:
+            logger.debug(f"Using proxy from environment settings: {proxy_url}")
             headers = {}
             mounts = {
                 "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
@@ -82,10 +78,7 @@ async def generate_keywords(
             }
             client = httpx.AsyncClient(mounts=mounts, follow_redirects=True, headers=headers)
         else:
-            if use_proxy:
-                logger.warning("Proxy was requested but no proxy URL is available. Proceeding without proxy.")
-            else:
-                logger.debug("Proxy disabled for this request.")
+            logger.debug("No proxy configured in environment. Proceeding without proxy.")
             client = httpx.AsyncClient(follow_redirects=True)
 
         async with client as http_client:
