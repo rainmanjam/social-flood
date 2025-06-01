@@ -1,474 +1,216 @@
-# Social Flood Docker API
+# Social Flood API
 
-A Docker-containerized FastAPI application that provides secure API access to various Google services including Google News, Google Trends, Google Autocomplete, and YouTube Transcripts, enabling comprehensive data collection and analysis for social media, news, and search trends.
+A powerful API for accessing and aggregating data from various Google services including Google News, Google Trends, Google Autocomplete, YouTube Transcripts, and Google Ads.
 
 ## Features
 
-- **Comprehensive Google Integration**: Access multiple Google services with a single API
-- **Google News API**: Fetch, decode, and analyze news articles categorized by topics, regions, or sources
-- **Google Trends API**: Analyze search trends over time, by region, and by related queries or topics
-- **Google Autocomplete API**: Generate keyword variations using Google Autocomplete suggestions
-- **YouTube Transcripts API**: Extract and translate YouTube video transcripts
-- **API Key Authentication**: Secure your API with x-api-key header authentication
-- **Rate Limiting**: Prevent abuse with configurable rate limits
-- **Caching**: Improve performance with response caching
-- **Proxy Support**: Configure global proxies via environment variables
-- **Customizable Defaults**: Set default search parameters via environment variables
-- **CORS Support**: Enable cross-origin requests for frontend integration
-- **Health Checks**: Monitor application health with dedicated endpoints
-- **Comprehensive Logging**: Track API usage and troubleshoot issues
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=rainmanjam/social-flood&type=Date)](https://www.star-history.com/#rainmanjam/social-flood&Date)
-
-## Support the Project
-
-If you find Social Flood Docker API useful, please consider:
-- ⭐️ Star this repository on GitHub: https://github.com/rainmanjam/social-flood
-- 🍴 Fork it to contribute and customize.
-- 👤 Follow the repo to stay updated with new features and releases.
-- 📥 Pull the Docker image from Docker Hub:
-```bash
-  docker pull rainmanjam/social-flood:latest
-```
-  or visit https://hub.docker.com/r/rainmanjam/social-flood and doing the same there.
+- **Google News API** - Access and search news articles from Google News
+- **Google Trends API** - Retrieve trending topics and search interest data
+- **Google Autocomplete API** - Get search suggestions and keyword variations
+- **YouTube Transcripts API** - Extract transcripts from YouTube videos
+- **Google Ads API** - Access keyword research, search volume, competition, and bid estimates
+- **API Versioning** - All endpoints follow `/api/v1/` structure for future compatibility
+- **RFC7807 Error Handling** - Standardized problem details for all error responses
+- **Rate Limiting** - Configurable request throttling to prevent abuse
+- **Comprehensive Health Checks** - Monitor system status and dependencies
+- **Prometheus Metrics** - Track API usage and performance
 
 ## Getting Started
 
 ### Prerequisites
 
-- [Docker](https://docs.docker.com/get-docker/)
-- [Docker Compose](https://docs.docker.com/compose/install/) (optional, but recommended)
+- Docker and Docker Compose
+- Google API credentials (see [GOOGLE_SERVICES.md](GOOGLE_SERVICES.md))
+- Google Ads API credentials (see [GOOGLE_ADS_OAUTH_SETUP.md](GOOGLE_ADS_OAUTH_SETUP.md))
 
-### Running with Docker
+### Installation
 
-#### Build and run the Docker container
-
-```bash
-# Build the Docker image
-docker build -t social-flood .
-
-# Run the container
-docker run -p 8000:8000 \
-  -e API_KEY=your-api-key-1 \
-  social-flood
-```
-
-#### Additional Docker run options
-
-You can configure the application by passing environment variables:
-
-```bash
-docker run -p 8000:8000 \
-  -e API_KEY=your-api-key \
-  -e PROXY_URLS=user:pass@host:port,user:pass@host:port \
-  -e ENABLE_PROXY=true \
-  -e LOG_LEVEL=INFO \
-  social-flood
-```
-
-### Running with Docker Compose
-
-#### Production setup
-
-1. Edit the environment variables in `docker-compose.yml` to match your requirements:
-
-```yaml
-environment:
-  # API Security
-  - API_KEY=your-api-key
-  
-  # Proxy Configuration (if needed)
-  - PROXY_URLS=user:pass@host:port,user:pass@host:port
-  - ENABLE_PROXY=true
-  
-  # Other settings as needed
-  - LOG_LEVEL=INFO
-```
-
-2. Start the application with Docker Compose:
-
-```bash
-docker-compose up -d
-```
-
-3. Access the API documentation at [http://localhost:8000/docs](http://localhost:8000/docs)
-
-#### Development setup
-
-For development with auto-reload:
-
-```bash
-# Uses docker-compose.dev.yml which mounts local directory and enables auto-reload
-docker-compose -f docker-compose.dev.yml up
-```
-
-### Stopping the application
-
-```bash
-# If running with docker-compose
-docker-compose down
-
-# If running with docker
-docker stop <container_id>
-```
-
-## Installation
-
-### Prerequisites
-
-- Python 3.8 or higher
-
-### Steps
-
-1. **Clone the Repository**:
+1. Clone the repository:
    ```bash
-   git clone https://github.com/rainmanjam/social-flood.git
+   git clone https://github.com/yourusername/social-flood.git
    cd social-flood
    ```
 
-2. **Install Dependencies**:
+2. Copy the example environment file and configure your settings:
    ```bash
-   pip install -r requirements.txt
+   cp .env.example .env
+   # Edit .env with your API keys and configuration
    ```
 
-3. **Set Up Environment Variables**:
-   Define the following in a `.env` file or your environment:
-   - `API_KEY` (for securing API access)
-   - Optional: `PROXY_URLS`, `ENABLE_PROXY`, `ENABLE_CACHE`
-
-4. **Run the Application**:
+3. Build and start the containers:
    ```bash
-   uvicorn main:app --reload
+   docker-compose up -d
    ```
 
-   The application will be accessible at `http://127.0.0.1:8000`.
+4. The API is now running at http://localhost:8000
+
+### API Documentation
+
+- Swagger UI: [http://localhost:8000/api/docs](http://localhost:8000/api/docs)
+- ReDoc: [http://localhost:8000/api/redoc](http://localhost:8000/api/redoc)
+- OpenAPI Schema: [http://localhost:8000/api/openapi.json](http://localhost:8000/api/openapi.json)
 
 ## Configuration
 
-### Environment Variables
+| Environment Variable | Description | Example |
+|----------------------|-------------|---------|
+| `API_KEYS` | Comma-separated list of valid API keys | `key1,key2,key3` |
+| `ENABLE_API_KEY_AUTH` | Enable/disable API key authentication | `true` |
+| `RATE_LIMIT_ENABLED` | Enable/disable rate limiting | `true` |
+| `RATE_LIMIT_REQUESTS` | Number of requests allowed per timeframe | `100` |
+| `RATE_LIMIT_TIMEFRAME` | Timeframe for rate limiting in seconds | `3600` |
+| `ENABLE_CACHE` | Enable/disable response caching | `true` |
+| `CACHE_TTL` | Cache time-to-live in seconds | `3600` |
+| `REDIS_URL` | Redis connection URL for caching | `redis://redis:6379/0` |
+| `DATABASE_URL` | PostgreSQL connection URL | `postgresql://user:pass@db:5432/dbname` |
+| `ENABLE_PROXY` | Enable/disable proxy for external requests | `false` |
+| `PROXY_URL` | Proxy server URL | `http://proxy:8080` |
+| `GOOGLE_ADS_DEVELOPER_TOKEN` | Google Ads API developer token | `your-developer-token` |
+| `GOOGLE_ADS_CLIENT_ID` | Google OAuth client ID | `your-client-id.apps.googleusercontent.com` |
+| `GOOGLE_ADS_CLIENT_SECRET` | Google OAuth client secret | `your-client-secret` |
+| `GOOGLE_ADS_REFRESH_TOKEN` | Google OAuth refresh token | `your-refresh-token` |
+| `GOOGLE_ADS_CUSTOMER_ID` | Google Ads customer ID (without hyphens) | `1234567890` |
+| `ENVIRONMENT` | Application environment | `development` |
+| `DEBUG` | Enable/disable debug mode | `false` |
+| `PROJECT_NAME` | Application name | `Social Flood` |
+| `VERSION` | Application version | `1.0.0` |
+| `DESCRIPTION` | Application description | `API for social media data aggregation` |
 
-You can configure the application using environment variables:
+See [.env.example](.env.example) for a complete list of configuration options.
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| **API Security** | | |
-| API_KEY | API key for securing access | None |
-| **Proxy Configuration** | | |
-| PROXY_URLS | Comma-separated proxy URLs | [] |
-| ENABLE_PROXY | Enable proxy usage | false |
-| CA_CERT_PATH | Path to CA Certificate file for proxies | null |
-| **Caching** | | |
-| ENABLE_CACHE | Enable response caching | true |
-| CACHE_EXPIRY | Cache expiry time in seconds | 3600 |
-| **Logging & CORS** | | |
-| LOG_LEVEL | Logging level (INFO, DEBUG, etc.) | INFO |
-| ENVIRONMENT | Environment name (development, production) | development |
-| CORS_ORIGINS | Allowed origins for CORS | * |
+## Usage Examples
 
-### Example `.env` File
-```ini
-API_KEY=your_api_key
-ENABLE_PROXY=true
-PROXY_URLS=http://proxy1.com,http://proxy2.com
-LOG_LEVEL=INFO
-```
+### Basic Health Check
 
-## API Usage
-
-All API endpoints require an API key to be passed in the `x-api-key` header.
-
-### Google News API
-
-1. **Search News**
-   - **Endpoint**: `/google-news/search`
-   - **Method**: `GET`
-   - **Description**: Searches Google News for articles matching a query.
-   - **Params**: 
-     - `query` (string): The search query string
-     - `language` (string, optional): Language for the news results (default: 'en')
-     - `country` (string, optional): Country for the news results (default: 'US')
-     - `max_results` (int, optional): Maximum number of news results (1-100)
-     - `start_date` (string, optional): Start date in YYYY-MM-DD format
-     - `end_date` (string, optional): End date in YYYY-MM-DD format
-     - `exclude_duplicates` (bool, optional): Exclude duplicate news articles
-     - `exact_match` (bool, optional): Search for an exact match of the query
-     - `sort_by` (string, optional): Sort news by 'relevance' or 'date'
-
-2. **Top News**
-   - **Endpoint**: `/google-news/top`
-   - **Method**: `GET`
-   - **Description**: Fetches the top Google News articles.
-   - **Params**: 
-     - `language` (string, optional): Language for the news results (default: 'en')
-     - `country` (string, optional): Country for the news results (default: 'US')
-     - `max_results` (int, optional): Maximum number of news results (1-100)
-
-3. **News by Topic**
-   - **Endpoint**: `/google-news/topic`
-   - **Method**: `GET`
-   - **Description**: Fetches news articles based on a specific topic.
-   - **Params**: 
-     - `topic` (string): The topic to filter news articles
-     - `language` (string, optional): Language for the news results
-     - `country` (string, optional): Country for the news results
-     - `max_results` (int, optional): Maximum number of news results
-     - `exclude_duplicates` (bool, optional): Exclude duplicate news articles
-
-4. **News by Location**
-   - **Endpoint**: `/google-news/location`
-   - **Method**: `GET`
-   - **Description**: Fetches news articles relevant to a specific location.
-   - **Params**: 
-     - `location` (string): The location to filter news articles
-     - `language` (string, optional): Language for the news results
-     - `country` (string, optional): Country for the news results
-     - `max_results` (int, optional): Maximum number of news results
-     - `start_date` (string, optional): Start date in YYYY-MM-DD format
-     - `end_date` (string, optional): End date in YYYY-MM-DD format
-     - `exclude_duplicates` (bool, optional): Exclude duplicate news articles
-
-5. **News by Source**
-   - **Endpoint**: `/google-news/source`
-   - **Method**: `GET`
-   - **Description**: Fetches news articles from a specific source.
-   - **Params**: 
-     - `source` (string): Source domain or full URL
-     - `language` (string, optional): Language for the news results
-     - `country` (string, optional): Country for the news results
-     - `max_results` (int, optional): Maximum number of news results
-     - `exclude_duplicates` (bool, optional): Exclude duplicate news articles
-     - `start_date` (string, optional): Start date in YYYY-MM-DD format
-     - `end_date` (string, optional): End date in YYYY-MM-DD format
-
-6. **Article Details**
-   - **Endpoint**: `/google-news/article-details`
-   - **Method**: `GET`
-   - **Description**: Retrieves detailed information about a specific article.
-   - **Params**: 
-     - `url` (string): URL of the article to retrieve details for
-
-### Google Trends API
-
-1. **Interest Over Time**
-   - **Endpoint**: `/google-trends/interest-over-time`
-   - **Method**: `GET`
-   - **Description**: Retrieves Google Trends interest over time for specified keywords.
-   - **Params**: 
-     - `keywords` (string): Comma-separated keywords
-     - `timeframe` (string, optional): Timeframe for the query (default: 'today 12-m')
-     - `geo` (string, optional): Geolocation code
-     - `cat` (string, optional): Category ID
-     - `gprop` (string, optional): Google property
-
-2. **Interest By Region**
-   - **Endpoint**: `/google-trends/interest-by-region`
-   - **Method**: `GET`
-   - **Description**: Retrieves Google Trends interest by region for a keyword.
-   - **Params**: 
-     - `keyword` (string): Single keyword
-     - `timeframe` (string, optional): Timeframe
-     - `geo` (string, optional): Geolocation code
-     - `cat` (string, optional): Category ID
-     - `resolution` (string, optional): Resolution level (COUNTRY, REGION, CITY)
-
-3. **Related Queries**
-   - **Endpoint**: `/google-trends/related-queries`
-   - **Method**: `GET`
-   - **Description**: Retrieves related queries for a specified keyword.
-   - **Params**: 
-     - `keyword` (string): Single keyword
-     - `timeframe` (string, optional): Timeframe
-     - `geo` (string, optional): Geolocation code
-     - `cat` (string, optional): Category ID
-     - `gprop` (string, optional): Google property
-
-4. **Related Topics**
-   - **Endpoint**: `/google-trends/related-topics`
-   - **Method**: `GET`
-   - **Description**: Retrieves related topics for a specified keyword.
-   - **Params**: 
-     - `keyword` (string): Single keyword
-     - `timeframe` (string, optional): Timeframe
-     - `geo` (string, optional): Geolocation code
-     - `cat` (string, optional): Category ID
-     - `gprop` (string, optional): Google property
-
-5. **Trending Now**
-   - **Endpoint**: `/google-trends/trending-now`
-   - **Method**: `GET`
-   - **Description**: Retrieves current trending searches for the specified geo.
-   - **Params**: 
-     - `geo` (string, optional): Geolocation code for trending searches (default: 'US')
-
-6. **Trending Now by RSS**
-   - **Endpoint**: `/google-trends/trending-now-by-rss`
-   - **Method**: `GET`
-   - **Description**: Retrieves current trending searches by RSS for the specified geo.
-   - **Params**: 
-     - `geo` (string, optional): Geolocation code for trending searches (default: 'US')
-
-7. **Categories**
-   - **Endpoint**: `/google-trends/categories`
-   - **Method**: `GET`
-   - **Description**: Searches or lists categories in the Google Trends taxonomy.
-   - **Params**: 
-     - `find` (string, optional): String to match category name
-     - `root` (string, optional): Root category ID to list subcategories
-
-8. **Geo**
-   - **Endpoint**: `/google-trends/geo`
-   - **Method**: `GET`
-   - **Description**: Searches available geolocation codes in Google Trends.
-   - **Params**: 
-     - `find` (string, optional): String to match location name
-
-### Google Autocomplete API
-
-1. **Autocomplete Keywords**
-   - **Endpoint**: `/google-autocomplete/autocomplete-keywords`
-   - **Method**: `GET`
-   - **Description**: Generates keyword variations using Google Autocomplete.
-   - **Params**: 
-     - `input_keyword` (string): Base keyword to generate variations
-     - `input_country` (string, optional): Country code for Google Autocomplete (default: 'US')
-     - `output` (string): Output format (toolbar, chrome, firefox, xml, safari, opera)
-     - `spell` (int, optional): Controls spell-checking (1 to enable, 0 to disable)
-     - `hl` (string, optional): UI language setting (default: 'en')
-     - `ds` (string, optional): Search domain or vertical
-
-### YouTube Transcripts API
-
-1. **Get Transcript**
-   - **Endpoint**: `/youtube-transcripts/get-transcript`
-   - **Method**: `GET`
-   - **Description**: Retrieves the transcript for a YouTube video.
-   - **Params**: 
-     - `video_id` (string): YouTube video ID
-     - `languages` (list, optional): List of language codes in descending priority (default: ['en'])
-     - `preserve_formatting` (bool, optional): Preserve HTML formatting in transcripts
-
-2. **List Transcripts**
-   - **Endpoint**: `/youtube-transcripts/list-transcripts`
-   - **Method**: `GET`
-   - **Description**: Lists available transcripts for a YouTube video.
-   - **Params**: 
-     - `video_id` (string): YouTube video ID
-
-3. **Translate Transcript**
-   - **Endpoint**: `/youtube-transcripts/translate-transcript`
-   - **Method**: `GET`
-   - **Description**: Translates a YouTube video transcript.
-   - **Params**: 
-     - `video_id` (string): YouTube video ID
-     - `target_language` (string): Target language code for translation
-     - `source_languages` (list, optional): List of source language codes (default: ['en'])
-
-4. **Batch Get Transcripts**
-   - **Endpoint**: `/youtube-transcripts/batch-get-transcripts`
-   - **Method**: `POST`
-   - **Description**: Retrieves transcripts for multiple YouTube videos.
-   - **Params**: 
-     - `video_ids` (list): List of YouTube video IDs
-     - `languages` (list, optional): List of language codes in descending priority
-     - `preserve_formatting` (bool, optional): Preserve HTML formatting in transcripts
-
-5. **Format Transcript**
-   - **Endpoint**: `/youtube-transcripts/format-transcript`
-   - **Method**: `GET`
-   - **Description**: Formats the transcript of a YouTube video into the desired format.
-   - **Params**: 
-     - `video_id` (string): YouTube video ID
-     - `format_type` (string): Desired format type (json, txt, vtt, srt, csv)
-     - `languages` (list, optional): List of language codes in descending priority
-
-## CLI Usage
-
-Fetch Google Trends data:
 ```bash
-python cli.py --google-trends "keyword1,keyword2"
+curl http://localhost:8000/health
 ```
 
-## Development
+Response:
+```json
+{
+  "status": "healthy",
+  "version": "1.0.0",
+  "environment": "development",
+  "timestamp": 1622548800.123456
+}
+```
 
-### Run Tests
+### Google News Search
+
 ```bash
-pytest
+curl -X GET "http://localhost:8000/api/v1/google-news/search?q=artificial+intelligence&country=US&language=en&max_results=5" \
+  -H "x-api-key: your_api_key"
 ```
 
-### Code Formatting
+Response:
+```json
+{
+  "status": "success",
+  "query": "artificial intelligence",
+  "country": "US",
+  "language": "en",
+  "results": [
+    {
+      "title": "Latest Developments in AI Research",
+      "link": "https://example.com/ai-research",
+      "source": "Tech News",
+      "published": "2023-06-01T12:00:00Z",
+      "snippet": "Researchers have made significant progress in..."
+    },
+    ...
+  ]
+}
+```
+
+### Google Autocomplete Suggestions
+
 ```bash
-black .
+curl -X GET "http://localhost:8000/api/v1/google-autocomplete/autocomplete?q=python+programming&output=chrome&gl=US" \
+  -H "x-api-key: your_api_key"
 ```
 
-## Troubleshooting
+Response:
+```json
+{
+  "response_type": "json",
+  "original_query": "python programming",
+  "suggestions": [
+    "python programming tutorial",
+    "python programming language",
+    "python programming for beginners",
+    "python programming jobs",
+    "python programming examples"
+  ],
+  "metadata": {
+    "google:clientdata": {"bpc": true, "tlw": false},
+    "google:suggesttype": ["QUERY", "QUERY", "QUERY", "QUERY", "QUERY"],
+    "google:verbatimrelevance": 1300
+  }
+}
+```
 
-### API Issues
-- If you receive a 429 error, you've exceeded the rate limit or the underlying Google services are blocking requests
-- For high-volume usage, configure proxies to avoid being blocked
-- Some Google services may have usage limitations or require additional authentication
+### Google Ads Keyword Ideas
 
-### Docker Troubleshooting
+```bash
+curl -X POST "http://localhost:8000/api/v1/google-ads/keyword-ideas" \
+  -H "x-api-key: your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "customer_id": "1234567890",
+    "keywords": ["python programming", "machine learning"],
+    "language_id": "1000",
+    "country_code": "US"
+  }'
+```
 
-- **Container exits immediately**: Check the logs with `docker logs <container_id>`
-- **Can't access the API**: Make sure ports are correctly mapped and the container is running
-- **API key issues**: Ensure API_KEY environment variable is set correctly
-- **Proxy issues**: If using proxies, make sure they're correctly formatted and working
-- **Permission issues**: If mounting volumes, ensure proper permissions are set
+Response:
+```json
+{
+  "keyword_ideas": [
+    {
+      "text": "python programming tutorial",
+      "avg_monthly_searches": 12000,
+      "competition": "HIGH",
+      "competition_index": 75.5,
+      "low_top_of_page_bid_micros": 1.2,
+      "high_top_of_page_bid_micros": 3.5,
+      "historical_metrics": {
+        "monthly_search_volumes": [
+          {
+            "year": 2025,
+            "month": 5,
+            "monthly_searches": 12000
+          }
+        ]
+      }
+    },
+    ...
+  ]
+}
+```
 
-### Environment Variable Issues
+For more examples, see [EXAMPLES.md](EXAMPLES.md).
 
-If you're experiencing issues with environment variables:
+## Documentation
 
-1. **Verify variable values**: Check which values are active
-   ```bash
-   python scripts/check_env.py
-   ```
-
-2. **Docker environment**: When running in Docker, use this command to debug
-   ```bash
-   docker-compose exec social-flood bash -c "env | grep -E 'API_KEY|ENABLE_|LOG_LEVEL'"
-   ```
-
-3. **Inspect container**: If necessary, inspect the container directly
-   ```bash
-   docker-compose exec social-flood bash
-   ```
-
-### Common Issues and Solutions
-
-1. **API authentication not working**:
-   - Ensure `API_KEY` is set correctly
-   - Verify you're including the proper header in requests (`x-api-key`)
-
-2. **Container fails to start**:
-   - Check logs with `docker-compose logs social-flood`
-   - Try running with the debug configuration: `docker-compose -f docker-compose.dev.yml up`
-
-3. **API errors with 500 status code**:
-   - Check Docker logs for detailed error information
-   - Increase logging level: `LOG_LEVEL=DEBUG`
-   - Look for specific errors related to Google services
-
-4. **Changes to `.env` file not taking effect**:
-   - Remember Docker Compose may have overriding environment variables
-   - Rebuild container: `docker-compose build` then `docker-compose up -d`
+- [API Structure](API_STRUCTURE.md) - Detailed API structure and organization
+- [Google Services](GOOGLE_SERVICES.md) - How to integrate with Google services
+- [Google Ads OAuth Setup](GOOGLE_ADS_OAUTH_SETUP.md) - How to set up OAuth for Google Ads API
+- [Architecture Overview](ARCHITECTURE_OVERVIEW.md) - High-level system architecture
+- [Deployment](DEPLOYMENT.md) - Step-by-step deployment instructions
+- [Security Guidelines](SECURITY_GUIDELINES.md) - Best practices and security considerations
+- [Performance Tuning](PERFORMANCE_TUNING.md) - Tips for optimizing performance
+- [Troubleshooting](TROUBLESHOOTING.md) - Common issues and solutions
+- [API Reference](API_REFERENCE.md) - Complete endpoint reference
+- [Changelog](CHANGELOG.md) - Version history and changes
+- [Roadmap](ROADMAP.md) - Planned features and improvements
+- [FAQ](FAQ.md) - Frequently asked questions
 
 ## Contributing
 
-1. Fork the repository.
-2. Create your feature branch (`git checkout -b feature/YourFeature`).
-3. Commit your changes (`git commit -m 'Add some feature'`).
-4. Push to the branch (`git push origin feature/YourFeature`).
-5. Open a pull request.
-
-## Known Issues
-
-- High-volume API requests may require careful proxy management and caching strategies.
-- Google APIs may have rate limits or specific terms of use.
-- Some Google services may require additional authentication or API keys.
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## License
 
-This project is licensed under the MIT License.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

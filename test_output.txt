@@ -1,0 +1,24 @@
+Starting test...
+
+Test 1: Create a router with auto-derived service_name
+Router 1 service_name: google-ads
+Test 1 passed!
+
+Test 2: Create a router with explicit service_name
+WARNING: Provided service_name 'google-ads-service' differs from extracted service_name 'google-ads' from prefix '/google-ads'
+Router 2 service_name: google-ads-service
+Test 2 passed!
+
+Test 3: Create a router with API versioned prefix
+Router 3 service_name: google-ads
+Test 3 passed!
+
+Test 4: Create a router with custom responses
+Router 4 responses keys: dict_keys([200, 400])
+Test 4 passed!
+
+Test 5: Include the routers in the app
+All routers included successfully!
+Test 5 passed!
+
+All tests passed!

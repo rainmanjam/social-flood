@@ -1,0 +1,50 @@
+name: Update Base Image
+
+on:
+  schedule:
+    - cron: '0 0 * * 1'  # Weekly on Monday at midnight
+  workflow_dispatch:  # Allow manual triggering
+
+jobs:
+  update-base-image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v2
+
+      - name: Check for base image updates
+        id: check-updates
+        run: |
+          chmod +x ./scripts/update_base_image.sh
+          if ./scripts/update_base_image.sh --check-only; then
+            echo "Base image is already up-to-date"
+            echo "updated=false" >> $GITHUB_OUTPUT
+          else
+            echo "Base image needs to be updated"
+            echo "updated=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update base image
+        if: steps.check-updates.outputs.updated == 'true'
+        run: |
+          ./scripts/update_base_image.sh
+          
+      - name: Create Pull Request
+        if: steps.check-updates.outputs.updated == 'true'
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: 'chore: update base image to latest digest'
+          title: 'chore: update base image to latest digest'
+          body: |
+            This PR updates the base image in the Dockerfile to the latest digest.
+            
+            This is an automated PR created by the "Update Base Image" workflow.
+          branch: update-base-image
+          delete-branch: true
+          labels: |
+            dependencies
+            security

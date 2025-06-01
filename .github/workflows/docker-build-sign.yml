@@ -1,0 +1,124 @@
+name: Build and Sign Docker Image
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-sign:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+        
+      # Check and update base image if needed
+      - name: Check for base image updates
+        run: |
+          chmod +x ./scripts/update_base_image.sh
+          ./scripts/update_base_image.sh
+
+      - name: Login to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Extract version from tags or use latest
+      - name: Extract version
+        id: version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            VERSION=$(python -c "from app.__version__ import __version__; print(__version__)")
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      # Build and push for PR (build only, no push)
+      - name: Build for PR
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: false
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:pr-${{ github.event.pull_request.number }}
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Build and push for main branch or tags
+      - name: Build and push
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ env.VERSION }}
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Sign the image (only for main branch or tags)
+      - name: Install Cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@v2
+
+      - name: Write Cosign key
+        if: github.event_name != 'pull_request'
+        run: echo "${{ secrets.COSIGN_KEY }}" > cosign.key
+
+      - name: Sign the image
+        if: github.event_name != 'pull_request'
+        env:
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          cosign sign --key cosign.key ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ env.VERSION }}
+          cosign sign --key cosign.key ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest
+
+      - name: Create provenance attestation
+        if: github.event_name != 'pull_request'
+        env:
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          cosign attest --predicate <(cosign generate-attestation ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ env.VERSION }}) \
+            --key cosign.key ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ env.VERSION }}
+          
+          cosign attest --predicate <(cosign generate-attestation ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest) \
+            --key cosign.key ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest
+
+      # Generate and attest SBOM
+      - name: Install Syft
+        if: github.event_name != 'pull_request'
+        uses: anchore/sbom-action/download-syft@v0.14.3
+
+      - name: Generate SBOM
+        if: github.event_name != 'pull_request'
+        run: |
+          syft ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ env.VERSION }} -o spdx-json > sbom.json
+
+      - name: Attest SBOM
+        if: github.event_name != 'pull_request'
+        env:
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          cosign attest --predicate sbom.json --key cosign.key --type spdx \
+            ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ env.VERSION }}
+          
+          cosign attest --predicate sbom.json --key cosign.key --type spdx \
+            ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest
+
+      # Clean up
+      - name: Clean up
+        if: always()
+        run: |
+          rm -f cosign.key sbom.json || true

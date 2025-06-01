@@ -88,3 +88,7 @@ htmlcov/
 
 # Testing outputs
 test_output/
+
+# Cosign keys
+cosign.key
+cosign.pub
