@@ -9,6 +9,7 @@ import asyncio
 from urllib.parse import quote, urlparse
 import httpx
 from selectolax.parser import HTMLParser
+import os
 import nltk
 from pydantic import BaseModel, validator, ValidationError
 import re
@@ -19,16 +20,28 @@ import datetime
 async def setup_nltk():
     loop = asyncio.get_event_loop()
     try:
-        # Check if 'punkt' is already downloaded
-        # This is a synchronous check, so run it in executor to be safe,
-        # though nltk.data.find is often fast if data is local.
-        await loop.run_in_executor(None, nltk.data.find, 'tokenizers/punkt')
-        logger.info("NLTK 'punkt' resource already available.")
-    except LookupError:
-        # 'punkt' not found, so download it
-        logger.info("NLTK 'punkt' resource not found. Downloading...")
-        await loop.run_in_executor(None, nltk.download, 'punkt')
-        logger.info("NLTK 'punkt' resource downloaded successfully.")
+        # Set NLTK data path to a writable directory
+        nltk_data_dir = os.path.join(os.getcwd(), "nltk_data")
+        os.makedirs(nltk_data_dir, exist_ok=True)
+        nltk.data.path.insert(0, nltk_data_dir)
+        
+        # Check if 'punkt_tab' is already downloaded
+        try:
+            await loop.run_in_executor(None, nltk.data.find, 'tokenizers/punkt_tab')
+            logger.info("NLTK 'punkt_tab' resource already available.")
+        except LookupError:
+            # 'punkt_tab' not found, so download it
+            logger.info("NLTK 'punkt_tab' resource not found. Downloading...")
+            await loop.run_in_executor(None, nltk.download, 'punkt_tab', nltk_data_dir)
+            logger.info("NLTK 'punkt_tab' resource downloaded successfully.")
+            
+        # Also download 'punkt' as fallback
+        try:
+            await loop.run_in_executor(None, nltk.data.find, 'tokenizers/punkt')
+        except LookupError:
+            logger.info("Downloading fallback 'punkt' resource...")
+            await loop.run_in_executor(None, nltk.download, 'punkt', nltk_data_dir)
+            
     except Exception as e:
         # Handle any other exceptions during NLTK setup
         logger.error(f"An error occurred during NLTK setup: {e}")

@@ -7,7 +7,10 @@ Social Flood API service.
 """
 import logging
 import time
+import os
+import nltk
 from typing import Dict, Any, Optional
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends, Request, Response, APIRouter
 from fastapi.responses import JSONResponse
