@@ -14,9 +14,9 @@ async def lifespan(app: FastAPI):
         
         # Download required NLTK resources
         nltk.download('punkt_tab', download_dir=nltk_data_dir, quiet=True)
-        print("NLTK resources downloaded successfully")
+        logger.info("NLTK resources downloaded successfully")
     except Exception as e:
-        print(f"Warning: Failed to download NLTK resources: {e}")
+        logger.warning(f"Failed to download NLTK resources: {e}")
     
     yield
 
