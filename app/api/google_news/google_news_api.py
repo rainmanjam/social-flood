@@ -426,19 +426,27 @@ async def decode_and_process_articles(
     if not raw_articles:
         return []
 
-    tasks = [decode_google_news_url(article.get('url')) for article in raw_articles if article.get('url')]
+    article_task_pairs = [
+        (article, decode_google_news_url(article.get('url')))
+        for article in raw_articles if article.get('url')
+    ]
     # Use return_exceptions=True to handle potential errors during decoding of individual URLs
-    decoded_results = await asyncio.gather(*tasks, return_exceptions=True)
+    decoded_results = await asyncio.gather(
+        *(task for _, task in article_task_pairs), return_exceptions=True
+    )
 
     processed_articles = []
-    for i, article_data in enumerate(raw_articles):
-        # Ensure we have a corresponding decoded_result, in case some articles had no URL
-        if i >= len(decoded_results):
-            logger.warning(f"Missing decoded result for article index {i}, title: '{article_data.get('title', 'N/A')}' (original URL might have been missing)")
+    for (article_data, decoded_result) in zip(
+        (article for article, _ in article_task_pairs), decoded_results
+    ):
+        if isinstance(decoded_result, Exception):
+            logger.warning(
+                f"Exception during URL decoding for article '{article_data.get('title', 'N/A')}': {decoded_result}"
+            )
+            # Optionally, include the article with its original URL or skip it. Here, we skip.
             continue
-
-        decoded_result = decoded_results[i]
-
+        
+        if decoded_result.get("status"):
         if isinstance(decoded_result, Exception):
             logger.warning(
                 f"Exception during URL decoding for article '{article_data.get('title', 'N/A')}': {decoded_result}"
