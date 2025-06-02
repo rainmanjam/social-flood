@@ -23,7 +23,10 @@ class GoogleNewsService:
         """Extract domain from URL using configured TLDExtract"""
         try:
             extracted = self.tld_extract(url)
-            return f"{extracted.domain}.{extracted.suffix}"
+            if extracted.suffix:
+                return f"{extracted.domain}.{extracted.suffix}"
+            else:
+                return extracted.domain
         except Exception as e:
             logger.error(f"Error extracting domain from {url}: {e}")
             return "unknown"
