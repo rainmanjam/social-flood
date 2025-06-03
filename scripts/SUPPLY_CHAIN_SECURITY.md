@@ -220,7 +220,7 @@ jobs:
         with:
           context: .
           push: false
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:pr-${{ github.event.pull_request.number }}
+          tags: social-flood:pr-${{ github.event.pull_request.number }}
           platforms: linux/amd64,linux/arm64
           cache-from: type=gha
           cache-to: type=gha,mode=max
