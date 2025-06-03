@@ -447,14 +447,6 @@ async def decode_and_process_articles(
             continue
         
         if decoded_result.get("status"):
-        if isinstance(decoded_result, Exception):
-            logger.warning(
-                f"Exception during URL decoding for article '{article_data.get('title', 'N/A')}': {decoded_result}"
-            )
-            # Optionally, include the article with its original URL or skip it. Here, we skip.
-            continue
-        
-        if decoded_result.get("status"):
             article_data['url'] = decoded_result["decoded_url"]
             transformed_article = transform_article(article_data) # transform_article is an existing helper
 
