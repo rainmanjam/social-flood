@@ -15,11 +15,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Download NLTK data
-RUN python -m nltk.downloader -d /usr/local/share/nltk_data punkt
+# Download NLTK data - update to include punkt_tab
+RUN python -c "import nltk; nltk.download('punkt_tab', download_dir='/usr/local/share/nltk_data'); nltk.download('punkt', download_dir='/usr/local/share/nltk_data')"
 
 # Create a non-root user and group
 RUN groupadd -r appuser && useradd -r -g appuser appuser
+
+# Create directories for NLTK and TLDExtract data with proper permissions
+RUN mkdir -p /app/nltk_data /app/.tldextract_cache && \
+    chown -R appuser:appuser /app/nltk_data /app/.tldextract_cache && \
+    chmod 755 /app/nltk_data /app/.tldextract_cache
 
 # Copy application code
 COPY --chown=appuser:appuser . .

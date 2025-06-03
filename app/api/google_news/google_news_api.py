@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Query, Depends  # Ensure Depends is imported if not already
 from fastapi.responses import JSONResponse
 from gnews import GNews
-from newspaper import Article, Config
+from newspaper import Article, Config, ArticleException
 from typing import List, Optional  # Ensure Optional is imported
 import logging
 import json
@@ -9,6 +9,7 @@ import asyncio
 from urllib.parse import quote, urlparse
 import httpx
 from selectolax.parser import HTMLParser
+import os
 import nltk
 from pydantic import BaseModel, validator, ValidationError
 import re
@@ -18,12 +19,37 @@ import datetime
 # Initialize NLTK asynchronously
 async def setup_nltk():
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, nltk.download, 'punkt_tab')
+    try:
+        # Set NLTK data path to a writable directory
+        nltk_data_dir = os.path.join(os.getcwd(), "nltk_data")
+        os.makedirs(nltk_data_dir, exist_ok=True)
+        nltk.data.path.insert(0, nltk_data_dir)
+        
+        # Check if 'punkt_tab' is already downloaded
+        try:
+            await loop.run_in_executor(None, nltk.data.find, 'tokenizers/punkt_tab')
+            logger.info("NLTK 'punkt_tab' resource already available.")
+        except LookupError:
+            # 'punkt_tab' not found, so download it
+            logger.info("NLTK 'punkt_tab' resource not found. Downloading...")
+            await loop.run_in_executor(None, nltk.download, 'punkt_tab', nltk_data_dir)
+            logger.info("NLTK 'punkt_tab' resource downloaded successfully.")
+            
+        # Also download 'punkt' as fallback
+        try:
+            await loop.run_in_executor(None, nltk.data.find, 'tokenizers/punkt')
+        except LookupError:
+            logger.info("Downloading fallback 'punkt' resource...")
+            await loop.run_in_executor(None, nltk.download, 'punkt', nltk_data_dir)
+            
+    except Exception as e:
+        # Handle any other exceptions during NLTK setup
+        logger.error(f"An error occurred during NLTK setup: {e}")
 
 # Initialize Google News API Router
 gnews_router = APIRouter()
-logger = logging.getLogger("uvicorn")
-logging.basicConfig(level=logging.DEBUG)  # Ensure DEBUG level logs are captured
+logger = logging.getLogger(__name__)
+# logging.basicConfig(level=logging.DEBUG)  # Ensure DEBUG level logs are captured -> This should be handled by the main application entry point
 
 # Pydantic Model for Input Validation
 class SourceQuery(BaseModel):
@@ -349,35 +375,95 @@ async def get_gnews_instance(
     start_date: Optional[tuple] = None,
     end_date: Optional[tuple] = None,
 ) -> GNews:
-    gnews = GNews()
-    gnews.language = language
-    gnews.country = country
-    gnews.max_results = max_results
+    proxy_url_val = await get_proxy()
+
+    # Initialize GNews with proxy for its internal feedparser usage
+    gnews = GNews(
+        language=language,
+        country=country,
+        max_results=max_results,
+        period=period,
+        start_date=start_date,
+        end_date=end_date,
+        # exclude_websites can be set if needed, GNews constructor supports it
+        proxy=proxy_url_val  # Pass the proxy URL to GNews constructor
+    )
+
+    # Set attributes not available in constructor or that need to be dynamically set
     gnews.exclude_duplicates = exclude_duplicates
     gnews.exact_match = exact_match
     gnews.sort_by = sort_by
-    if period:
-        gnews.period = period
-    if start_date:
-        gnews.start_date = start_date
-    if end_date:
-        gnews.end_date = end_date
+    # Period, start_date, end_date are already set via constructor if provided
 
-    # Set up proxies for GNews if available
-    proxy_url = await get_proxy()  # Adjust based on your implementation
-
-    if proxy_url:
+    # Set up httpx.AsyncClient on gnews.session for any parts of GNews that might use it
+    # (or for future use/consistency, as the original code did this).
+    if proxy_url_val:
         mounts = {
-            "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-            "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
+            "http://": httpx.AsyncHTTPTransport(proxy=proxy_url_val),
+            "https://": httpx.AsyncHTTPTransport(proxy=proxy_url_val),
         }
         gnews.session = httpx.AsyncClient(mounts=mounts)
-        logger.debug(f"GNews is using proxy: {proxy_url}")
+        logger.debug(f"GNews instance using proxy for httpx session: {proxy_url_val}")
+        if proxy_url_val: # Logging for clarity that proxy is also set for feedparser
+            logger.debug(f"GNews instance also configured with proxy for feedparser: {proxy_url_val}")
     else:
         gnews.session = httpx.AsyncClient()
-        logger.debug("GNews is not using any proxy.")
+        logger.debug("GNews instance not using any proxy for httpx session or feedparser.")
 
     return gnews
+
+# -----------------------------------------------------------------------------
+# Helper: Decode and Process Articles
+# -----------------------------------------------------------------------------
+async def decode_and_process_articles(
+    raw_articles: List[dict],
+    filter_by_domain: Optional[str] = None
+) -> List[dict]:
+    """
+    Decodes Google News URLs for a list of articles and processes them.
+    Optionally filters articles by a specified domain.
+    """
+    if not raw_articles:
+        return []
+
+    article_task_pairs = [
+        (article, decode_google_news_url(article.get('url')))
+        for article in raw_articles if article.get('url')
+    ]
+    # Use return_exceptions=True to handle potential errors during decoding of individual URLs
+    decoded_results = await asyncio.gather(
+        *(task for _, task in article_task_pairs), return_exceptions=True
+    )
+
+    processed_articles = []
+    for (article_data, decoded_result) in zip(
+        (article for article, _ in article_task_pairs), decoded_results
+    ):
+        if isinstance(decoded_result, Exception):
+            logger.warning(
+                f"Exception during URL decoding for article '{article_data.get('title', 'N/A')}': {decoded_result}"
+            )
+            # Optionally, include the article with its original URL or skip it. Here, we skip.
+            continue
+        
+        if decoded_result.get("status"):
+            article_data['url'] = decoded_result["decoded_url"]
+            transformed_article = transform_article(article_data) # transform_article is an existing helper
+
+            if filter_by_domain:
+                article_domain = urlparse(transformed_article["url"]).netloc.lower().replace('www.', '').strip()
+                if filter_by_domain not in article_domain:
+                    logger.debug(f"Skipping article '{transformed_article['title']}' as its domain '{article_domain}' does not match '{filter_by_domain}'")
+                    continue
+            
+            processed_articles.append(transformed_article)
+        else:
+            logger.warning(
+                f"Could not decode URL for article '{article_data.get('title', 'N/A')}': "
+                f"{decoded_result.get('message')}"
+            )
+            # Optionally, include the article with its original URL. Here, we skip if decoding failed.
+    return processed_articles
 
 # -----------------------------------------------------------------------------
 # Pydantic Models for Responses
@@ -501,37 +587,16 @@ async def get_news_by_source(
         if not articles:
             raise HTTPException(status_code=404, detail="No articles found for the given parameters.")
 
-        # Decode URLs asynchronously and filter articles by source
-        tasks = []
-        for article in articles:
-            source_url = article.get('url')
-            tasks.append(decode_google_news_url(source_url))
-        decoded_results = await asyncio.gather(*tasks)
+        # Use the new helper function to decode URLs and filter
+        processed_articles = await decode_and_process_articles(articles, filter_by_domain=domain_source)
 
-        filtered_articles = []
-        for article, decoded_url_response in zip(articles, decoded_results):
-            if decoded_url_response.get("status"):
-                article['url'] = decoded_url_response["decoded_url"]
-                # Transform the article data
-                transformed_article = transform_article(article)
-                # Check if the decoded URL matches the source domain
-                article_domain = urlparse(transformed_article["url"]).netloc.lower()
-                article_domain = article_domain.replace('www.', '').strip()
-                if domain_source in article_domain:
-                    filtered_articles.append(transformed_article)
-            else:
-                logger.warning(
-                    f"Could not decode URL for article '{article.get('title', 'N/A')}': "
-                    f"{decoded_url_response.get('message')}"
-                )
-
-        if not filtered_articles:
+        if not processed_articles:
             raise HTTPException(
                 status_code=404,
                 detail=f"No articles found from source '{domain_source}' with the given date range."
             )
 
-        return {"articles": filtered_articles}
+        return {"articles": processed_articles}
 
     except ValidationError as ve:
         logger.error(f"Validation error for source '{source}': {ve}")
@@ -607,27 +672,16 @@ async def search_google_news(
         if not news:
             raise HTTPException(status_code=404, detail="No news found for the given query.")
 
-        # Decode URLs asynchronously
-        tasks = []
-        for article in news:
-            source_url = article.get('url')
-            tasks.append(decode_google_news_url(source_url))
-        decoded_results = await asyncio.gather(*tasks)
+        # Use the new helper function to decode URLs
+        processed_articles = await decode_and_process_articles(news)
+        
+        if not processed_articles: # Check if processing yielded any articles
+            # This condition might be hit if all URLs failed to decode or were filtered out
+            # Depending on desired behavior, could raise 404 or return empty list
+            # For now, let's assume if news was found initially but processing failed for all, it's still a "not found" scenario for valid articles.
+            raise HTTPException(status_code=404, detail="No processable news found after URL decoding.")
 
-        processed_news = []
-        for article, decoded_url_response in zip(news, decoded_results):
-            if decoded_url_response.get("status"):
-                article['url'] = decoded_url_response["decoded_url"]
-                # Transform the article data
-                transformed_article = transform_article(article)
-                processed_news.append(transformed_article)
-            else:
-                logger.warning(
-                    f"Could not decode URL for article '{article.get('title', 'N/A')}': "
-                    f"{decoded_url_response.get('message')}"
-                )
-
-        return {"articles": processed_news}
+        return {"articles": processed_articles}
 
     except HTTPException as http_exc:
         raise http_exc
@@ -677,27 +731,13 @@ async def get_top_google_news(
         if not top_news:
             raise HTTPException(status_code=404, detail="No top news found.")
 
-        # Decode URLs asynchronously
-        tasks = []
-        for article in top_news:
-            source_url = article.get('url')
-            tasks.append(decode_google_news_url(source_url))
-        decoded_results = await asyncio.gather(*tasks)
+        # Use the new helper function to decode URLs
+        processed_articles = await decode_and_process_articles(top_news)
 
-        processed_top_news = []
-        for article, decoded_url_response in zip(top_news, decoded_results):
-            if decoded_url_response.get("status"):
-                article['url'] = decoded_url_response["decoded_url"]
-                # Transform the article data
-                transformed_article = transform_article(article)
-                processed_top_news.append(transformed_article)
-            else:
-                logger.warning(
-                    f"Could not decode URL for article '{article.get('title', 'N/A')}': "
-                    f"{decoded_url_response.get('message')}"
-                )
-
-        return {"articles": processed_top_news}
+        if not processed_articles: # Similar check as in /search
+            raise HTTPException(status_code=404, detail="No processable top news found after URL decoding.")
+            
+        return {"articles": processed_articles}
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
@@ -758,27 +798,13 @@ async def get_news_by_topic(
         if not news:
             raise HTTPException(status_code=404, detail="No news found for the given topic.")
 
-        # Decode URLs asynchronously
-        tasks = []
-        for article in news:
-            source_url = article.get('url')
-            tasks.append(decode_google_news_url(source_url))
-        decoded_results = await asyncio.gather(*tasks)
+        # Use the new helper function to decode URLs
+        processed_articles = await decode_and_process_articles(news)
 
-        processed_news = []
-        for article, decoded_url_response in zip(news, decoded_results):
-            if decoded_url_response.get("status"):
-                article['url'] = decoded_url_response["decoded_url"]
-                # Transform the article data
-                transformed_article = transform_article(article)
-                processed_news.append(transformed_article)
-            else:
-                logger.warning(
-                    f"Could not decode URL for article '{article.get('title', 'N/A')}': "
-                    f"{decoded_url_response.get('message')}"
-                )
+        if not processed_articles: # Similar check
+            raise HTTPException(status_code=404, detail="No processable news found for the topic after URL decoding.")
 
-        return {"articles": processed_news}
+        return {"articles": processed_articles}
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
@@ -842,27 +868,13 @@ async def get_news_by_location(
         if not news_by_location:
             raise HTTPException(status_code=404, detail=f"No news found for the location '{location}'.")
 
-        # Decode URLs asynchronously
-        tasks = []
-        for article in news_by_location:
-            source_url = article.get('url')
-            tasks.append(decode_google_news_url(source_url))
-        decoded_results = await asyncio.gather(*tasks)
+        # Use the new helper function to decode URLs
+        processed_articles = await decode_and_process_articles(news_by_location)
 
-        processed_news = []
-        for article, decoded_url_response in zip(news_by_location, decoded_results):
-            if decoded_url_response.get("status"):
-                article['url'] = decoded_url_response["decoded_url"]
-                # Transform the article data
-                transformed_article = transform_article(article)
-                processed_news.append(transformed_article)
-            else:
-                logger.warning(
-                    f"Could not decode URL for article '{article.get('title', 'N/A')}': "
-                    f"{decoded_url_response.get('message')}"
-                )
-
-        return {"articles": processed_news}
+        if not processed_articles: # Similar check
+            raise HTTPException(status_code=404, detail=f"No processable news found for the location '{location}' after URL decoding.")
+            
+        return {"articles": processed_articles}
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
@@ -917,25 +929,11 @@ async def get_google_news_articles(
         if not articles:
             raise HTTPException(status_code=404, detail="No articles found for the given parameters.")
 
-        # Decode URLs asynchronously
-        tasks = []
-        for article in articles:
-            source_url = article.get('url')
-            tasks.append(decode_google_news_url(source_url))
-        decoded_results = await asyncio.gather(*tasks)
-
-        processed_articles = []
-        for article, decoded_url_response in zip(articles, decoded_results):
-            if decoded_url_response.get("status"):
-                article['url'] = decoded_url_response["decoded_url"]
-                # Transform the article data
-                transformed_article = transform_article(article)
-                processed_articles.append(transformed_article)
-            else:
-                logger.warning(
-                    f"Could not decode URL for article '{article.get('title', 'N/A')}': "
-                    f"{decoded_url_response.get('message')}"
-                )
+        # Use the new helper function to decode URLs
+        processed_articles = await decode_and_process_articles(articles)
+        
+        if not processed_articles: # Similar check
+            raise HTTPException(status_code=404, detail="No processable articles found for the given parameters after URL decoding.")
 
         return {"articles": processed_articles}
 
@@ -952,6 +950,7 @@ async def get_google_news_articles(
     response_model=dict,
     responses={
         500: {"model": ErrorResponse, "description": "Internal Server Error."},
+        503: {"model": ErrorResponse, "description": "Service unavailable: Could not process article from URL."},
     }
 )
 async def get_article_details(
@@ -966,6 +965,7 @@ async def get_article_details(
     ### Responses:
     - **200 OK**: Returns detailed information about the specified article.
     - **500 Internal Server Error**: Unexpected server error.
+    - **503 Service Unavailable**: Could not process article from URL due to an issue with the article source or processing.
     """
     logger.info(f"Received request to get article details for URL: {url}")
     try:
@@ -988,8 +988,9 @@ async def get_article_details(
 
         try:
             await loop.run_in_executor(None, article.nlp)
-        except LookupError as e:
-            logger.warning(f"NLTK resource not found: {str(e)}")
+        except LookupError as le: # Specific exception for NLTK resource not found
+            logger.warning(f"NLTK resource not found for URL '{url}': {str(le)}")
+            # Return partial data as this is not a complete failure of article retrieval
             return {
                 "title": article.title,
                 "authors": article.authors,
@@ -1018,6 +1019,9 @@ async def get_article_details(
             "meta_description": article.meta_description,
             "meta_keywords": article.meta_keywords
         }
+    except ArticleException as ae:
+        logger.error(f"Newspaper library error for URL '{url}': {str(ae)}")
+        raise HTTPException(status_code=503, detail=f"Service unavailable: Could not process article from URL. Error: {str(ae)}")
     except Exception as e:
-        logger.error(f"Error fetching article details for URL '{url}': {str(e)}")
+        logger.error(f"Unexpected error fetching article details for URL '{url}': {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")

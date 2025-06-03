@@ -32,9 +32,15 @@ async def get_proxy():
     Returns a single proxy URL string, or None if proxying is disabled or no valid URLs exist.
     Example return: 'http://localhost:8030'
     """
-    if ENABLE_PROXY and PROXY_LIST:
-        async with _proxy_lock:
-            proxy_url = next(_proxy_iter)
-        logger.debug(f"Selected proxy: {proxy_url}")
-        return proxy_url
+    if ENABLE_PROXY:
+        if _proxy_iter is not None:
+            async with _proxy_lock:
+                # Since _proxy_iter is not None, PROXY_LIST was not empty, so next() is safe.
+                proxy_url = next(_proxy_iter)
+            logger.debug(f"Selected proxy: {proxy_url}")
+            return proxy_url
+        else:
+            # ENABLE_PROXY is true, but _proxy_iter is None (meaning PROXY_LIST was empty)
+            logger.warning("Proxying is enabled, but no valid proxy URLs were found in PROXY_URLS or the list is empty.")
+            return None
     return None
