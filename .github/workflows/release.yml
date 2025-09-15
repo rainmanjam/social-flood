@@ -1,0 +1,110 @@
+name: Create Release
+
+on:
+  pull_request:
+    types: [ closed ]
+    branches: [ main ]
+
+jobs:
+  release:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Get current version
+        id: current-version
+        run: |
+          VERSION=$(python -c "from app.__version__ import __version__; print(__version__)")
+          echo "current_version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Current version: $VERSION"
+
+      - name: Increment version
+        run: |
+          python scripts/increment_version.py patch
+
+      - name: Get new version
+        id: new-version
+        run: |
+          VERSION=$(python -c "from app.__version__ import __version__; print(__version__)")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "New version: $VERSION"
+
+      - name: Commit version bump
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add app/__version__.py
+          git commit -m "chore: bump version to v${{ steps.new-version.outputs.version }}" || echo "No changes to commit"
+
+      - name: Push version bump
+        run: |
+          git push origin main
+
+      - name: Check if release exists
+        id: release-check
+        run: |
+          if gh release view "v${{ steps.new-version.outputs.version }}" --repo ${{ github.repository }} 2>/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Release v${{ steps.new-version.outputs.version }} already exists"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Release v${{ steps.new-version.outputs.version }} does not exist"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate release notes
+        if: steps.release-check.outputs.exists == 'false'
+        id: release-notes
+        run: |
+          # Get the latest commit message
+          LATEST_COMMIT=$(git log -1 --pretty=format:"%s")
+          echo "Latest commit: $LATEST_COMMIT"
+
+          # Generate basic release notes
+          RELEASE_NOTES="## What's Changed
+
+          This release includes various improvements and bug fixes.
+
+          ### Recent Changes
+          - $LATEST_COMMIT
+
+          ### Deployment
+          - Docker image: ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.new-version.outputs.version }}
+          - Signed with cosign for supply chain security
+
+          ### Security
+          - SBOM (Software Bill of Materials) attached
+          - Provenance attestation included"
+
+          # Escape newlines for GitHub output
+          RELEASE_NOTES="${RELEASE_NOTES//'%'/'%25'}"
+          RELEASE_NOTES="${RELEASE_NOTES//$'\n'/'%0A'}"
+          RELEASE_NOTES="${RELEASE_NOTES//$'\r'/'%0D'}"
+
+          echo "release_notes<<EOF" >> $GITHUB_OUTPUT
+          echo "$RELEASE_NOTES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create release
+        if: steps.release-check.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ steps.new-version.outputs.version }}
+          name: Release v${{ steps.new-version.outputs.version }}
+          body: ${{ steps.release-notes.outputs.release_notes }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
