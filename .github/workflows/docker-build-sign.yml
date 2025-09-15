@@ -76,7 +76,13 @@ jobs:
 
       - name: Write Cosign key
         if: github.event_name != 'pull_request'
-        run: echo "${{ secrets.COSIGN_KEY }}" > cosign.key
+        run: |
+          if [ -n "${{ secrets.COSIGN_KEY }}" ]; then
+            echo "${{ secrets.COSIGN_KEY }}" > cosign.key
+          else
+            echo "Error: COSIGN_KEY secret is not set"
+            exit 1
+          fi
 
       - name: Sign the image
         if: github.event_name != 'pull_request'

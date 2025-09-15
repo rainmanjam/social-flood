@@ -486,3 +486,72 @@ def cached(
         Callable: Decorated function
     """
     return cache_manager.cached(ttl, namespace, key_builder)
+
+
+def generate_cache_key(base_key: str, **kwargs) -> str:
+    """
+    Generate a consistent cache key from a base key and parameters.
+    
+    Args:
+        base_key: The base cache key (e.g., "trends_interest_over_time")
+        **kwargs: Additional parameters to include in the key
+        
+    Returns:
+        str: A consistent cache key
+    """
+    # Sort kwargs for consistent key generation
+    sorted_kwargs = sorted(kwargs.items())
+    
+    # Build key components
+    key_parts = [base_key]
+    
+    for key, value in sorted_kwargs:
+        if value is not None:
+            # Convert value to string and handle special cases
+            if isinstance(value, list):
+                value_str = ",".join(str(v) for v in value)
+            else:
+                value_str = str(value)
+            key_parts.append(f"{key}={value_str}")
+    
+    # Join parts with colons
+    full_key = ":".join(key_parts)
+    
+    # If key is too long, hash it
+    if len(full_key) > 250:  # Redis key limit is 512 bytes, be conservative
+        full_key = hashlib.md5(full_key.encode()).hexdigest()
+    
+    return full_key
+
+
+async def get_cached_or_fetch(cache_key: str, fetch_func: Callable[[], Any], ttl: Optional[int] = None) -> Any:
+    """
+    Get data from cache or fetch and cache it if not found.
+    
+    Args:
+        cache_key: The cache key to use
+        fetch_func: Async function to call if data not in cache
+        ttl: Optional TTL override
+        
+    Returns:
+        Any: The cached or freshly fetched data
+    """
+    # Try to get from cache first
+    cached_data = await cache_manager.get(cache_key)
+    if cached_data is not None:
+        logger.debug(f"Cache hit for key: {cache_key}")
+        return cached_data
+    
+    # Cache miss - fetch the data
+    logger.debug(f"Cache miss for key: {cache_key}, fetching data")
+    try:
+        data = await fetch_func()
+        
+        # Cache the result
+        await cache_manager.set(cache_key, data, ttl)
+        logger.debug(f"Cached data for key: {cache_key}")
+        
+        return data
+    except Exception as e:
+        logger.error(f"Error fetching data for cache key {cache_key}: {e}")
+        raise
