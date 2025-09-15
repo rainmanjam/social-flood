@@ -89,18 +89,18 @@ jobs:
         env:
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
         run: |
-          cosign sign --key cosign.key ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ env.VERSION }}
-          cosign sign --key cosign.key ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest
+          cosign sign --yes --key cosign.key ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ env.VERSION }}
+          cosign sign --yes --key cosign.key ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest
 
       - name: Create provenance attestation
         if: github.event_name != 'pull_request'
         env:
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
         run: |
-          cosign attest --predicate <(cosign generate-attestation ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ env.VERSION }}) \
+          cosign attest --yes --predicate <(cosign generate-attestation ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ env.VERSION }}) \
             --key cosign.key ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ env.VERSION }}
           
-          cosign attest --predicate <(cosign generate-attestation ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest) \
+          cosign attest --yes --predicate <(cosign generate-attestation ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest) \
             --key cosign.key ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest
 
       # Generate and attest SBOM
@@ -118,10 +118,10 @@ jobs:
         env:
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
         run: |
-          cosign attest --predicate sbom.json --key cosign.key --type spdx \
+          cosign attest --yes --predicate sbom.json --key cosign.key --type spdx \
             ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ env.VERSION }}
           
-          cosign attest --predicate sbom.json --key cosign.key --type spdx \
+          cosign attest --yes --predicate sbom.json --key cosign.key --type spdx \
             ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest
 
       # Clean up
