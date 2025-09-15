@@ -72,7 +72,7 @@ jobs:
       # Sign the image (only for main branch or tags)
       - name: Install Cosign
         if: github.event_name != 'pull_request'
-        uses: sigstore/cosign-installer@v2
+        uses: sigstore/cosign-installer@v3
 
       - name: Write Cosign key
         if: github.event_name != 'pull_request'
