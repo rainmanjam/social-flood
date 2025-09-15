@@ -10,8 +10,6 @@ The API is organized into versioned modules under the `app/api/` directory:
 app/
 ├── api/
 │   ├── v1/
-│   │   ├── google_ads/
-│   │   │   └── google_ads_api.py
 │   │   ├── google_autocomplete/
 │   │   │   └── google_autocomplete_api.py
 │   │   ├── google_news/

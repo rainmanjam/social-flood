@@ -134,44 +134,6 @@ async def check_redis_connection() -> Dict[str, Any]:
         )
 
 
-async def check_google_api_credentials() -> Dict[str, Any]:
-    """
-    Check the Google API credentials.
-    
-    Returns:
-        Dict[str, Any]: Status information
-        
-    Raises:
-        ServiceUnavailableError: If the credentials are invalid
-    """
-    settings = get_settings()
-    
-    # Check if Google Ads credentials are configured
-    has_ads_credentials = all([
-        settings.GOOGLE_ADS_DEVELOPER_TOKEN,
-        settings.GOOGLE_ADS_CLIENT_ID,
-        settings.GOOGLE_ADS_CLIENT_SECRET,
-        settings.GOOGLE_ADS_REFRESH_TOKEN
-    ]) if hasattr(settings, "GOOGLE_ADS_DEVELOPER_TOKEN") else False
-    
-    if not has_ads_credentials:
-        return {
-            "status": "skipped",
-            "message": "Google API credentials not fully configured"
-        }
-    
-    # For now, just check if the credentials are present
-    # In a real application, you would validate the credentials
-    # by making a test API call
-    return {
-        "status": "healthy",
-        "message": "Google API credentials configured",
-        "credentials": {
-            "google_ads": has_ads_credentials
-        }
-    }
-
-
 async def check_external_apis() -> Dict[str, Any]:
     """
     Check external APIs.
@@ -304,7 +266,6 @@ async def check_health(
     checks = await asyncio.gather(
         check_database_connection(),
         check_redis_connection(),
-        check_google_api_credentials(),
         check_external_apis(),
         check_system_resources(),
         return_exceptions=True
@@ -314,9 +275,8 @@ async def check_health(
     results = {
         "database": checks[0] if not isinstance(checks[0], Exception) else {"status": "unhealthy", "message": str(checks[0])},
         "redis": checks[1] if not isinstance(checks[1], Exception) else {"status": "unhealthy", "message": str(checks[1])},
-        "google_api": checks[2] if not isinstance(checks[2], Exception) else {"status": "unhealthy", "message": str(checks[2])},
-        "external_apis": checks[3] if not isinstance(checks[3], Exception) else {"status": "unhealthy", "message": str(checks[3])},
-        "system": checks[4] if not isinstance(checks[4], Exception) else {"status": "unhealthy", "message": str(checks[4])}
+        "external_apis": checks[2] if not isinstance(checks[2], Exception) else {"status": "unhealthy", "message": str(checks[2])},
+        "system": checks[3] if not isinstance(checks[3], Exception) else {"status": "unhealthy", "message": str(checks[3])}
     }
     
     # Determine overall status
@@ -364,7 +324,6 @@ async def require_healthy_service(
     health_checks = {
         "database": check_database_connection,
         "redis": check_redis_connection,
-        "google_api": check_google_api_credentials,
         "external_apis": check_external_apis,
         "system": check_system_resources
     }

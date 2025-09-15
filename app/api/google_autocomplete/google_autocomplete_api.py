@@ -9,6 +9,7 @@ with support for all available parameters and output formats.
 from fastapi import APIRouter, Depends, HTTPException, Query, Path
 from app.core.auth import get_api_key
 from app.core.proxy import get_proxy  # Import get_proxy for proxy handling
+from app.core.config import get_settings
 from pydantic import BaseModel, Field, validator
 from fastapi.responses import JSONResponse
 
@@ -18,11 +19,70 @@ import xml.etree.ElementTree as ET
 import logging
 import json
 from typing import Optional, List, Dict, Any, Union
+import asyncio
+from app.core.rate_limiter import rate_limit
+from app.core.cache_manager import cache_manager
 from enum import Enum
+import asyncio
+import time
+from datetime import datetime
+from app.core.http_client import get_http_client_manager
+from app.core.input_sanitizer import get_input_sanitizer
 
 # Configure logging
 logger = logging.getLogger("uvicorn")
 logging.basicConfig(level=logging.INFO)
+
+# Cache key generation functions
+# -----------------------------------------------------------------------------
+def generate_cache_key(endpoint: str, **params) -> str:
+    """
+    Generate a cache key for Google Autocomplete API calls.
+    
+    Args:
+        endpoint: The API endpoint name
+        **params: Query parameters
+        
+    Returns:
+        str: Cache key
+    """
+    # Sort parameters for consistent key generation
+    sorted_params = sorted(params.items())
+    param_str = "_".join(f"{k}:{v}" for k, v in sorted_params if v is not None)
+    return f"autocomplete:{endpoint}:{param_str}"
+
+async def get_cached_or_fetch(key: str, fetch_func, ttl: int = None):
+    """
+    Get data from cache or fetch and cache it.
+    
+    Args:
+        key: Cache key
+        fetch_func: Async function to fetch data if not cached
+        ttl: Time to live in seconds
+        
+    Returns:
+        The fetched or cached data
+    """
+    settings = get_settings()
+    if not settings.ENABLE_CACHE:
+        return await fetch_func()
+    
+    # Try to get from cache
+    cached_data = await cache_manager.get(key, namespace="autocomplete")
+    if cached_data is not None:
+        logger.debug(f"Cache hit for key: {key}")
+        return cached_data
+    
+    # Fetch data
+    data = await fetch_func()
+    
+    # Cache the result
+    if data:
+        ttl = ttl or settings.CACHE_TTL
+        await cache_manager.set(key, data, ttl=ttl, namespace="autocomplete")
+        logger.debug(f"Cached data for key: {key}, TTL: {ttl}s")
+    
+    return data
 
 # Enums for parameter validation
 class OutputFormat(str, Enum):
@@ -308,7 +368,8 @@ async def get_autocomplete(
         example=False,
         title="Generate Variations"
     ),
-    api_key: str = Depends(get_api_key)
+    api_key: str = Depends(get_api_key),
+    rate_limit_check: None = Depends(rate_limit)
 ):
     """
     Get Google Autocomplete suggestions with support for all available parameters.
@@ -473,36 +534,60 @@ async def get_autocomplete(
     try:
         # Get proxy configuration
         proxy_url = await get_proxy()
-        
+
+        # Get HTTP client manager and input sanitizer
+        http_manager = get_http_client_manager()
+        sanitizer = get_input_sanitizer()
+
+        # Start timing for response metadata
+        start_time = time.time()
+
+        # Sanitize and validate all input parameters
+        if sanitizer.settings.INPUT_SANITIZATION_ENABLED:
+            validation_result = sanitizer.validate_all_params(
+                q=q, gl=gl, hl=hl, cr=cr, ds=ds, spell=spell, cp=cp,
+                gs_rn=gs_rn, gs_id=gs_id, callback=callback, jsonp=jsonp,
+                psi=psi, pq=pq, complete=complete, suggid=suggid, gs_l=gs_l
+            )
+
+            if not validation_result["valid"]:
+                logger.warning("Input validation failed: %s", validation_result["errors"])
+                # Use sanitized values where possible
+                if "query" in validation_result["results"]:
+                    q = validation_result["results"]["query"]["sanitized"]
+                if "country_code" in validation_result["results"]:
+                    gl = validation_result["results"]["country_code"]["sanitized"]
+                if "language_code" in validation_result["results"]:
+                    hl = validation_result["results"]["language_code"]["sanitized"]
+
         # Set up HTTP client with proxy if available
         if proxy_url:
-            logger.debug(f"Using proxy from environment settings: {proxy_url}")
-            headers = {}
-            mounts = {
-                "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-                "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-            }
-            client_obj = httpx.AsyncClient(mounts=mounts, follow_redirects=True, headers=headers)
+            logger.debug("Using proxy from environment settings: %s", proxy_url)
         else:
             logger.debug("No proxy configured in environment. Proceeding without proxy.")
-            client_obj = httpx.AsyncClient(follow_redirects=True)
-        
+
         # If variations is True, use the variations endpoint functionality
         if variations:
             logger.info(f"Generating keyword variations for query: {q}")
-            
+
+            # Get settings for parallel processing configuration
+            settings = get_settings()
+            max_parallel = settings.AUTOCOMPLETE_MAX_PARALLEL_REQUESTS
+
             # Convert ds to string value if provided
             ds_value = ds if ds else ""
-            
-            async with client_obj as http_client:
-                keyword_data = await get_suggestion_keywords_google_optimized(
-                    query=q, 
-                    country_code=gl, 
-                    output=output, 
-                    hl=hl, 
-                    ds=ds_value, 
-                    spell=spell, 
+
+            # Use HTTP client manager for the request
+            async with http_manager.get_client(proxy_url) as http_client:
+                keyword_data = await get_suggestion_keywords_google_optimized_parallel(
+                    query=q,
+                    country_code=gl,
+                    output=output,
+                    hl=hl,
+                    ds=ds_value,
+                    spell=spell,
                     http_client=http_client,
+                    max_parallel=max_parallel,
                     client=client,
                     cr=cr,
                     cp=cp,
@@ -516,194 +601,247 @@ async def get_autocomplete(
                     suggid=suggid,
                     gs_l=gs_l
                 )
-                
+
+                # Calculate response time and add metadata
+                end_time = time.time()
+                response_time = end_time - start_time
+
                 result = {
                     "success": True,
                     "message": "Success! Keywords Generated",
                     "keyword_data": keyword_data,
+                    "response_metadata": {
+                        "response_time_seconds": response_time,
+                        "timestamp": datetime.now().isoformat(),
+                        "request_count": http_manager.get_request_count(),
+                        "connection_pool_stats": http_manager.get_connection_stats()
+                    }
                 }
                 return result
-        
+
         # Standard autocomplete functionality
-        # Build URL with all provided parameters
-        params = {
-            "q": q,
-            "output": output.value,
-            "gl": gl,
-            "hl": hl,
-            "spell": spell
-        }
-        
-        # Add optional parameters if provided
-        if client:
-            params["client"] = client.value
-        if cr:
-            params["cr"] = cr
-        if ds:
-            params["ds"] = ds
-        if cp is not None:
-            params["cp"] = cp
-        if gs_rn is not None:
-            params["gs_rn"] = gs_rn
-        if gs_id:
-            params["gs_id"] = gs_id
-        if callback:
-            params["callback"] = callback
-        if jsonp:
-            params["jsonp"] = jsonp
-        if psi is not None:
-            params["psi"] = psi
-        if pq:
-            params["pq"] = pq
-        if complete is not None:
-            params["complete"] = complete
-        if suggid:
-            params["suggid"] = suggid
-        if gs_l:
-            params["gs_l"] = gs_l
-        
-        # Make request to Google Autocomplete API
-        async with client_obj as http_client:
-            response = await http_client.get(
-                "https://www.google.com/complete/search",
-                params=params
-            )
-            
-            if response.status_code != 200:
-                logger.error(f"Failed to retrieve suggestions. Status Code: {response.status_code}")
-                raise HTTPException(status_code=response.status_code, detail="Failed to retrieve suggestions")
-            
-            # Determine the actual response format based on parameters and content
-            # When client parameter is specified, Google usually returns JSON regardless of output parameter
-            should_try_json_first = client is not None or output in [OutputFormat.CHROME, OutputFormat.FIREFOX, OutputFormat.SAFARI, OutputFormat.OPERA]
-            
-            # Log the first 100 characters of the response for debugging
-            response_preview = response.text[:100] if response.text else "Empty response"
-            logger.debug(f"Response preview: {response_preview}...")
-            
-            # Check if response looks like JSON (starts with [ or {) or JSONP (contains callback function)
-            response_text = response.text.strip() if response.text else ""
-            looks_like_json = response_text.startswith(('[', '{'))
-            looks_like_jsonp = (callback or jsonp) and "(" in response_text and response_text.endswith(")")
-            
-            # Smart response parsing - try the most likely format first, then fall back
-            if should_try_json_first or looks_like_json or looks_like_jsonp:
-                # Try JSON parsing first
-                try:
-                    # Handle JSONP response (callback wrapped JSON)
-                    if looks_like_jsonp:
-                        logger.debug("Detected JSONP response, extracting JSON data")
-                        # Extract JSON data from JSONP wrapper
-                        # Format is typically: callback_name({"data": "value"});
-                        callback_name = response_text[:response_text.find('(')]
-                        start_idx = response_text.find('(')
-                        end_idx = response_text.rfind(')')
-                        
-                        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-                            json_str = response_text[start_idx + 1:end_idx]
-                            data = json.loads(json_str)
-                            
-                            # Parse the Google Autocomplete response structure
-                            # Format is typically: [query, [suggestions], [descriptions], [query_completions], {metadata}]
-                            parsed_response = {
-                                "callback": callback_name,
-                                "response_type": "jsonp",
-                                "original_query": data[0] if len(data) > 0 else "",
-                                "suggestions": data[1] if len(data) > 1 else [],
-                                "descriptions": data[2] if len(data) > 2 else [],
-                                "query_completions": data[3] if len(data) > 3 else [],
-                                "metadata": data[4] if len(data) > 4 else {},
-                                "raw_response": data
-                            }
-                            
-                            # Log detailed information about the response
-                            logger.debug(f"Parsed JSONP response: query='{parsed_response['original_query']}', " +
-                                        f"suggestions_count={len(parsed_response['suggestions'])}, " +
-                                        f"metadata={json.dumps(parsed_response['metadata'])}")
-                            
-                            return parsed_response
+        # Generate cache key
+        cache_key = generate_cache_key(
+            "autocomplete",
+            q=q,
+            output=output.value,
+            client=client.value if client else None,
+            gl=gl,
+            hl=hl,
+            cr=cr,
+            ds=ds,
+            spell=spell,
+            cp=cp,
+            gs_rn=gs_rn,
+            gs_id=gs_id,
+            callback=callback,
+            jsonp=jsonp,
+            psi=psi,
+            pq=pq,
+            complete=complete,
+            suggid=suggid,
+            gs_l=gs_l
+        )
+
+        async def fetch_autocomplete_suggestions():
+            # Build URL with all provided parameters
+            params = {
+                "q": q,
+                "output": output.value,
+                "gl": gl,
+                "hl": hl,
+                "spell": spell
+            }
+
+            # Add optional parameters if provided
+            if client:
+                params["client"] = client.value
+            if cr:
+                params["cr"] = cr
+            if ds:
+                params["ds"] = ds
+            if cp is not None:
+                params["cp"] = cp
+            if gs_rn is not None:
+                params["gs_rn"] = gs_rn
+            if gs_id:
+                params["gs_id"] = gs_id
+            if callback:
+                params["callback"] = callback
+            if jsonp:
+                params["jsonp"] = jsonp
+            if psi is not None:
+                params["psi"] = psi
+            if pq:
+                params["pq"] = pq
+            if complete is not None:
+                params["complete"] = complete
+            if suggid:
+                params["suggid"] = suggid
+            if gs_l:
+                params["gs_l"] = gs_l
+
+            # Make request using HTTP client manager
+            async with http_manager.get_client(proxy_url) as http_client:
+                response = await http_client.get(
+                    "https://www.google.com/complete/search",
+                    params=params
+                )
+
+                if response.status_code != 200:
+                    logger.error(f"Failed to retrieve suggestions. Status Code: {response.status_code}")
+                    raise HTTPException(status_code=response.status_code, detail="Failed to retrieve suggestions")
+
+                # Calculate response time
+                end_time = time.time()
+                response_time = end_time - start_time
+
+                # Determine the actual response format based on parameters and content
+                # When client parameter is specified, Google usually returns JSON regardless of output parameter
+                should_try_json_first = client is not None or output in [OutputFormat.CHROME, OutputFormat.FIREFOX, OutputFormat.SAFARI, OutputFormat.OPERA]
+
+                # Log the first 100 characters of the response for debugging
+                response_preview = response.text[:100] if response.text else "Empty response"
+                logger.debug(f"Response preview: {response_preview}...")
+
+                # Check if response looks like JSON (starts with [ or {) or JSONP (contains callback function)
+                response_text = response.text.strip() if response.text else ""
+                looks_like_json = response_text.startswith(('[', '{'))
+                looks_like_jsonp = (callback or jsonp) and "(" in response_text and response_text.endswith(")")
+
+                # Smart response parsing - try the most likely format first, then fall back
+                if should_try_json_first or looks_like_json or looks_like_jsonp:
+                    # Try JSON parsing first
+                    try:
+                        # Handle JSONP response (callback wrapped JSON)
+                        if looks_like_jsonp:
+                            logger.debug("Detected JSONP response, extracting JSON data")
+                            # Extract JSON data from JSONP wrapper
+                            # Format is typically: callback_name({"data": "value"});
+                            callback_name = response_text[:response_text.find('(')]
+                            start_idx = response_text.find('(')
+                            end_idx = response_text.rfind(')')
+
+                            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                                json_str = response_text[start_idx + 1:end_idx]
+                                data = json.loads(json_str)
+
+                                # Parse the Google Autocomplete response structure
+                                # Format is typically: [query, [suggestions], [descriptions], [query_completions], {metadata}]
+                                parsed_response = {
+                                    "callback": callback_name,
+                                    "response_type": "jsonp",
+                                    "original_query": data[0] if len(data) > 0 else "",
+                                    "suggestions": data[1] if len(data) > 1 else [],
+                                    "descriptions": data[2] if len(data) > 2 else [],
+                                    "query_completions": data[3] if len(data) > 3 else [],
+                                    "metadata": data[4] if len(data) > 4 else {},
+                                    "raw_response": data,
+                                    "response_metadata": {
+                                        "response_time_seconds": response_time,
+                                        "timestamp": datetime.now().isoformat(),
+                                        "request_count": http_manager.get_request_count(),
+                                        "connection_pool_stats": http_manager.get_connection_stats()
+                                    }
+                                }
+
+                                # Log detailed information about the response
+                                logger.debug(f"Parsed JSONP response: query='{parsed_response['original_query']}', " +
+                                            f"suggestions_count={len(parsed_response['suggestions'])}, " +
+                                            f"metadata={json.dumps(parsed_response['metadata'])}")
+
+                                return parsed_response
+                            else:
+                                logger.warning("Failed to extract JSON from JSONP response")
+                                return {"raw_response": response_text, "response_type": "raw_jsonp"}
                         else:
-                            logger.warning("Failed to extract JSON from JSONP response")
-                            return {"raw_response": response_text, "response_type": "raw_jsonp"}
-                    else:
-                        # Regular JSON response
-                        data = response.json()
-                        
-                        # Check if this is a Google Autocomplete array format
-                        if isinstance(data, list) and len(data) >= 2:
-                            parsed_response = {
-                                "response_type": "json",
-                                "original_query": data[0] if len(data) > 0 else "",
-                                "suggestions": data[1] if len(data) > 1 else [],
-                                "descriptions": data[2] if len(data) > 2 else [],
-                                "query_completions": data[3] if len(data) > 3 else [],
-                                "metadata": data[4] if len(data) > 4 else {},
-                                "raw_response": data
-                            }
-                            return parsed_response
+                            # Regular JSON response
+                            data = response.json()
+
+                            # Check if this is a Google Autocomplete array format
+                            if isinstance(data, list) and len(data) >= 2:
+                                parsed_response = {
+                                    "response_type": "json",
+                                    "original_query": data[0] if len(data) > 0 else "",
+                                    "suggestions": data[1] if len(data) > 1 else [],
+                                    "descriptions": data[2] if len(data) > 2 else [],
+                                    "query_completions": data[3] if len(data) > 3 else [],
+                                    "metadata": data[4] if len(data) > 4 else {},
+                                    "raw_response": data,
+                                    "response_metadata": {
+                                        "response_time_seconds": response_time,
+                                        "timestamp": datetime.now().isoformat(),
+                                        "request_count": http_manager.get_request_count(),
+                                        "connection_pool_stats": http_manager.get_connection_stats()
+                                    }
+                                }
+                                return parsed_response
+                            else:
+                                # Unknown JSON format, return as is
+                                return {"raw_response": data, "response_type": "json"}
+                    except ValueError as e:
+                        logger.warning(f"JSON parsing failed, falling back to XML: {str(e)}")
+                        # If client is specified but JSON parsing failed, log a warning about parameter conflict
+                        if client is not None:
+                            logger.warning(f"Parameter conflict: client={client.value} specified but response is not valid JSON")
+
+                        # If callback or jsonp is specified, the response might be a malformed JSONP
+                        if callback or jsonp:
+                            logger.warning(f"JSONP parameters specified but couldn't parse response: callback={callback}, jsonp={jsonp}")
+                            # Return the raw response for debugging
+                            return {"raw_response": response_text, "response_type": "unparseable_jsonp"}
+
+                        # Only fall back to XML if output is XML/toolbar
+                        if output in [OutputFormat.XML, OutputFormat.TOOLBAR]:
+                            try:
+                                root = ET.fromstring(response.content)
+                                suggestions = []
+                                for complete_suggestion in root.findall("CompleteSuggestion"):
+                                    suggestion_element = complete_suggestion.find("suggestion")
+                                    if suggestion_element is not None:
+                                        data = suggestion_element.get("data", "")
+                                        suggestions.append(data)
+                                return {"suggestions": suggestions}
+                            except ET.ParseError as e:
+                                logger.error(f"XML Parse Error: {str(e)}")
+                                logger.error(f"Response content: {response.text[:500]}...")
+                                raise HTTPException(
+                                    status_code=500,
+                                    detail=f"Failed to parse response as XML or JSON. Parameter conflict may exist between output={output.value} and client={client.value if client else 'None'}"
+                                )
                         else:
-                            # Unknown JSON format, return as is
-                            return {"raw_response": data, "response_type": "json"}
-                except ValueError as e:
-                    logger.warning(f"JSON parsing failed, falling back to XML: {str(e)}")
-                    # If client is specified but JSON parsing failed, log a warning about parameter conflict
-                    if client is not None:
-                        logger.warning(f"Parameter conflict: client={client.value} specified but response is not valid JSON")
-                    
-                    # If callback or jsonp is specified, the response might be a malformed JSONP
-                    if callback or jsonp:
-                        logger.warning(f"JSONP parameters specified but couldn't parse response: callback={callback}, jsonp={jsonp}")
-                        # Return the raw response for debugging
-                        return {"raw_response": response_text, "response_type": "unparseable_jsonp"}
-                    
-                    # Only fall back to XML if output is XML/toolbar
-                    if output in [OutputFormat.XML, OutputFormat.TOOLBAR]:
+                            # Return raw text if both JSON and XML parsing failed
+                            logger.warning("Both JSON and XML parsing failed, returning raw response")
+                            return {"raw_response": response.text}
+                else:
+                    # Try XML parsing first for toolbar/XML output formats
+                    try:
+                        root = ET.fromstring(response.content)
+                        suggestions = []
+                        for complete_suggestion in root.findall("CompleteSuggestion"):
+                            suggestion_element = complete_suggestion.find("suggestion")
+                            if suggestion_element is not None:
+                                data = suggestion_element.get("data", "")
+                                suggestions.append(data)
+                        return {"suggestions": suggestions}
+                    except ET.ParseError as e:
+                        logger.warning(f"XML parsing failed, trying JSON: {str(e)}")
+
+                        # Fall back to JSON parsing
                         try:
-                            root = ET.fromstring(response.content)
-                            suggestions = []
-                            for complete_suggestion in root.findall("CompleteSuggestion"):
-                                suggestion_element = complete_suggestion.find("suggestion")
-                                if suggestion_element is not None:
-                                    data = suggestion_element.get("data", "")
-                                    suggestions.append(data)
-                            return {"suggestions": suggestions}
-                        except ET.ParseError as e:
-                            logger.error(f"XML Parse Error: {str(e)}")
+                            data = response.json()
+                            return {"raw_response": data}
+                        except ValueError as e2:
+                            logger.error(f"Both XML and JSON parsing failed: {str(e2)}")
                             logger.error(f"Response content: {response.text[:500]}...")
                             raise HTTPException(
-                                status_code=500, 
-                                detail=f"Failed to parse response as XML or JSON. Parameter conflict may exist between output={output.value} and client={client.value if client else 'None'}"
+                                status_code=500,
+                                detail="Failed to parse response as either XML or JSON"
                             )
-                    else:
-                        # Return raw text if both JSON and XML parsing failed
-                        logger.warning("Both JSON and XML parsing failed, returning raw response")
-                        return {"raw_response": response.text}
-            else:
-                # Try XML parsing first for toolbar/XML output formats
-                try:
-                    root = ET.fromstring(response.content)
-                    suggestions = []
-                    for complete_suggestion in root.findall("CompleteSuggestion"):
-                        suggestion_element = complete_suggestion.find("suggestion")
-                        if suggestion_element is not None:
-                            data = suggestion_element.get("data", "")
-                            suggestions.append(data)
-                    return {"suggestions": suggestions}
-                except ET.ParseError as e:
-                    logger.warning(f"XML parsing failed, trying JSON: {str(e)}")
-                    
-                    # Fall back to JSON parsing
-                    try:
-                        data = response.json()
-                        return {"raw_response": data}
-                    except ValueError as e2:
-                        logger.error(f"Both XML and JSON parsing failed: {str(e2)}")
-                        logger.error(f"Response content: {response.text[:500]}...")
-                        raise HTTPException(
-                            status_code=500, 
-                            detail="Failed to parse response as either XML or JSON"
-                        )
-    
+
+        # Get cached result or fetch and cache
+        return await get_cached_or_fetch(cache_key, fetch_autocomplete_suggestions)
+
     except Exception as e:
         logger.error(f"Error in get_autocomplete: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
@@ -893,6 +1031,229 @@ async def get_suggestion_keywords_google_optimized(
             except Exception as e:
                 logger.warning(f"Error fetching suggestions for '{modified_query}': {str(e)}")
 
+    # Return both categorized suggestions and metadata
+    return {
+        "suggestions": categorized_suggestions,
+        "metadata": metadata_collection
+    }
+
+
+async def get_suggestion_keywords_google_optimized_parallel(
+    query: str, 
+    country_code: str, 
+    output: OutputFormat, 
+    hl: str, 
+    ds: str, 
+    spell: Optional[int], 
+    http_client: httpx.AsyncClient,
+    max_parallel: int = 10,
+    client: Optional[ClientType] = None,
+    cr: Optional[str] = None,
+    cp: Optional[int] = None,
+    gs_rn: Optional[int] = None,
+    gs_id: Optional[str] = None,
+    callback: Optional[str] = None,
+    jsonp: Optional[str] = None,
+    psi: Optional[int] = None,
+    pq: Optional[str] = None,
+    complete: Optional[int] = None,
+    suggid: Optional[str] = None,
+    gs_l: Optional[str] = None
+) -> dict:
+    """
+    Generates user-centric keyword expansions using parallel processing.
+    Fetches autocomplete suggestions for each variation concurrently using asyncio.gather.
+    
+    - **query**: The base keyword query.
+    - **country_code**: The country code for localization.
+    - **output**: The desired output format for the autocomplete response.
+    - **hl**: The UI language setting.
+    - **ds**: Specifies a search domain or vertical.
+    - **spell**: Controls spell-checking in autocomplete suggestions.
+    - **http_client**: The configured httpx.AsyncClient instance.
+    - **max_parallel**: Maximum number of parallel requests to make.
+    """
+    categories = {
+        "Questions": [
+            "who", "what", "where", "when", "why", "how", "are",
+            "can", "does", "did", "should", "would", "could", "is", "am", "might"
+        ],
+        "Prepositions": [
+            "can", "with", "for", "by", "about", "against", "between", "into",
+            "through", "during", "before", "after", "above", "below", "under", "over", "within"
+        ],
+        "Alphabet": list("abcdefghijklmnopqrstuvwxyz"),
+        "Comparisons": [
+            "vs", "versus", "or", "compared to", "compared with", "against",
+            "like", "similar to"
+        ],
+        "Intent-Based": [
+            "buy", "review", "price", "best", "top", "how to", "why to",
+            "where to", "find", "get", "download", "install", "learn",
+            "use", "compare", "donate", "subscribe", "sign up", "best way to"
+        ],
+        "Intent-Based - Transactional": [
+            "buy", "purchase", "order", "book", "subscribe"
+        ],
+        "Intent-Based - Informational": [
+            "how to", "what is", "tips for", "guide to", "information about"
+        ],
+        "Intent-Based - Navigational": [
+            "official site", "login", "homepage", "contact"
+        ],
+        "Time-Related": [
+            "when", "schedule", "deadline", "today", "now", "latest",
+            "future", "upcoming", "recently", "this week", "this month",
+            "this year", "current", "historical", "past", "before", "after"
+        ],
+        "Audience-Specific": [
+            "for beginners", "for small businesses", "for students", "for professionals",
+            "for teachers", "for developers", "for marketers", "for educators",
+            "for entrepreneurs", "for hobbyists", "for seniors", "for children",
+            "for parents", "for freelancers", "for startups", "for non-profits"
+        ],
+        "Problem-Solving": [
+            "solution", "issue", "error", "troubleshoot", "fix",
+            "how to solve", "how to fix", "common problems",
+            "tips for", "overcoming", "resolving", "addressing",
+            "dealing with", "combating", "eliminating"
+        ],
+        "Feature-Specific": [
+            "with video", "with images", "analytics", "tools", "with example",
+            "with tutorials", "with guides", "with screenshots", "with templates",
+            "with case studies", "for mobile", "for desktop", "with API",
+            "with integrations", "with extensions", "customizable",
+            "premium features", "advanced features"
+        ],
+        "Opinions/Reviews": [
+            "review", "opinion", "rating", "feedback", "testimonial",
+            "user reviews", "expert reviews", "customer reviews",
+            "unbiased reviews", "honest opinions", "detailed ratings",
+            "product testimonials", "service feedback", "peer reviews",
+            "trusted reviews"
+        ],
+        "Cost-Related": [
+            "price", "cost", "budget", "cheap", "expensive", "value",
+            "affordable", "free", "discount", "promotions", "deals",
+            "cheapest", "most affordable", "pricing plans", "cost-effective",
+            "low cost", "premium price", "worth the price", "ROI"
+        ],
+        "Trend-Based": [
+            "trends", "new", "upcoming", "latest", "hot", "viral",
+            "popular", "current", "2024", "emerging", "now", "breakthrough"
+        ],
+        "Geographic-Specific": [
+            "in New York", "near me", "US based", "local", "regional",
+            "global", "Worldwide", "California", "Downtown"
+        ],
+        "Demographic-Specific": [
+            "for seniors", "for millennials", "for Gen Z", "for men",
+            "for women", "for families", "for singles", "for couples",
+            "for retirees", "for parents", "for teenagers"
+        ],
+        "Seasonal/Event-Specific": [
+            "during Christmas", "for Summer", "Black Friday 2024",
+            "Cyber Monday 2024", "Halloween", "Spring", "Fall",
+            "Back to School", "New Year", "Easter"
+        ],
+        "Problem/Need-Based": [
+            "how to prevent", "how to manage", "how to improve",
+            "how to reduce", "how to increase", "how to enhance",
+            "alternatives to", "replacement for", "best practices for",
+            "real-life examples of"
+        ],
+    }
+
+    categorized_suggestions = {key: {} for key in categories.keys()}
+    metadata_collection = {}  # Store metadata for each query
+    
+    # Create a list of all tasks to be executed
+    tasks = []
+    task_info = []  # Store info about each task for later processing
+    
+    for category, prefixes in categories.items():
+        for prefix in prefixes:
+            if category.startswith("Intent-Based"):
+                modified_query = f"{prefix} {query}"
+            elif category == "Alphabet":
+                modified_query = f"{query} {prefix}"
+            else:
+                modified_query = f"{prefix} {query}"
+            
+            # Create task for this query
+            task = get_suggestions_for_query_async_with_metadata(
+                query=modified_query, 
+                country=country_code, 
+                output=output, 
+                hl=hl, 
+                ds=ds, 
+                spell=spell, 
+                http_client=http_client,
+                client=client,
+                cr=cr,
+                cp=cp,
+                gs_rn=gs_rn,
+                gs_id=gs_id,
+                callback=callback,
+                jsonp=jsonp,
+                psi=psi,
+                pq=pq,
+                complete=complete,
+                suggid=suggid,
+                gs_l=gs_l
+            )
+            
+            tasks.append(task)
+            task_info.append({
+                "category": category,
+                "prefix": prefix,
+                "query": modified_query
+            })
+    
+    logger.info(f"Starting parallel processing of {len(tasks)} variation queries with max_parallel={max_parallel}")
+    
+    # Process tasks in batches to respect the parallel limit
+    all_results = []
+    for i in range(0, len(tasks), max_parallel):
+        batch_tasks = tasks[i:i + max_parallel]
+        batch_info = task_info[i:i + max_parallel]
+        
+        logger.debug(f"Processing batch {i//max_parallel + 1} with {len(batch_tasks)} tasks")
+        
+        try:
+            # Execute batch in parallel
+            batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+            
+            # Process results
+            for j, result in enumerate(batch_results):
+                info = batch_info[j]
+                if isinstance(result, Exception):
+                    logger.warning(f"Error fetching suggestions for '{info['query']}': {str(result)}")
+                    # Store empty result for failed requests
+                    categorized_suggestions[info["category"]][info["prefix"]] = []
+                else:
+                    # Store successful results
+                    categorized_suggestions[info["category"]][info["prefix"]] = result["suggestions"]
+                    
+                    # Store metadata separately
+                    if result.get("metadata"):
+                        query_key = f"{info['category']}:{info['prefix']}"
+                        metadata_collection[query_key] = {
+                            "query": info["query"],
+                            "metadata": result.get("metadata", {}),
+                            "response_type": result.get("response_type", "unknown")
+                        }
+                        
+                        # Log interesting metadata if available
+                        if "google:verbatimrelevance" in str(result.get("metadata", {})):
+                            logger.info(f"Found verbatimrelevance for '{info['query']}': {result['metadata']}")
+        
+        except Exception as e:
+            logger.error(f"Error processing batch {i//max_parallel + 1}: {str(e)}")
+            # Continue with next batch even if this one fails
+    
+    logger.info(f"Completed parallel processing of {len(tasks)} variation queries")
+    
     # Return both categorized suggestions and metadata
     return {
         "suggestions": categorized_suggestions,

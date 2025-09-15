@@ -3,6 +3,12 @@ import nltk
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
+# Import version from version file
+try:
+    from app.__version__ import __version__ as app_version
+except ImportError:
+    app_version = "1.0.0"  # Fallback version
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Download required NLTK data on startup
@@ -24,6 +30,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Social Flood API",
     description="API for social media monitoring and content analysis",
-    version="1.0.0",
+    version=app_version,  # Use dynamic version
     lifespan=lifespan
 )

@@ -7,6 +7,7 @@ help:
 	@echo "  make test               - Run tests"
 	@echo "  make lint               - Run linter"
 	@echo "  make docker-build       - Build Docker image"
+	@echo "  make docker-nocache-build - Build Docker image without cache"
 	@echo "  make docker-run         - Run Docker container"
 	@echo "  make docker-compose-up  - Start with Docker Compose"
 	@echo "  make docker-compose-down- Stop Docker Compose containers"
@@ -73,6 +74,9 @@ lint:
 docker-build:
 	docker build -t social-flood .
 
+docker-nocache-build:
+	docker build --no-cache -t social-flood .
+
 docker-buildx:
 	@echo "Building multi-arch Docker image (linux/amd64,linux/arm64)..."
 	@./scripts/docker_multiarch.sh build
@@ -82,7 +86,7 @@ docker-buildx-no-cache:
 	@./scripts/docker_multiarch.sh build-no-cache
 
 docker-run:
-	docker run -p 8000:8000 social-flood
+	docker run -p 8000:8000 --env-file .env social-flood
 
 docker-compose-up:
 	docker-compose up -d
