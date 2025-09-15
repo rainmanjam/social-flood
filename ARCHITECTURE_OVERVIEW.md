@@ -51,7 +51,6 @@ The Social Flood API follows a layered architecture pattern with clear separatio
    - Google Trends client
    - Google Autocomplete client
    - YouTube Transcripts client
-   - Google Ads client (planned)
 
 5. **Data Storage**:
    - Redis for caching and rate limiting

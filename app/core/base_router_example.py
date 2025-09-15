@@ -12,8 +12,8 @@ from pydantic import BaseModel
 from app.core.base_router import BaseRouter
 
 # Example 1: Basic usage with auto-derived service_name
-google_ads_router = BaseRouter(prefix="/google-ads")
-# service_name is automatically derived as "google-ads"
+news_router = BaseRouter(prefix="/google-news")
+# service_name is automatically derived as "google-news"
 
 # Example 2: Explicit service_name
 youtube_router = BaseRouter(
@@ -56,81 +56,81 @@ trends_router = BaseRouter(
 )
 
 # Example models for the API endpoints
-class AdCampaign(BaseModel):
+class NewsArticle(BaseModel):
     id: str
-    name: str
-    budget: float
-    status: str
+    title: str
+    source: str
+    published_date: str
 
-class AdCampaignCreate(BaseModel):
-    name: str
-    budget: float
-    status: str = "DRAFT"
+class NewsArticleCreate(BaseModel):
+    title: str
+    source: str
+    published_date: str
 
 # Example endpoints using the router
-@google_ads_router.get("/campaigns/", response_model=List[AdCampaign])
-async def list_campaigns(
-    status: Optional[str] = Query(None, description="Filter by campaign status")
+@news_router.get("/articles/", response_model=List[NewsArticle])
+async def list_articles(
+    source: Optional[str] = Query(None, description="Filter by news source")
 ):
     """
-    List all ad campaigns, optionally filtered by status.
+    List all news articles, optionally filtered by source.
     """
     # Example implementation
-    campaigns = [
-        {"id": "1", "name": "Summer Sale", "budget": 1000.0, "status": "ACTIVE"},
-        {"id": "2", "name": "Holiday Promo", "budget": 2000.0, "status": "DRAFT"}
+    articles = [
+        {"id": "1", "title": "AI Breakthrough", "source": "Tech News", "published_date": "2023-06-01"},
+        {"id": "2", "title": "Market Update", "source": "Finance Daily", "published_date": "2023-06-02"}
     ]
     
-    if status:
-        campaigns = [c for c in campaigns if c["status"] == status]
+    if source:
+        articles = [a for a in articles if a["source"] == source]
         
-    return campaigns
+    return articles
 
-@google_ads_router.get("/campaigns/{campaign_id}", response_model=AdCampaign)
-async def get_campaign(campaign_id: str):
+@news_router.get("/articles/{article_id}", response_model=NewsArticle)
+async def get_article(article_id: str):
     """
-    Get details of a specific ad campaign.
+    Get details of a specific news article.
     """
     # Example of using the error handling methods
-    if campaign_id != "1" and campaign_id != "2":
-        google_ads_router.raise_not_found_error("Campaign", campaign_id)
+    if article_id != "1" and article_id != "2":
+        news_router.raise_not_found_error("Article", article_id)
         
     # Example implementation
-    campaigns = {
-        "1": {"id": "1", "name": "Summer Sale", "budget": 1000.0, "status": "ACTIVE"},
-        "2": {"id": "2", "name": "Holiday Promo", "budget": 2000.0, "status": "DRAFT"}
+    articles = {
+        "1": {"id": "1", "title": "AI Breakthrough", "source": "Tech News", "published_date": "2023-06-01"},
+        "2": {"id": "2", "title": "Market Update", "source": "Finance Daily", "published_date": "2023-06-02"}
     }
     
-    return campaigns[campaign_id]
+    return articles[article_id]
 
-@google_ads_router.post("/campaigns/", response_model=AdCampaign, status_code=201)
-async def create_campaign(campaign: AdCampaignCreate):
+@news_router.post("/articles/", response_model=NewsArticle, status_code=201)
+async def create_article(article: NewsArticleCreate):
     """
-    Create a new ad campaign.
+    Create a new news article.
     """
     # Example of validation error
-    if campaign.budget <= 0:
-        google_ads_router.raise_validation_error(
-            "Budget must be greater than zero",
-            field="budget"
+    if not article.title:
+        news_router.raise_validation_error(
+            "Title cannot be empty",
+            field="title"
         )
         
     # Example implementation
-    new_campaign = {
+    new_article = {
         "id": "3",
-        **campaign.dict()
+        **article.dict()
     }
     
-    return new_campaign
+    return new_article
 
 # Example of how to use the router in FastAPI app
 """
 # In your main.py:
 
-from app.core.base_router_example import google_ads_router
+from app.core.base_router_example import news_router
 
 app = FastAPI()
 
 # Include the router - note we call the router instance to get the underlying APIRouter
-app.include_router(google_ads_router())
+app.include_router(news_router())
 """

@@ -1,6 +1,6 @@
 # Social Flood API
 
-A powerful API for accessing and aggregating data from various Google services including Google News, Google Trends, Google Autocomplete, YouTube Transcripts, and Google Ads.
+A powerful API for accessing and aggregating data from various Google services including Google News, Google Trends, Google Autocomplete, and YouTube Transcripts.
 
 ## Features
 
@@ -8,7 +8,6 @@ A powerful API for accessing and aggregating data from various Google services i
 - **Google Trends API** - Retrieve trending topics and search interest data
 - **Google Autocomplete API** - Get search suggestions and keyword variations
 - **YouTube Transcripts API** - Extract transcripts from YouTube videos
-- **Google Ads API** - Access keyword research, search volume, competition, and bid estimates
 - **API Versioning** - All endpoints follow `/api/v1/` structure for future compatibility
 - **RFC7807 Error Handling** - Standardized problem details for all error responses
 - **Rate Limiting** - Configurable request throttling to prevent abuse
@@ -21,7 +20,6 @@ A powerful API for accessing and aggregating data from various Google services i
 
 - Docker and Docker Compose
 - Google API credentials (see [GOOGLE_SERVICES.md](GOOGLE_SERVICES.md))
-- Google Ads API credentials (see [GOOGLE_ADS_OAUTH_SETUP.md](GOOGLE_ADS_OAUTH_SETUP.md))
 
 ### Installation
 
@@ -65,11 +63,6 @@ A powerful API for accessing and aggregating data from various Google services i
 | `DATABASE_URL` | PostgreSQL connection URL | `postgresql://user:pass@db:5432/dbname` |
 | `ENABLE_PROXY` | Enable/disable proxy for external requests | `false` |
 | `PROXY_URL` | Proxy server URL | `http://proxy:8080` |
-| `GOOGLE_ADS_DEVELOPER_TOKEN` | Google Ads API developer token | `your-developer-token` |
-| `GOOGLE_ADS_CLIENT_ID` | Google OAuth client ID | `your-client-id.apps.googleusercontent.com` |
-| `GOOGLE_ADS_CLIENT_SECRET` | Google OAuth client secret | `your-client-secret` |
-| `GOOGLE_ADS_REFRESH_TOKEN` | Google OAuth refresh token | `your-refresh-token` |
-| `GOOGLE_ADS_CUSTOMER_ID` | Google Ads customer ID (without hyphens) | `1234567890` |
 | `ENVIRONMENT` | Application environment | `development` |
 | `DEBUG` | Enable/disable debug mode | `false` |
 | `PROJECT_NAME` | Application name | `Social Flood` |
@@ -150,53 +143,12 @@ Response:
 }
 ```
 
-### Google Ads Keyword Ideas
-
-```bash
-curl -X POST "http://localhost:8000/api/v1/google-ads/keyword-ideas" \
-  -H "x-api-key: your_api_key" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "customer_id": "1234567890",
-    "keywords": ["python programming", "machine learning"],
-    "language_id": "1000",
-    "country_code": "US"
-  }'
-```
-
-Response:
-```json
-{
-  "keyword_ideas": [
-    {
-      "text": "python programming tutorial",
-      "avg_monthly_searches": 12000,
-      "competition": "HIGH",
-      "competition_index": 75.5,
-      "low_top_of_page_bid_micros": 1.2,
-      "high_top_of_page_bid_micros": 3.5,
-      "historical_metrics": {
-        "monthly_search_volumes": [
-          {
-            "year": 2025,
-            "month": 5,
-            "monthly_searches": 12000
-          }
-        ]
-      }
-    },
-    ...
-  ]
-}
-```
-
 For more examples, see [EXAMPLES.md](EXAMPLES.md).
 
 ## Documentation
 
 - [API Structure](API_STRUCTURE.md) - Detailed API structure and organization
 - [Google Services](GOOGLE_SERVICES.md) - How to integrate with Google services
-- [Google Ads OAuth Setup](GOOGLE_ADS_OAUTH_SETUP.md) - How to set up OAuth for Google Ads API
 - [Architecture Overview](ARCHITECTURE_OVERVIEW.md) - High-level system architecture
 - [Deployment](DEPLOYMENT.md) - Step-by-step deployment instructions
 - [Security Guidelines](SECURITY_GUIDELINES.md) - Best practices and security considerations

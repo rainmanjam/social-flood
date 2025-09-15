@@ -10,7 +10,6 @@ The Social Flood API integrates with the following Google services:
 2. **Google Trends** - Retrieve trending topics and search interest data
 3. **Google Autocomplete** - Get search suggestions and keyword variations
 4. **YouTube Transcripts** - Extract transcripts from YouTube videos
-5. **Google Ads** - Access advertising data and keyword research (planned)
 
 ## Authentication and Credentials
 
@@ -29,60 +28,7 @@ Some Google services require an API key for authentication. To obtain a Google A
 GOOGLE_API_KEY=your_api_key_here
 ```
 
-### Google Ads API Credentials
-
-Google Ads API requires OAuth 2.0 credentials:
-
-1. Go to the [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a new project or select an existing one
-3. Navigate to "APIs & Services" > "Credentials"
-4. Click "Create Credentials" > "OAuth client ID"
-5. Select "Web application" as the application type
-6. Add authorized redirect URIs (e.g., `http://localhost:8000/auth/callback`)
-7. Copy the client ID and client secret
-8. Obtain a developer token from the [Google Ads API Center](https://ads.google.com/home/tools/manager-accounts/)
-9. Generate a refresh token using the OAuth 2.0 flow
-10. Add these credentials to your `.env` file
-
-```
-GOOGLE_ADS_DEVELOPER_TOKEN=your_developer_token
-GOOGLE_ADS_CLIENT_ID=your_client_id
-GOOGLE_ADS_CLIENT_SECRET=your_client_secret
-GOOGLE_ADS_REFRESH_TOKEN=your_refresh_token
-```
-
 ## Code Examples
-
-### Setting Up Google Ads Client
-
-```python
-from app.core.config import get_settings
-
-settings = get_settings()
-
-# Check if Google Ads credentials are configured
-if all([
-    settings.GOOGLE_ADS_DEVELOPER_TOKEN,
-    settings.GOOGLE_ADS_CLIENT_ID,
-    settings.GOOGLE_ADS_CLIENT_SECRET,
-    settings.GOOGLE_ADS_REFRESH_TOKEN
-]):
-    from google.ads.googleads.client import GoogleAdsClient
-    
-    # Create credentials dictionary
-    credentials = {
-        "developer_token": settings.GOOGLE_ADS_DEVELOPER_TOKEN,
-        "client_id": settings.GOOGLE_ADS_CLIENT_ID,
-        "client_secret": settings.GOOGLE_ADS_CLIENT_SECRET,
-        "refresh_token": settings.GOOGLE_ADS_REFRESH_TOKEN,
-        "use_proto_plus": True
-    }
-    
-    # Initialize Google Ads client
-    google_ads_client = GoogleAdsClient.load_from_dict(credentials)
-else:
-    raise ValueError("Google Ads credentials not fully configured")
-```
 
 ### Making a Google News API Request
 
@@ -205,13 +151,6 @@ Google Autocomplete does not have an official API, and the Social Flood API uses
 YouTube Transcripts API uses the `youtube-transcript-api` library, which has the following limitations:
 
 - Maximum of 300 requests per day per IP address
-
-### Google Ads API
-
-Google Ads API has official quotas that vary by account type:
-
-- Standard accounts: 10,000 operations per day
-- Premium accounts: 100,000 operations per day
 
 ## Best Practices
 

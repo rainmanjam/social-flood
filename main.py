@@ -35,7 +35,6 @@ from app.api.google_news.google_news_api import gnews_router, setup_nltk
 from app.api.google_autocomplete.google_autocomplete_api import router as google_autocomplete_router
 from app.api.google_trends.google_trends_api import google_trends_router
 from app.api.youtube_transcripts.youtube_transcripts_api import youtube_transcripts_router
-from app.api.google_ads import router as google_ads_router
 
 # Configure logging
 logging.basicConfig(
@@ -278,10 +277,6 @@ def create_application() -> FastAPI:
         tags=["YouTube Transcripts API"],
         dependencies=[Depends(get_api_key)]
     )
-    
-    # The google_ads_router is already an APIRouter instance (from BaseRouter.__call__())
-    # and already has prefix, tags, and dependencies set
-    v1_router.include_router(google_ads_router)
     
     # Include v1 router in app
     app.include_router(v1_router)

@@ -64,10 +64,6 @@ def check_env_variables():
     
     # API-specific variables
     api_vars = [
-        "GOOGLE_ADS_DEVELOPER_TOKEN",
-        "GOOGLE_ADS_CLIENT_ID",
-        "GOOGLE_ADS_CLIENT_SECRET",
-        "GOOGLE_ADS_REFRESH_TOKEN",
     ]
     
     # Check required variables
@@ -177,17 +173,6 @@ def check_network():
 def check_api_services():
     """Check API services."""
     print_header("Checking API Services")
-    
-    # Check Google APIs if credentials are available
-    if all([
-        os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN"),
-        os.environ.get("GOOGLE_ADS_CLIENT_ID"),
-        os.environ.get("GOOGLE_ADS_CLIENT_SECRET"),
-        os.environ.get("GOOGLE_ADS_REFRESH_TOKEN")
-    ]):
-        print_success("Google Ads API credentials are available")
-    else:
-        print_warning("Google Ads API credentials are incomplete")
     
     # Check Redis if enabled
     if os.environ.get("ENABLE_CACHE") == "True" and os.environ.get("REDIS_URL"):

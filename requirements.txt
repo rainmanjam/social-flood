@@ -20,8 +20,6 @@ httpx
 asyncio
 email-validator
 youtube-transcript-api
-google-ads>=20.0.0  # Google Ads API client
-google-auth-oauthlib>=1.0.0  # For OAuth authentication
 google-auth>=2.0.0  # Google authentication library
 pandas  # For data analysis
 matplotlib  # For visualization
