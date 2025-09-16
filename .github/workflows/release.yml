@@ -5,7 +5,51 @@ on:
     branches: [ main ]
 
 jobs:
+  bump-version:
+    name: Bump Version
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Increment version
+        run: python scripts/increment_version.py patch
+
+      - name: Read new version
+        id: new-version
+        run: |
+          VERSION=$(python -c "from app.__version__ import __version__; print(__version__)")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version bumped to $VERSION"
+
+      - name: Commit version bump
+        id: commit
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add app/__version__.py
+          if git diff --cached --quiet; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          git commit -m "chore: bump version to v${{ steps.new-version.outputs.version }}"
+          echo "changed=true" >> $GITHUB_OUTPUT
+
+      - name: Push version bump
+        if: steps.commit.outputs.changed == 'true'
+        run: git push origin HEAD:${{ github.ref }}
+
   release:
+    name: Publish Release
+    if: github.actor == 'github-actions[bot]'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -18,68 +62,61 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Install GitHub CLI
-        run: |
-          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-          sudo apt update
-          sudo apt install gh
-
-      - name: Get current version
-        id: current-version
-        run: |
-          VERSION=$(python -c "from app.__version__ import __version__; print(__version__)")
-          echo "current_version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Current version: $VERSION"
-
-      - name: Increment version
-        run: |
-          python scripts/increment_version.py patch
-
-      - name: Get new version
-        id: new-version
+      - name: Read release version
+        id: release-version
         run: |
           VERSION=$(python -c "from app.__version__ import __version__; print(__version__)")
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "New version: $VERSION"
+          echo "Release version: $VERSION"
 
-      - name: Commit version bump
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add app/__version__.py
-          git commit -m "chore: bump version to v${{ steps.new-version.outputs.version }}" || echo "No changes to commit"
-
-      - name: Pull latest main
-        run: |
-          git fetch origin main
-          git rebase origin/main
-      
-      - name: Push version bump
-        run: |
-          git push origin main
+      - name: Determine release state
+        id: release-check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const version = '${{ steps.release-version.outputs.version }}';
+            try {
+              await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag: `v${version}`,
+              });
+              core.info(`Release v${version} already exists`);
+              core.setOutput('publish', 'false');
+            } catch (error) {
+              if (error.status === 404) {
+                core.info(`Preparing first release for v${version}`);
+                core.setOutput('publish', 'true');
+              } else {
+                throw error;
+              }
+            }
 
       - name: Set up Docker Buildx
+        if: steps.release-check.outputs.publish == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to DockerHub
+        if: steps.release-check.outputs.publish == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}  # Store your token in this secret
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Log in to GitHub Container Registry
+        if: steps.release-check.outputs.publish == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
+          username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata
+        if: steps.release-check.outputs.publish == 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -87,10 +124,11 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/social-flood
             ghcr.io/${{ github.repository }}
           tags: |
-            type=raw,value=${{ steps.new-version.outputs.version }}
+            type=raw,value=${{ steps.release-version.outputs.version }}
             type=raw,value=latest
 
       - name: Build and push Docker image
+        if: steps.release-check.outputs.publish == 'true'
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -102,70 +140,52 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Install Cosign
+        if: steps.release-check.outputs.publish == 'true'
         uses: sigstore/cosign-installer@v3
 
       - name: Sign Docker images
+        if: steps.release-check.outputs.publish == 'true'
         run: |
-          # Sign Docker Hub image
-          cosign sign --yes ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.new-version.outputs.version }}
+          cosign sign --yes ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.release-version.outputs.version }}
           cosign sign --yes ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest
-          
-          # Sign GitHub Container Registry image
-          cosign sign --yes ghcr.io/${{ github.repository }}:${{ steps.new-version.outputs.version }}
+          cosign sign --yes ghcr.io/${{ github.repository }}:${{ steps.release-version.outputs.version }}
           cosign sign --yes ghcr.io/${{ github.repository }}:latest
 
-      - name: Generate SBOM
-        uses: anchore/sbom-action/download-syft@v0.14.3
+      - name: Generate SBOM tool
+        if: steps.release-check.outputs.publish == 'true'
         id: syft
+        uses: anchore/sbom-action/download-syft@v0.14.3
 
       - name: Create SBOM attestation
+        if: steps.release-check.outputs.publish == 'true'
         run: |
-          # Generate SBOM for Docker Hub image
-          ${{ steps.syft.outputs.cmd }} ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.new-version.outputs.version }} -o spdx-json > sbom-dockerhub.json
-          cosign attest --predicate sbom-dockerhub.json --type spdx ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.new-version.outputs.version }}
-          
-          # Generate SBOM for GitHub Container Registry image
-          ${{ steps.syft.outputs.cmd }} ghcr.io/${{ github.repository }}:${{ steps.new-version.outputs.version }} -o spdx-json > sbom-ghcr.json
-          cosign attest --predicate sbom-ghcr.json --type spdx ghcr.io/${{ github.repository }}:${{ steps.new-version.outputs.version }}
+          ${{ steps.syft.outputs.cmd }} ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.release-version.outputs.version }} -o spdx-json > sbom-dockerhub.json
+          cosign attest --predicate sbom-dockerhub.json --type spdx ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.release-version.outputs.version }}
 
-      - name: Check if release exists
-        id: release-check
-        run: |
-          if gh release view "v${{ steps.new-version.outputs.version }}" --repo ${{ github.repository }} 2>/dev/null; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-            echo "Release v${{ steps.new-version.outputs.version }} already exists"
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
-            echo "Release v${{ steps.new-version.outputs.version }} does not exist"
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ${{ steps.syft.outputs.cmd }} ghcr.io/${{ github.repository }}:${{ steps.release-version.outputs.version }} -o spdx-json > sbom-ghcr.json
+          cosign attest --predicate sbom-ghcr.json --type spdx ghcr.io/${{ github.repository }}:${{ steps.release-version.outputs.version }}
 
       - name: Generate release notes
-        if: steps.release-check.outputs.exists == 'false'
+        if: steps.release-check.outputs.publish == 'true'
         id: release-notes
         run: |
-          # Get recent commits for this release
           COMMITS=$(git log --oneline -10 --pretty=format:"- %s" 2>/dev/null || echo "- Various improvements and updates")
 
-          # Generate comprehensive release notes
-          RELEASE_NOTES="## 🚀 Release v${{ steps.new-version.outputs.version }}
+          RELEASE_NOTES="## 🚀 Release v${{ steps.release-version.outputs.version }}
 
           **Automatic Release**: Created from push to main branch
-          **Triggered by**: ${{ github.actor }}
+          **Triggered by**: ${{ github.triggering_actor }}
 
           ### 📋 What's Changed
-
-          This release includes the following recent changes:
 
           $COMMITS
 
           ### 🐳 Deployment
 
-          - **Docker Hub**: \`${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.new-version.outputs.version }}\`
+          - **Docker Hub**: \`${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.release-version.outputs.version }}\`
           - **Latest Tag**: \`${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest\`
-          - **GitHub Packages**: \`ghcr.io/${{ github.repository }}:${{ steps.new-version.outputs.version }}\`
-          - **Container Signing**: ✅ Signed with [cosign](https://github.com/sigstore/cosign) for supply chain security
+          - **GitHub Packages**: \`ghcr.io/${{ github.repository }}:${{ steps.release-version.outputs.version }}\`
+          - **Container Signing**: ✅ Signed with [cosign](https://github.com/sigstore/cosign)
 
           ### 🔒 Security Features
 
@@ -177,11 +197,11 @@ jobs:
 
           \`\`\`bash
           # From Docker Hub
-          docker pull ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.new-version.outputs.version }}
+          docker pull ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.release-version.outputs.version }}
           docker pull ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest
 
           # From GitHub Packages
-          docker pull ghcr.io/${{ github.repository }}:${{ steps.new-version.outputs.version }}
+          docker pull ghcr.io/${{ github.repository }}:${{ steps.release-version.outputs.version }}
           docker pull ghcr.io/${{ github.repository }}:latest
           \`\`\`
 
@@ -190,11 +210,11 @@ jobs:
           Verify the container signatures:
           \`\`\`bash
           # Docker Hub
-          cosign verify ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.new-version.outputs.version }}
+          cosign verify ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.release-version.outputs.version }}
           cosign verify ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest
 
           # GitHub Packages
-          cosign verify ghcr.io/${{ github.repository }}:${{ steps.new-version.outputs.version }}
+          cosign verify ghcr.io/${{ github.repository }}:${{ steps.release-version.outputs.version }}
           cosign verify ghcr.io/${{ github.repository }}:latest
           \`\`\`
 
@@ -202,7 +222,6 @@ jobs:
 
           *This release was automatically created when code was pushed to the main branch.*"
 
-          # Escape newlines for GitHub output
           RELEASE_NOTES="${RELEASE_NOTES//'%'/'%25'}"
           RELEASE_NOTES="${RELEASE_NOTES//$'\n'/'%0A'}"
           RELEASE_NOTES="${RELEASE_NOTES//$'\r'/'%0D'}"
@@ -210,15 +229,13 @@ jobs:
           echo "release_notes<<EOF" >> $GITHUB_OUTPUT
           echo "$RELEASE_NOTES" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create release
-        if: steps.release-check.outputs.exists == 'false'
+        if: steps.release-check.outputs.publish == 'true'
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: v${{ steps.new-version.outputs.version }}
-          name: Release v${{ steps.new-version.outputs.version }}
+          tag_name: v${{ steps.release-version.outputs.version }}
+          name: Release v${{ steps.release-version.outputs.version }}
           body: ${{ steps.release-notes.outputs.release_notes }}
           draft: false
           prerelease: false
