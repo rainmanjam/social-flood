@@ -4,7 +4,7 @@ Utility functions for the Social Flood application.
 This module provides shared helper functions for common tasks like
 datetime formatting, JSON serialization, and other utilities.
 """
-from typing import Any, Dict, List, Optional, Union, Set, TypeVar, Generic, Callable
+from typing import Any, Dict, List, Optional, Union, Set, TypeVar, Generic, Callable, Tuple
 import json
 import datetime
 import re

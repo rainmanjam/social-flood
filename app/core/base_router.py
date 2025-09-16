@@ -84,13 +84,15 @@ class BaseRouter:
         
         # If the prefix is like "/api/v1/google-ads", take the last segment
         if len(parts) > 1 and parts[0] == "api" and parts[1].startswith("v"):
-            return parts[2] if len(parts) > 2 else parts[0]
+            service_name = parts[2] if len(parts) > 2 else parts[0]
+        else:
+            service_name = parts[0]
         
-        # Otherwise take the first segment
-        if not parts[0]:
+        # Validate that we have a non-empty service name
+        if not service_name:
             raise ValueError(f"Cannot extract service name from prefix: {prefix}")
             
-        return parts[0]
+        return service_name
     
     def _default_responses(self) -> Dict[int, dict]:
         """

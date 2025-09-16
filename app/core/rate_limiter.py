@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 # Format: {key: (requests_count, window_start_timestamp)}
 _rate_limit_store: Dict[str, Tuple[int, float]] = {}
 
+# Global cleanup task reference to prevent garbage collection
+_cleanup_task: Optional[asyncio.Task] = None
+
 
 class RateLimiter:
     """
@@ -50,9 +53,26 @@ class RateLimiter:
             settings: Optional settings instance
         """
         self.settings = settings or get_settings()
-        self.requests = self.settings.RATE_LIMIT_REQUESTS if hasattr(self.settings, "RATE_LIMIT_REQUESTS") else requests
-        self.timeframe = self.settings.RATE_LIMIT_TIMEFRAME if hasattr(self.settings, "RATE_LIMIT_TIMEFRAME") else timeframe
-        self.enabled = self.settings.RATE_LIMIT_ENABLED if hasattr(self.settings, "RATE_LIMIT_ENABLED") else True
+        
+        # Use provided values, or fall back to settings, or use defaults
+        if requests != 100:
+            self.requests = requests
+        elif hasattr(self.settings, "RATE_LIMIT_REQUESTS"):
+            self.requests = self.settings.RATE_LIMIT_REQUESTS
+        else:
+            self.requests = 100
+            
+        if timeframe != 3600:
+            self.timeframe = timeframe
+        elif hasattr(self.settings, "RATE_LIMIT_TIMEFRAME"):
+            self.timeframe = self.settings.RATE_LIMIT_TIMEFRAME
+        else:
+            self.timeframe = 3600
+        self.enabled = (
+            self.settings.RATE_LIMIT_ENABLED 
+            if hasattr(self.settings, "RATE_LIMIT_ENABLED") 
+            else True
+        )
     
     async def _get_rate_limit_key(self, request: Request) -> str:
         """
@@ -71,7 +91,7 @@ class RateLimiter:
         try:
             api_key = await get_current_api_key(request)
             return f"rate_limit:api_key:{api_key}"
-        except:
+        except Exception:
             # Fall back to IP address
             client_host = request.client.host if request.client else "unknown"
             return f"rate_limit:ip:{client_host}"
@@ -105,14 +125,16 @@ class RateLimiter:
                 _rate_limit_store[key] = (1, now)
                 return False, self._get_rate_limit_headers(1, self.requests, self.timeframe)
             
-            # Check if the request count exceeds the limit
-            if requests_count >= self.requests:
-                # Rate limited
-                return True, self._get_rate_limit_headers(requests_count, self.requests, self.timeframe, window_start)
-            
             # Increment the request count
-            _rate_limit_store[key] = (requests_count + 1, window_start)
-            return False, self._get_rate_limit_headers(requests_count + 1, self.requests, self.timeframe, window_start)
+            new_count = requests_count + 1
+            _rate_limit_store[key] = (new_count, window_start)
+            
+            # Check if the request count exceeds the limit
+            if new_count > self.requests:
+                # Rate limited
+                return True, self._get_rate_limit_headers(new_count, self.requests, self.timeframe, window_start)
+            
+            return False, self._get_rate_limit_headers(new_count, self.requests, self.timeframe, window_start)
         
         # First request for this key
         _rate_limit_store[key] = (1, now)
@@ -184,7 +206,7 @@ class RateLimiter:
         if is_limited:
             # Log the rate limit
             logger.warning(
-                f"Rate limit exceeded",
+                "Rate limit exceeded",
                 extra={
                     "path": request.url.path,
                     "method": request.method,
@@ -329,4 +351,5 @@ async def cleanup_rate_limit_store():
 # Start the cleanup task
 def start_cleanup_task():
     """Start the rate limit store cleanup task."""
-    asyncio.create_task(cleanup_rate_limit_store())
+    global _cleanup_task
+    _cleanup_task = asyncio.create_task(cleanup_rate_limit_store())

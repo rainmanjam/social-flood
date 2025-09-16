@@ -22,6 +22,13 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install GitHub CLI
+        run: |
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt update
+          sudo apt install gh
+
       - name: Get current version
         id: current-version
         run: |
@@ -68,25 +75,61 @@ jobs:
         if: steps.release-check.outputs.exists == 'false'
         id: release-notes
         run: |
-          # Get the latest commit message
-          LATEST_COMMIT=$(git log -1 --pretty=format:"%s")
-          echo "Latest commit: $LATEST_COMMIT"
+          # Get PR information
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          PR_BODY="${{ github.event.pull_request.body }}"
+          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
 
-          # Generate basic release notes
-          RELEASE_NOTES="## What's Changed
+          echo "PR #$PR_NUMBER: $PR_TITLE by @$PR_AUTHOR"
 
-          This release includes various improvements and bug fixes.
+          # Get commits from this PR
+          COMMITS=$(gh pr view $PR_NUMBER --json commits --jq '.commits[].messageHeadline' 2>/dev/null || echo "Various improvements")
 
-          ### Recent Changes
-          - $LATEST_COMMIT
+          # Generate comprehensive release notes
+          RELEASE_NOTES="## 🚀 Release v${{ steps.new-version.outputs.version }}
 
-          ### Deployment
-          - Docker image: ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.new-version.outputs.version }}
-          - Signed with cosign for supply chain security
+          **Merged from PR #$PR_NUMBER**: $PR_TITLE
+          **Author**: @$PR_AUTHOR
 
-          ### Security
-          - SBOM (Software Bill of Materials) attached
-          - Provenance attestation included"
+          ### 📋 What's Changed
+
+          This release includes the following changes:
+
+          $COMMITS
+
+          ### 🐳 Deployment
+
+          - **Docker Image**: \`${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.new-version.outputs.version }}\`
+          - **Latest Tag**: \`${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest\`
+          - **Container Signing**: ✅ Signed with [cosign](https://github.com/sigstore/cosign) for supply chain security
+
+          ### 🔒 Security Features
+
+          - **SBOM**: Software Bill of Materials attached for vulnerability scanning
+          - **Provenance**: Cryptographic attestation of build process included
+          - **Container Signing**: All images are cryptographically signed
+
+          ### 📦 Installation
+
+          \`\`\`bash
+          # Pull the latest signed image
+          docker pull ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.new-version.outputs.version }}
+
+          # Or use the latest tag
+          docker pull ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest
+          \`\`\`
+
+          ### 🔍 Verification
+
+          Verify the container signature:
+          \`\`\`bash
+          cosign verify ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.new-version.outputs.version }}
+          \`\`\`
+
+          ---
+
+          *This release was automatically created when PR #$PR_NUMBER was merged to main.*"
 
           # Escape newlines for GitHub output
           RELEASE_NOTES="${RELEASE_NOTES//'%'/'%25'}"
@@ -96,6 +139,8 @@ jobs:
           echo "release_notes<<EOF" >> $GITHUB_OUTPUT
           echo "$RELEASE_NOTES" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create release
         if: steps.release-check.outputs.exists == 'false'
