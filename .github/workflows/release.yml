@@ -9,6 +9,8 @@ jobs:
     name: Bump Version
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
