@@ -210,7 +210,7 @@ class GoogleAutocompleteParams(BaseModel):
     
     class Config:
         """Configuration for the Pydantic model."""
-        schema_extra = {
+        json_schema_extra = {
             "example": {
                 "q": "chrome",
                 "output": "chrome",
