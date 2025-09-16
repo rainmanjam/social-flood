@@ -1,13 +1,11 @@
 name: Create Release
 
 on:
-  pull_request:
-    types: [ closed ]
+  push:
     branches: [ main ]
 
 jobs:
   release:
-    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -147,26 +145,18 @@ jobs:
         if: steps.release-check.outputs.exists == 'false'
         id: release-notes
         run: |
-          # Get PR information
-          PR_NUMBER=${{ github.event.pull_request.number }}
-          PR_TITLE="${{ github.event.pull_request.title }}"
-          PR_BODY="${{ github.event.pull_request.body }}"
-          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
-
-          echo "PR #$PR_NUMBER: $PR_TITLE by @$PR_AUTHOR"
-
-          # Get commits from this PR
-          COMMITS=$(gh pr view $PR_NUMBER --json commits --jq '.commits[].messageHeadline' 2>/dev/null || echo "Various improvements")
+          # Get recent commits for this release
+          COMMITS=$(git log --oneline -10 --pretty=format:"- %s" 2>/dev/null || echo "- Various improvements and updates")
 
           # Generate comprehensive release notes
           RELEASE_NOTES="## 🚀 Release v${{ steps.new-version.outputs.version }}
 
-          **Merged from PR #$PR_NUMBER**: $PR_TITLE
-          **Author**: @$PR_AUTHOR
+          **Automatic Release**: Created from push to main branch
+          **Triggered by**: ${{ github.actor }}
 
           ### 📋 What's Changed
 
-          This release includes the following changes:
+          This release includes the following recent changes:
 
           $COMMITS
 
@@ -210,7 +200,7 @@ jobs:
 
           ---
 
-          *This release was automatically created when PR #$PR_NUMBER was merged to main.*"
+          *This release was automatically created when code was pushed to the main branch.*"
 
           # Escape newlines for GitHub output
           RELEASE_NOTES="${RELEASE_NOTES//'%'/'%25'}"
