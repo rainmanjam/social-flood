@@ -13,7 +13,7 @@ from trendspy import Trends, BatchPeriod
 from app.core.proxy import get_proxy
 from app.core.cache_manager import generate_cache_key, get_cached_or_fetch
 from app.core.rate_limiter import rate_limit
-from app.core.http_client import http_manager
+from app.core.http_client import get_http_client_manager
 import random
 import json
 
@@ -701,6 +701,8 @@ async def trending_now_news_by_ids(
         # Get cached result or fetch and cache
         return await get_cached_or_fetch(cache_key, fetch_trending_now_news_by_ids)
 
+    except HTTPException as http_exc:
+        raise http_exc
     except Exception as e:
         logger.error(f"Error in trending_now_news_by_ids: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error")

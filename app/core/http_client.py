@@ -279,10 +279,6 @@ def set_http_client_manager(manager: HTTPClientManager):
     globals()['_http_client_manager'] = manager
 
 
-# Create global http_manager instance for easy importing
-http_manager = HTTPClientManager()
-
-
 @asynccontextmanager
 async def lifespan_manager():
     """Context manager for application lifespan management."""
