@@ -11,6 +11,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      packages: write
+      id-token: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -58,6 +60,71 @@ jobs:
         run: |
           git push origin main
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/social-flood
+            ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=${{ steps.new-version.outputs.version }}
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign Docker images
+        run: |
+          # Sign Docker Hub image
+          cosign sign --yes ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.new-version.outputs.version }}
+          cosign sign --yes ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest
+          
+          # Sign GitHub Container Registry image
+          cosign sign --yes ghcr.io/${{ github.repository }}:${{ steps.new-version.outputs.version }}
+          cosign sign --yes ghcr.io/${{ github.repository }}:latest
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action/download-syft@v0.14.3
+        id: syft
+
+      - name: Create SBOM attestation
+        run: |
+          # Generate SBOM for Docker Hub image
+          ${{ steps.syft.outputs.cmd }} ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.new-version.outputs.version }} -o spdx-json > sbom-dockerhub.json
+          cosign attest --predicate sbom-dockerhub.json --type spdx ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.new-version.outputs.version }}
+          
+          # Generate SBOM for GitHub Container Registry image
+          ${{ steps.syft.outputs.cmd }} ghcr.io/${{ github.repository }}:${{ steps.new-version.outputs.version }} -o spdx-json > sbom-ghcr.json
+          cosign attest --predicate sbom-ghcr.json --type spdx ghcr.io/${{ github.repository }}:${{ steps.new-version.outputs.version }}
+
       - name: Check if release exists
         id: release-check
         run: |
@@ -100,8 +167,9 @@ jobs:
 
           ### 🐳 Deployment
 
-          - **Docker Image**: \`${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.new-version.outputs.version }}\`
+          - **Docker Hub**: \`${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.new-version.outputs.version }}\`
           - **Latest Tag**: \`${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest\`
+          - **GitHub Packages**: \`ghcr.io/${{ github.repository }}:${{ steps.new-version.outputs.version }}\`
           - **Container Signing**: ✅ Signed with [cosign](https://github.com/sigstore/cosign) for supply chain security
 
           ### 🔒 Security Features
@@ -113,18 +181,26 @@ jobs:
           ### 📦 Installation
 
           \`\`\`bash
-          # Pull the latest signed image
+          # From Docker Hub
           docker pull ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.new-version.outputs.version }}
-
-          # Or use the latest tag
           docker pull ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest
+
+          # From GitHub Packages
+          docker pull ghcr.io/${{ github.repository }}:${{ steps.new-version.outputs.version }}
+          docker pull ghcr.io/${{ github.repository }}:latest
           \`\`\`
 
           ### 🔍 Verification
 
-          Verify the container signature:
+          Verify the container signatures:
           \`\`\`bash
+          # Docker Hub
           cosign verify ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.new-version.outputs.version }}
+          cosign verify ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest
+
+          # GitHub Packages
+          cosign verify ghcr.io/${{ github.repository }}:${{ steps.new-version.outputs.version }}
+          cosign verify ghcr.io/${{ github.repository }}:latest
           \`\`\`
 
           ---
