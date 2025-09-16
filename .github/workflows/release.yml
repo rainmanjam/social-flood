@@ -56,6 +56,11 @@ jobs:
           git add app/__version__.py
           git commit -m "chore: bump version to v${{ steps.new-version.outputs.version }}" || echo "No changes to commit"
 
+      - name: Pull latest main
+        run: |
+          git fetch origin main
+          git rebase origin/main
+      
       - name: Push version bump
         run: |
           git push origin main
