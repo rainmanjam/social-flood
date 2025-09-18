@@ -6,6 +6,11 @@ help:
 	@echo "  make run                - Run development server"
 	@echo "  make test               - Run tests"
 	@echo "  make lint               - Run linter"
+	@echo "  make format             - Format code with black and isort"
+	@echo "  make format-check       - Check code formatting without changes"
+	@echo "  make quality-check      - Run comprehensive code quality checks"
+	@echo "  make pre-commit-install - Install pre-commit hooks"
+	@echo "  make pre-commit-run     - Run all pre-commit hooks"
 	@echo "  make docker-build       - Build Docker image"
 	@echo "  make docker-nocache-build - Build Docker image without cache"
 	@echo "  make docker-run         - Run Docker container"
@@ -70,6 +75,25 @@ test:
 
 lint:
 	pylint app/
+
+# Enhanced code quality targets
+format:
+	black --line-length 120 app/
+	isort --line-length 120 app/
+
+format-check:
+	black --line-length 120 --check app/
+	isort --line-length 120 --check-only app/
+
+quality-check:
+	./scripts/check_code_quality.sh
+
+pre-commit-install:
+	pip install pre-commit
+	pre-commit install
+
+pre-commit-run:
+	pre-commit run --all-files
 
 docker-build:
 	docker build -t social-flood .

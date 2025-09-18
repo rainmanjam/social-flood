@@ -1,31 +1,36 @@
 # app/core/proxy.py
 
+import asyncio
+import itertools
+import logging
 import os
 import re
-import itertools
-import asyncio
-import logging
 
 logger = logging.getLogger("uvicorn")
 
-PROXY_URLS = os.getenv('PROXY_URLS', '')
-ENABLE_PROXY = os.getenv('ENABLE_PROXY', 'false').lower() == 'true'
+PROXY_URLS = os.getenv("PROXY_URLS", "")
+ENABLE_PROXY = os.getenv("ENABLE_PROXY", "false").lower() == "true"
+
 
 def is_valid_url(url):
-    return re.match(r'^(http|https):\/\/[^\s\/$.?#].[^\s]*$', url) is not None
+    return re.match(r"^(http|https):\/\/[^\s\/$.?#].[^\s]*$", url) is not None
+
 
 # Parse the PROXY_URLS into a list
-PROXY_LIST = [url.strip() for url in PROXY_URLS.split(',') if is_valid_url(url.strip())]
+PROXY_LIST = [url.strip() for url in PROXY_URLS.split(",") if is_valid_url(url.strip())]
 
 # Use an asyncio.Lock for async thread safety
 _proxy_lock = asyncio.Lock()
 
+
 def get_available_proxies():
     return PROXY_LIST
+
 
 AVAILABLE_PROXIES = get_available_proxies()
 
 _proxy_iter = itertools.cycle(AVAILABLE_PROXIES) if AVAILABLE_PROXIES else None
+
 
 async def get_proxy():
     """
@@ -41,6 +46,8 @@ async def get_proxy():
             return proxy_url
         else:
             # ENABLE_PROXY is true, but _proxy_iter is None (meaning PROXY_LIST was empty)
-            logger.warning("Proxying is enabled, but no valid proxy URLs were found in PROXY_URLS or the list is empty.")
+            logger.warning(
+                "Proxying is enabled, but no valid proxy URLs were found in PROXY_URLS or the list is empty."
+            )
             return None
     return None
