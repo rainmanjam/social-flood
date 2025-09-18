@@ -1,21 +1,24 @@
 # google_trends_api.py
 
-from fastapi import APIRouter, Query, HTTPException, Depends
-from pydantic import BaseModel, Field
-from datetime import date
-import logging
 import asyncio
-import pandas as pd
-import numpy as np
-from enum import IntEnum, Enum
-from typing import List, Optional, Union
-from trendspy import Trends, BatchPeriod
-from app.core.proxy import get_proxy
-from app.core.cache_manager import generate_cache_key, get_cached_or_fetch
-from app.core.rate_limiter import rate_limit
-from app.core.http_client import get_http_client_manager
-import random
 import json
+import logging
+import random
+from datetime import date
+from enum import Enum, IntEnum
+from typing import List, Optional, Union
+
+import numpy as np
+import pandas as pd
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
+from trendspy import BatchPeriod, Trends
+
+from app.core.cache_manager import generate_cache_key, get_cached_or_fetch
+from app.core.http_client import get_http_client_manager
+from app.core.proxy import get_proxy
+from app.core.rate_limiter import rate_limit
+
 
 # Add TimeframeEnum
 class TimeframeEnum(IntEnum):
@@ -24,12 +27,14 @@ class TimeframeEnum(IntEnum):
     FOUR = 4
     FIVE = 5
 
+
 # Add HumanFriendlyBatchPeriod Enum
 class HumanFriendlyBatchPeriod(str, Enum):
     past_4h = "past_4h"
     past_24h = "past_24h"
     past_48h = "past_48h"
     past_7d = "past_7d"
+
 
 # Define Enums for each time format
 class StandardTimeframe(str, Enum):
@@ -39,6 +44,7 @@ class StandardTimeframe(str, Enum):
     TODAY_3M = "today 3-m"
     TODAY_12M = "today 12-m"
 
+
 class CustomIntervalTimeframe(str, Enum):
     NOW_123H = "now 123-H"
     NOW_72H = "now 72-H"
@@ -46,15 +52,18 @@ class CustomIntervalTimeframe(str, Enum):
     TODAY_90D = "today 90-d"
     TODAY_18M = "today 18-m"
 
+
 # Pydantic model for date range
 class DateRangeTimeframeModel(BaseModel):
     start_date: date = Field(..., description="Start date in YYYY-MM-DD format.")
     end_date: Optional[date] = Field(None, description="End date in YYYY-MM-DD format.")
 
+
 # Create the router
 google_trends_router = APIRouter()
 logger = logging.getLogger("uvicorn")
 logging.basicConfig(level=logging.DEBUG)
+
 
 # -------------------------------------------------------------------------
 # Utility Functions
@@ -66,7 +75,8 @@ def df_to_json(df: pd.DataFrame):
     """
     if df.empty:
         return []
-    return df.reset_index(drop=True).to_dict(orient='records')
+    return df.reset_index(drop=True).to_dict(orient="records")
+
 
 def to_jsonable(value):
     """
@@ -90,6 +100,7 @@ def to_jsonable(value):
         return [to_jsonable(x) for x in value]
     return value
 
+
 # -------------------------------------------------------------------------
 # Header Configuration
 # -------------------------------------------------------------------------
@@ -103,7 +114,7 @@ REFERER_LIST = [
     "https://www.aol.com/",
     "https://www.ecosia.org/",
     "https://www.startpage.com/",
-    "https://www.qwant.com/"
+    "https://www.qwant.com/",
 ]
 
 USER_AGENT_LIST = [
@@ -116,8 +127,9 @@ USER_AGENT_LIST = [
     "Mozilla/5.0 (Windows NT 6.1; WOW64)",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6)",
     "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:92.0)",
-    "Mozilla/5.0 (iPod touch; CPU iPhone OS 14_0 like Mac OS X)"
+    "Mozilla/5.0 (iPod touch; CPU iPhone OS 14_0 like Mac OS X)",
 ]
+
 
 def get_random_headers():
     """
@@ -131,9 +143,10 @@ def get_random_headers():
         "User-Agent": user_agent,
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive"
+        "Connection": "keep-alive",
     }
     return headers
+
 
 # -------------------------------------------------------------------------
 # Helper: Create a new Trends instance per request
@@ -151,6 +164,7 @@ async def get_trends_instance():
         logger.debug("TrendSpy is not using any proxy.")
         return Trends(headers=headers)
 
+
 # -------------------------------------------------------------------------
 # 1) Interest Over Time
 # -------------------------------------------------------------------------
@@ -161,7 +175,7 @@ async def interest_over_time(
     geo: Optional[str] = Query(None, description="Geolocation code (e.g., 'US', 'US-NY')."),
     cat: Optional[str] = Query(None, description="Category ID (e.g., '13' for Computers & Electronics)."),
     gprop: Optional[str] = Query(None, description="Google property (e.g., 'images', 'youtube')."),
-    rate_limit: None = Depends(rate_limit)
+    rate_limit: None = Depends(rate_limit),
 ):
     """
     Retrieves Google Trends interest over time for the specified keywords.
@@ -173,12 +187,7 @@ async def interest_over_time(
 
         # Generate cache key
         cache_key = generate_cache_key(
-            "trends_interest_over_time",
-            keywords=keywords,
-            timeframe=timeframe,
-            geo=geo,
-            cat=cat,
-            gprop=gprop
+            "trends_interest_over_time", keywords=keywords, timeframe=timeframe, geo=geo, cat=cat, gprop=gprop
         )
 
         async def fetch_interest_over_time():
@@ -187,14 +196,10 @@ async def interest_over_time(
 
             def safe_get_interest_over_time():
                 try:
-                    logger.debug(f"Calling TrendSpy API with keywords: {kw_list}, timeframe: {timeframe}, geo: {geo}, cat: {cat}, gprop: {gprop}")
-                    df = trends_obj.interest_over_time(
-                        kw_list,
-                        timeframe=timeframe,
-                        geo=geo,
-                        cat=cat,
-                        gprop=gprop
+                    logger.debug(
+                        f"Calling TrendSpy API with keywords: {kw_list}, timeframe: {timeframe}, geo: {geo}, cat: {cat}, gprop: {gprop}"
                     )
+                    df = trends_obj.interest_over_time(kw_list, timeframe=timeframe, geo=geo, cat=cat, gprop=gprop)
                     logger.debug(f"Raw API response: {df}")
 
                     if df is None or df.empty:
@@ -233,6 +238,7 @@ async def interest_over_time(
         logger.error(f"Error in interest_over_time: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
+
 # -------------------------------------------------------------------------
 # 2) Interest By Region
 # -------------------------------------------------------------------------
@@ -243,7 +249,7 @@ async def interest_by_region(
     geo: Optional[str] = Query(None, description="Geolocation code."),
     cat: Optional[str] = Query(None, description="Category ID."),
     resolution: str = Query("COUNTRY", description="Resolution level (COUNTRY, REGION, CITY)."),
-    rate_limit: None = Depends(rate_limit)
+    rate_limit: None = Depends(rate_limit),
 ):
     """
     Retrieves Google Trends interest by region for the specified keyword.
@@ -251,12 +257,7 @@ async def interest_by_region(
     try:
         # Generate cache key
         cache_key = generate_cache_key(
-            "trends_interest_by_region",
-            keyword=keyword,
-            timeframe=timeframe,
-            geo=geo,
-            cat=cat,
-            resolution=resolution
+            "trends_interest_by_region", keyword=keyword, timeframe=timeframe, geo=geo, cat=cat, resolution=resolution
         )
 
         async def fetch_interest_by_region():
@@ -265,13 +266,11 @@ async def interest_by_region(
 
             def safe_get_interest_by_region():
                 try:
-                    logger.debug(f"Calling TrendSpy API with keyword: {keyword}, timeframe: {timeframe}, geo: {geo}, cat: {cat}, resolution: {resolution}")
+                    logger.debug(
+                        f"Calling TrendSpy API with keyword: {keyword}, timeframe: {timeframe}, geo: {geo}, cat: {cat}, resolution: {resolution}"
+                    )
                     df = trends_obj.interest_by_region(
-                        keyword,
-                        timeframe=timeframe,
-                        geo=geo,
-                        cat=cat,
-                        resolution=resolution
+                        keyword, timeframe=timeframe, geo=geo, cat=cat, resolution=resolution
                     )
                     logger.debug(f"Raw API response: {df}")
 
@@ -309,6 +308,7 @@ async def interest_by_region(
         logger.error(f"Error in interest_by_region: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
+
 # -------------------------------------------------------------------------
 # 3) Related Queries (Uses a Custom Referer in the Headers)
 # -------------------------------------------------------------------------
@@ -319,7 +319,7 @@ async def related_queries(
     geo: Optional[str] = Query(None, description="Geolocation code."),
     cat: Optional[str] = Query(None, description="Category ID."),
     gprop: Optional[str] = Query(None, description="Google property (e.g., 'images', 'youtube')."),
-    rate_limit: None = Depends(rate_limit)
+    rate_limit: None = Depends(rate_limit),
 ):
     """
     Retrieves related queries for a specified keyword.
@@ -328,12 +328,7 @@ async def related_queries(
     try:
         # Generate cache key
         cache_key = generate_cache_key(
-            "trends_related_queries",
-            keyword=keyword,
-            timeframe=timeframe,
-            geo=geo,
-            cat=cat,
-            gprop=gprop
+            "trends_related_queries", keyword=keyword, timeframe=timeframe, geo=geo, cat=cat, gprop=gprop
         )
 
         async def fetch_related_queries():
@@ -342,14 +337,10 @@ async def related_queries(
 
             def safe_get_related_queries():
                 try:
-                    logger.debug(f"Calling TrendSpy API with keyword: {keyword}, timeframe: {timeframe}, geo: {geo}, cat: {cat}, gprop: {gprop}")
-                    data = trends_obj.related_queries(
-                        keyword,
-                        timeframe=timeframe,
-                        geo=geo,
-                        cat=cat,
-                        gprop=gprop
+                    logger.debug(
+                        f"Calling TrendSpy API with keyword: {keyword}, timeframe: {timeframe}, geo: {geo}, cat: {cat}, gprop: {gprop}"
                     )
+                    data = trends_obj.related_queries(keyword, timeframe=timeframe, geo=geo, cat=cat, gprop=gprop)
                     logger.debug(f"Raw API response: {data}")
 
                     if data is None:
@@ -386,6 +377,7 @@ async def related_queries(
         logger.error(f"Error in related_queries: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
+
 # -------------------------------------------------------------------------
 # 4) Related Topics
 # -------------------------------------------------------------------------
@@ -396,7 +388,7 @@ async def related_topics(
     geo: Optional[str] = Query(None, description="Geolocation code."),
     cat: Optional[str] = Query(None, description="Category ID."),
     gprop: Optional[str] = Query(None, description="Google property."),
-    rate_limit: None = Depends(rate_limit)
+    rate_limit: None = Depends(rate_limit),
 ):
     """
     Retrieves related topics for a specified keyword.
@@ -405,12 +397,7 @@ async def related_topics(
     try:
         # Generate cache key
         cache_key = generate_cache_key(
-            "trends_related_topics",
-            keyword=keyword,
-            timeframe=timeframe,
-            geo=geo,
-            cat=cat,
-            gprop=gprop
+            "trends_related_topics", keyword=keyword, timeframe=timeframe, geo=geo, cat=cat, gprop=gprop
         )
 
         async def fetch_related_topics():
@@ -419,14 +406,10 @@ async def related_topics(
 
             def safe_get_related_topics():
                 try:
-                    logger.debug(f"Calling TrendSpy API with keyword: {keyword}, timeframe: {timeframe}, geo: {geo}, cat: {cat}, gprop: {gprop}")
-                    data = trends_obj.related_topics(
-                        keyword,
-                        timeframe=timeframe,
-                        geo=geo,
-                        cat=cat,
-                        gprop=gprop
+                    logger.debug(
+                        f"Calling TrendSpy API with keyword: {keyword}, timeframe: {timeframe}, geo: {geo}, cat: {cat}, gprop: {gprop}"
                     )
+                    data = trends_obj.related_topics(keyword, timeframe=timeframe, geo=geo, cat=cat, gprop=gprop)
                     logger.debug(f"Raw API response: {data}")
 
                     if data is None:
@@ -463,23 +446,21 @@ async def related_topics(
         logger.error(f"Error in related_topics: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
+
 # -------------------------------------------------------------------------
 # 5) Trending Now
 # -------------------------------------------------------------------------
 @google_trends_router.get("/trending-now", summary="Google Trends: Trending Now")
 async def trending_now(
     geo: Optional[str] = Query("US", description="Geolocation code for trending searches (e.g., 'US')."),
-    rate_limit: None = Depends(rate_limit)
+    rate_limit: None = Depends(rate_limit),
 ):
     """
     Retrieves current trending searches for the specified geo.
     """
     try:
         # Generate cache key
-        cache_key = generate_cache_key(
-            "trends_trending_now",
-            geo=geo
-        )
+        cache_key = generate_cache_key("trends_trending_now", geo=geo)
 
         async def fetch_trending_now():
             trends_obj = await get_trends_instance()
@@ -525,23 +506,21 @@ async def trending_now(
         logger.error(f"Error in trending_now: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
+
 # -------------------------------------------------------------------------
 # 6) Trending Now by RSS
 # -------------------------------------------------------------------------
 @google_trends_router.get("/trending-now-by-rss", summary="Google Trends: Trending Now by RSS")
 async def trending_now_by_rss(
     geo: Optional[str] = Query("US", description="Geolocation code for trending searches (e.g., 'US')."),
-    rate_limit: None = Depends(rate_limit)
+    rate_limit: None = Depends(rate_limit),
 ):
     """
     Retrieves current trending searches by RSS for the specified geo. Includes related news.
     """
     try:
         # Generate cache key
-        cache_key = generate_cache_key(
-            "trends_trending_now_by_rss",
-            geo=geo
-        )
+        cache_key = generate_cache_key("trends_trending_now_by_rss", geo=geo)
 
         async def fetch_trending_now_by_rss():
             trends_obj = await get_trends_instance()
@@ -587,6 +566,7 @@ async def trending_now_by_rss(
         logger.error(f"Error in trending_now_by_rss: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
+
 # -------------------------------------------------------------------------
 # 7) Trending Now News by IDs
 # -------------------------------------------------------------------------
@@ -594,7 +574,7 @@ async def trending_now_by_rss(
 async def trending_now_news_by_ids(
     news_tokens: str = Query(..., description="Comma-separated news tokens from a trending topic."),
     max_news: int = Query(3, description="Number of articles to retrieve."),
-    rate_limit: None = Depends(rate_limit)
+    rate_limit: None = Depends(rate_limit),
 ):
     """
     Retrieves related news articles for specified news tokens.
@@ -611,11 +591,7 @@ async def trending_now_news_by_ids(
             raise HTTPException(status_code=400, detail="No valid news tokens provided.")
 
         # Generate cache key
-        cache_key = generate_cache_key(
-            "trends_trending_now_news_by_ids",
-            news_tokens=news_tokens,
-            max_news=max_news
-        )
+        cache_key = generate_cache_key("trends_trending_now_news_by_ids", news_tokens=news_tokens, max_news=max_news)
 
         async def fetch_trending_now_news_by_ids():
             trends_obj = await get_trends_instance()
@@ -707,14 +683,17 @@ async def trending_now_news_by_ids(
         logger.error(f"Error in trending_now_news_by_ids: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
+
 # -------------------------------------------------------------------------
 # 8) Trending Now Showcase Timeline (Independent Historical Data)
 # -------------------------------------------------------------------------
 @google_trends_router.get("/trending-now-showcase-timeline", summary="Get Trending Timeline")
 async def trending_now_showcase_timeline(
     keywords: str = Query(..., description="Comma-separated keywords to analyze"),
-    timeframe: HumanFriendlyBatchPeriod = Query(..., description="Timeframe value (past_4h, past_24h, past_48h, past_7d)"),
-    rate_limit: None = Depends(rate_limit)
+    timeframe: HumanFriendlyBatchPeriod = Query(
+        ..., description="Timeframe value (past_4h, past_24h, past_48h, past_7d)"
+    ),
+    rate_limit: None = Depends(rate_limit),
 ):
     """
     Get trending timeline data for specified keywords.
@@ -732,7 +711,7 @@ async def trending_now_showcase_timeline(
             HumanFriendlyBatchPeriod.past_4h: BatchPeriod.Past4H,
             HumanFriendlyBatchPeriod.past_24h: BatchPeriod.Past24H,
             HumanFriendlyBatchPeriod.past_48h: BatchPeriod.Past48H,
-            HumanFriendlyBatchPeriod.past_7d: BatchPeriod.Past7D
+            HumanFriendlyBatchPeriod.past_7d: BatchPeriod.Past7D,
         }
 
         mapped_timeframe = timeframe_mapping.get(timeframe)
@@ -742,9 +721,7 @@ async def trending_now_showcase_timeline(
 
         # Generate cache key
         cache_key = generate_cache_key(
-            "trends_trending_now_showcase_timeline",
-            keywords=keywords,
-            timeframe=timeframe.value
+            "trends_trending_now_showcase_timeline", keywords=keywords, timeframe=timeframe.value
         )
 
         async def fetch_trending_now_showcase_timeline():
@@ -754,10 +731,7 @@ async def trending_now_showcase_timeline(
             def safe_get_timeline():
                 try:
                     logger.debug(f"Calling TrendSpy API with keywords: {keyword_list}, timeframe: {mapped_timeframe}")
-                    data = trends_obj.trending_now_showcase_timeline(
-                        keyword_list,
-                        timeframe=mapped_timeframe
-                    )
+                    data = trends_obj.trending_now_showcase_timeline(keyword_list, timeframe=mapped_timeframe)
                     logger.debug(f"Raw API response: {data}")
 
                     if data is None:
@@ -796,6 +770,7 @@ async def trending_now_showcase_timeline(
         logger.error(f"Error in trending_now_showcase_timeline: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
+
 # -------------------------------------------------------------------------
 # 9) Categories
 # -------------------------------------------------------------------------
@@ -803,7 +778,7 @@ async def trending_now_showcase_timeline(
 async def get_categories(
     find: Optional[str] = Query(None, description="String to match category name (e.g., 'tech')."),
     root: Optional[str] = Query(None, description="Root category ID to list subcategories."),
-    rate_limit: None = Depends(rate_limit)
+    rate_limit: None = Depends(rate_limit),
 ):
     """
     Searches or lists categories in the Google Trends taxonomy.
@@ -811,11 +786,7 @@ async def get_categories(
     """
     try:
         # Generate cache key
-        cache_key = generate_cache_key(
-            "trends_categories",
-            find=find,
-            root=root
-        )
+        cache_key = generate_cache_key("trends_categories", find=find, root=root)
 
         async def fetch_categories():
             trends_obj = await get_trends_instance()
@@ -861,13 +832,14 @@ async def get_categories(
         logger.error(f"Error in get_categories: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
+
 # -------------------------------------------------------------------------
 # 10) Geo
 # -------------------------------------------------------------------------
 @google_trends_router.get("/geo", summary="Search or List Google Trends Geolocations")
 async def get_geo(
     find: Optional[str] = Query(None, description="String to match location name (e.g., 'york')."),
-    rate_limit: None = Depends(rate_limit)
+    rate_limit: None = Depends(rate_limit),
 ):
     """
     Searches available geolocation codes in Google Trends (countries, states, cities).
@@ -875,10 +847,7 @@ async def get_geo(
     """
     try:
         # Generate cache key
-        cache_key = generate_cache_key(
-            "trends_geo",
-            find=find
-        )
+        cache_key = generate_cache_key("trends_geo", find=find)
 
         async def fetch_geo():
             trends_obj = await get_trends_instance()
