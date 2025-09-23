@@ -1,8 +1,10 @@
-import os
-import tldextract
 import logging
+import os
+
+import tldextract
 
 logger = logging.getLogger(__name__)
+
 
 class GoogleNewsService:
     def __init__(self):
@@ -18,7 +20,7 @@ class GoogleNewsService:
             logger.warning("TLDExtract cache disabled due to permission issues")
 
     # ...existing code...
-    
+
     def _extract_domain(self, url: str) -> str:
         """Extract domain from URL using configured TLDExtract"""
         try:
