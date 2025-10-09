@@ -72,7 +72,8 @@ class HTTPClientManager:
                 }
 
                 if proxy_url:
-                    client_config["proxies"] = proxy_url
+                    # httpx uses 'proxy' parameter, not 'proxies'
+                    client_config["proxy"] = proxy_url
                     logger.debug("Created HTTP client with proxy: %s", proxy_url)
                 else:
                     logger.debug("Created HTTP client without proxy")
