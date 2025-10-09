@@ -1,23 +1,26 @@
-from fastapi import APIRouter, HTTPException, Query, Depends, Request  # Ensure Depends is imported if not already
+import asyncio
+import datetime
+import json
+import logging
+import os
+import re
+from typing import List, Optional  # Ensure Optional is imported
+from urllib.parse import quote, urlparse
+
+import httpx
+import nltk
+from fastapi import APIRouter, Depends, HTTPException, Query, Request  # Ensure Depends is imported if not already
 from fastapi.responses import JSONResponse
 from gnews import GNews
-from newspaper import Article, Config, ArticleException
-from typing import List, Optional  # Ensure Optional is imported
-import logging
-import json
-import asyncio
-from urllib.parse import quote, urlparse
-import httpx
+from newspaper import Article, ArticleException, Config
+from pydantic import BaseModel, ValidationError, validator
 from selectolax.parser import HTMLParser
-import os
-import nltk
-from pydantic import BaseModel, validator, ValidationError
-import re
-from app.core.proxy import get_proxy  # adjust if needed
-import datetime
-from app.core.rate_limiter import rate_limit
+
 from app.core.cache_manager import cache_manager
 from app.core.config import get_settings
+from app.core.proxy import get_proxy  # adjust if needed
+from app.core.rate_limiter import rate_limit
+
 
 # Initialize NLTK asynchronously at module level
 async def setup_nltk():
@@ -27,30 +30,32 @@ async def setup_nltk():
         nltk_data_dir = os.path.join(os.getcwd(), "nltk_data")
         os.makedirs(nltk_data_dir, exist_ok=True)
         nltk.data.path.insert(0, nltk_data_dir)
-        
+
         # Check if 'punkt_tab' is already downloaded
         try:
-            nltk.data.find('tokenizers/punkt_tab')
+            nltk.data.find("tokenizers/punkt_tab")
             logger.info("NLTK 'punkt_tab' resource already available.")
         except LookupError:
             # 'punkt_tab' not found, so download it
             logger.info("NLTK 'punkt_tab' resource not found. Downloading...")
-            nltk.download('punkt_tab', nltk_data_dir, quiet=True)
+            nltk.download("punkt_tab", nltk_data_dir, quiet=True)
             logger.info("NLTK 'punkt_tab' resource downloaded successfully.")
-            
+
         # Also download 'punkt' as fallback
         try:
-            nltk.data.find('tokenizers/punkt')
+            nltk.data.find("tokenizers/punkt")
         except LookupError:
             logger.info("Downloading fallback 'punkt' resource...")
-            nltk.download('punkt', nltk_data_dir, quiet=True)
-            
+            nltk.download("punkt", nltk_data_dir, quiet=True)
+
     except Exception as e:
         # Handle any other exceptions during NLTK setup
         logger.error(f"An error occurred during NLTK setup: {e}")
 
+
 # Run NLTK setup at import time (this will be awaited in the lifespan event)
 _nltk_setup_task = None
+
 
 async def ensure_nltk_setup():
     """Ensure NLTK is set up, running setup only once."""
@@ -59,152 +64,210 @@ async def ensure_nltk_setup():
         _nltk_setup_task = asyncio.create_task(setup_nltk())
     await _nltk_setup_task
 
+
 # Initialize Google News API Router
 gnews_router = APIRouter()
 logger = logging.getLogger(__name__)
 # logging.basicConfig(level=logging.DEBUG)  # Ensure DEBUG level logs are captured -> This should be handled by the main application entry point
 
+
 # Pydantic Model for Input Validation
 class SourceQuery(BaseModel):
     source: str
 
-    @validator('source')
+    @validator("source")
     def validate_source(cls, v):
         # Optimized regex to validate domain names or full URLs
-        pattern = r'^(https?://)?(www\.)?([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$'
+        pattern = r"^(https?://)?(www\.)?([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$"
         if not re.fullmatch(pattern, v):
-            raise ValueError('Invalid source URL or domain.')
+            raise ValueError("Invalid source URL or domain.")
         return v
 
+
 AVAILABLE_TOPICS = [
-    "WORLD", "NATION", "BUSINESS", "TECHNOLOGY", "ENTERTAINMENT", "SPORTS", "SCIENCE", "HEALTH",
-    "POLITICS", "CELEBRITIES", "TV", "MUSIC", "MOVIES", "THEATER", "SOCCER", "CYCLING",
-    "MOTOR SPORTS", "TENNIS", "COMBAT SPORTS", "BASKETBALL", "BASEBALL", "FOOTBALL",
-    "SPORTS BETTING", "WATER SPORTS", "HOCKEY", "GOLF", "CRICKET", "RUGBY", "ECONOMY",
-    "PERSONAL FINANCE", "FINANCE", "DIGITAL CURRENCIES", "MOBILE", "ENERGY", "GAMING",
-    "INTERNET SECURITY", "GADGETS", "VIRTUAL REALITY", "ROBOTICS", "NUTRITION", "PUBLIC HEALTH",
-    "MENTAL HEALTH", "MEDICINE", "SPACE", "WILDLIFE", "ENVIRONMENT", "NEUROSCIENCE",
-    "PHYSICS", "GEOLOGY", "PALEONTOLOGY", "SOCIAL SCIENCES", "EDUCATION", "JOBS",
-    "ONLINE EDUCATION", "HIGHER EDUCATION", "VEHICLES", "ARTS-DESIGN", "BEAUTY", "FOOD",
-    "TRAVEL", "SHOPPING", "HOME", "OUTDOORS", "FASHION"
+    "WORLD",
+    "NATION",
+    "BUSINESS",
+    "TECHNOLOGY",
+    "ENTERTAINMENT",
+    "SPORTS",
+    "SCIENCE",
+    "HEALTH",
+    "POLITICS",
+    "CELEBRITIES",
+    "TV",
+    "MUSIC",
+    "MOVIES",
+    "THEATER",
+    "SOCCER",
+    "CYCLING",
+    "MOTOR SPORTS",
+    "TENNIS",
+    "COMBAT SPORTS",
+    "BASKETBALL",
+    "BASEBALL",
+    "FOOTBALL",
+    "SPORTS BETTING",
+    "WATER SPORTS",
+    "HOCKEY",
+    "GOLF",
+    "CRICKET",
+    "RUGBY",
+    "ECONOMY",
+    "PERSONAL FINANCE",
+    "FINANCE",
+    "DIGITAL CURRENCIES",
+    "MOBILE",
+    "ENERGY",
+    "GAMING",
+    "INTERNET SECURITY",
+    "GADGETS",
+    "VIRTUAL REALITY",
+    "ROBOTICS",
+    "NUTRITION",
+    "PUBLIC HEALTH",
+    "MENTAL HEALTH",
+    "MEDICINE",
+    "SPACE",
+    "WILDLIFE",
+    "ENVIRONMENT",
+    "NEUROSCIENCE",
+    "PHYSICS",
+    "GEOLOGY",
+    "PALEONTOLOGY",
+    "SOCIAL SCIENCES",
+    "EDUCATION",
+    "JOBS",
+    "ONLINE EDUCATION",
+    "HIGHER EDUCATION",
+    "VEHICLES",
+    "ARTS-DESIGN",
+    "BEAUTY",
+    "FOOD",
+    "TRAVEL",
+    "SHOPPING",
+    "HOME",
+    "OUTDOORS",
+    "FASHION",
 ]
 
 AVAILABLE_LANGUAGES = {
-    'english': 'en',
-    'indonesian': 'id',
-    'czech': 'cs',
-    'german': 'de',
-    'spanish': 'es-419',
-    'french': 'fr',
-    'italian': 'it',
-    'latvian': 'lv',
-    'lithuanian': 'lt',
-    'hungarian': 'hu',
-    'dutch': 'nl',
-    'norwegian': 'no',
-    'polish': 'pl',
-    'portuguese brasil': 'pt-419',
-    'portuguese portugal': 'pt-150',
-    'romanian': 'ro',
-    'slovak': 'sk',
-    'slovenian': 'sl',
-    'swedish': 'sv',
-    'vietnamese': 'vi',
-    'turkish': 'tr',
-    'greek': 'el',
-    'bulgarian': 'bg',
-    'russian': 'ru',
-    'serbian': 'sr',
-    'ukrainian': 'uk',
-    'hebrew': 'he',
-    'arabic': 'ar',
-    'marathi': 'mr',
-    'hindi': 'hi',
-    'bengali': 'bn',
-    'tamil': 'ta',
-    'telugu': 'te',
-    'malyalam': 'ml',
-    'thai': 'th',
-    'chinese simplified': 'zh-Hans',
-    'chinese traditional': 'zh-Hant',
-    'japanese': 'ja',
-    'korean': 'ko'
+    "english": "en",
+    "indonesian": "id",
+    "czech": "cs",
+    "german": "de",
+    "spanish": "es-419",
+    "french": "fr",
+    "italian": "it",
+    "latvian": "lv",
+    "lithuanian": "lt",
+    "hungarian": "hu",
+    "dutch": "nl",
+    "norwegian": "no",
+    "polish": "pl",
+    "portuguese brasil": "pt-419",
+    "portuguese portugal": "pt-150",
+    "romanian": "ro",
+    "slovak": "sk",
+    "slovenian": "sl",
+    "swedish": "sv",
+    "vietnamese": "vi",
+    "turkish": "tr",
+    "greek": "el",
+    "bulgarian": "bg",
+    "russian": "ru",
+    "serbian": "sr",
+    "ukrainian": "uk",
+    "hebrew": "he",
+    "arabic": "ar",
+    "marathi": "mr",
+    "hindi": "hi",
+    "bengali": "bn",
+    "tamil": "ta",
+    "telugu": "te",
+    "malyalam": "ml",
+    "thai": "th",
+    "chinese simplified": "zh-Hans",
+    "chinese traditional": "zh-Hant",
+    "japanese": "ja",
+    "korean": "ko",
 }
 
 AVAILABLE_COUNTRIES = {
-    'Australia': 'AU',
-    'Botswana': 'BW',
-    'Canada': 'CA',
-    'Ethiopia': 'ET',
-    'Ghana': 'GH',
-    'India': 'IN',
-    'Indonesia': 'ID',
-    'Ireland': 'IE',
-    'Israel': 'IL',
-    'Kenya': 'KE',
-    'Latvia': 'LV',
-    'Malaysia': 'MY',
-    'Namibia': 'NA',
-    'New Zealand': 'NZ',
-    'Nigeria': 'NG',
-    'Pakistan': 'PK',
-    'Philippines': 'PH',
-    'Singapore': 'SG',
-    'South Africa': 'ZA',
-    'Tanzania': 'TZ',
-    'Uganda': 'UG',
-    'United Kingdom': 'GB',
-    'United States': 'US',
-    'Zimbabwe': 'ZW',
-    'Czech Republic': 'CZ',
-    'Germany': 'DE',
-    'Austria': 'AT',
-    'Switzerland': 'CH',
-    'Argentina': 'AR',
-    'Chile': 'CL',
-    'Colombia': 'CO',
-    'Cuba': 'CU',
-    'Mexico': 'MX',
-    'Peru': 'PE',
-    'Venezuela': 'VE',
-    'Belgium': 'BE',
-    'France': 'FR',
-    'Morocco': 'MA',
-    'Senegal': 'SN',
-    'Italy': 'IT',
-    'Lithuania': 'LT',
-    'Hungary': 'HU',
-    'Netherlands': 'NL',
-    'Norway': 'NO',
-    'Poland': 'PL',
-    'Brazil': 'BR',
-    'Portugal': 'PT',
-    'Romania': 'RO',
-    'Slovakia': 'SK',
-    'Slovenia': 'SI',
-    'Sweden': 'SE',
-    'Vietnam': 'VN',
-    'Turkey': 'TR',
-    'Greece': 'GR',
-    'Bulgaria': 'BG',
-    'Russia': 'RU',
-    'Ukraine': 'UA',
-    'Serbia': 'RS',
-    'United Arab Emirates': 'AE',
-    'Saudi Arabia': 'SA',
-    'Lebanon': 'LB',
-    'Egypt': 'EG',
-    'Bangladesh': 'BD',
-    'Thailand': 'TH',
-    'China': 'CN',
-    'Taiwan': 'TW',
-    'Hong Kong': 'HK',
-    'Japan': 'JP',
-    'Republic of Korea': 'KR'
+    "Australia": "AU",
+    "Botswana": "BW",
+    "Canada": "CA",
+    "Ethiopia": "ET",
+    "Ghana": "GH",
+    "India": "IN",
+    "Indonesia": "ID",
+    "Ireland": "IE",
+    "Israel": "IL",
+    "Kenya": "KE",
+    "Latvia": "LV",
+    "Malaysia": "MY",
+    "Namibia": "NA",
+    "New Zealand": "NZ",
+    "Nigeria": "NG",
+    "Pakistan": "PK",
+    "Philippines": "PH",
+    "Singapore": "SG",
+    "South Africa": "ZA",
+    "Tanzania": "TZ",
+    "Uganda": "UG",
+    "United Kingdom": "GB",
+    "United States": "US",
+    "Zimbabwe": "ZW",
+    "Czech Republic": "CZ",
+    "Germany": "DE",
+    "Austria": "AT",
+    "Switzerland": "CH",
+    "Argentina": "AR",
+    "Chile": "CL",
+    "Colombia": "CO",
+    "Cuba": "CU",
+    "Mexico": "MX",
+    "Peru": "PE",
+    "Venezuela": "VE",
+    "Belgium": "BE",
+    "France": "FR",
+    "Morocco": "MA",
+    "Senegal": "SN",
+    "Italy": "IT",
+    "Lithuania": "LT",
+    "Hungary": "HU",
+    "Netherlands": "NL",
+    "Norway": "NO",
+    "Poland": "PL",
+    "Brazil": "BR",
+    "Portugal": "PT",
+    "Romania": "RO",
+    "Slovakia": "SK",
+    "Slovenia": "SI",
+    "Sweden": "SE",
+    "Vietnam": "VN",
+    "Turkey": "TR",
+    "Greece": "GR",
+    "Bulgaria": "BG",
+    "Russia": "RU",
+    "Ukraine": "UA",
+    "Serbia": "RS",
+    "United Arab Emirates": "AE",
+    "Saudi Arabia": "SA",
+    "Lebanon": "LB",
+    "Egypt": "EG",
+    "Bangladesh": "BD",
+    "Thailand": "TH",
+    "China": "CN",
+    "Taiwan": "TW",
+    "Hong Kong": "HK",
+    "Japan": "JP",
+    "Republic of Korea": "KR",
 }
 
 # Global cache manager instance
 settings = get_settings()
+
 
 # -----------------------------------------------------------------------------
 # Cache key generation functions
@@ -212,11 +275,11 @@ settings = get_settings()
 def generate_cache_key(endpoint: str, **params) -> str:
     """
     Generate a cache key for Google News API calls.
-    
+
     Args:
         endpoint: The API endpoint name
         **params: Query parameters
-        
+
     Returns:
         str: Cache key
     """
@@ -225,85 +288,81 @@ def generate_cache_key(endpoint: str, **params) -> str:
     param_str = "_".join(f"{k}:{v}" for k, v in sorted_params if v is not None)
     return f"gnews:{endpoint}:{param_str}"
 
+
 async def get_cached_or_fetch(key: str, fetch_func, ttl: int = None):
     """
     Get data from cache or fetch and cache it.
-    
+
     Args:
         key: Cache key
         fetch_func: Async function to fetch data if not cached
         ttl: Time to live in seconds
-        
+
     Returns:
         The fetched or cached data
     """
     if not settings.ENABLE_CACHE:
         return await fetch_func()
-    
+
     # Try to get from cache
     cached_data = await cache_manager.get(key, namespace="gnews")
     if cached_data is not None:
         logger.debug(f"Cache hit for key: {key}")
         return cached_data
-    
+
     # Fetch data
     data = await fetch_func()
-    
+
     # Cache the result
     if data:
         ttl = ttl or settings.CACHE_TTL
         await cache_manager.set(key, data, ttl=ttl, namespace="gnews")
         logger.debug(f"Cached data for key: {key}, TTL: {ttl}s")
-    
+
     return data
+
 
 # Global HTTP client pool for GNews operations
 _gnews_http_client: Optional[httpx.AsyncClient] = None
 
+
 async def get_gnews_http_client(proxy_url: Optional[str] = None) -> httpx.AsyncClient:
     """
     Get or create a shared HTTP client for GNews operations with connection pooling.
-    
+
     Args:
         proxy_url: Optional proxy URL
-        
+
     Returns:
         httpx.AsyncClient: Shared HTTP client
     """
     global _gnews_http_client
-    
+
     if _gnews_http_client is None:
         # Configure connection limits based on settings
         limits = httpx.Limits(
             max_keepalive_connections=settings.HTTP_MAX_KEEPALIVE_CONNECTIONS,
             max_connections=settings.HTTP_MAX_CONNECTIONS_PER_HOST,
-            keepalive_expiry=30.0
+            keepalive_expiry=30.0,
         )
-        
+
         # Configure timeouts
         timeout = httpx.Timeout(
-            connect=settings.HTTP_CONNECTION_TIMEOUT,
-            read=settings.HTTP_READ_TIMEOUT,
-            write=10.0,
-            pool=5.0
+            connect=settings.HTTP_CONNECTION_TIMEOUT, read=settings.HTTP_READ_TIMEOUT, write=10.0, pool=5.0
         )
-        
+
         mounts = None
         if proxy_url:
             mounts = {
                 "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
                 "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
             }
-        
-        _gnews_http_client = httpx.AsyncClient(
-            limits=limits,
-            timeout=timeout,
-            mounts=mounts,
-            follow_redirects=True
-        )
+
+        _gnews_http_client = httpx.AsyncClient(limits=limits, timeout=timeout, mounts=mounts, follow_redirects=True)
         logger.debug("Created shared HTTP client for GNews operations")
-    
+
     return _gnews_http_client
+
 
 # -----------------------------------------------------------------------------
 # Decoding functions
@@ -315,15 +374,12 @@ async def get_base64_str(source_url):
     try:
         url = urlparse(source_url)
         path = url.path.split("/")
-        if (
-            url.hostname == "news.google.com"
-            and len(path) > 1
-            and path[-2] in ["articles", "read", "rss"]
-        ):
+        if url.hostname == "news.google.com" and len(path) > 1 and path[-2] in ["articles", "read", "rss"]:
             return {"status": True, "base64_str": path[-1]}
         return {"status": False, "message": "Invalid Google News URL format."}
     except Exception as e:
         return {"status": False, "message": f"Error in get_base64_str: {str(e)}"}
+
 
 async def get_decoding_params(base64_str):
     """
@@ -363,12 +419,14 @@ async def get_decoding_params(base64_str):
             "message": f"Unexpected error in get_decoding_params: {str(e)}",
         }
 
+
 def validate_date_format(date_str):
     try:
-        datetime.datetime.strptime(date_str, '%Y-%m-%d')
+        datetime.datetime.strptime(date_str, "%Y-%m-%d")
         return True
     except ValueError:
         return False
+
 
 async def decode_url(signature, timestamp, base64_str, start_date=None, end_date=None):
     """
@@ -405,11 +463,7 @@ async def decode_url(signature, timestamp, base64_str, start_date=None, end_date
         proxy_url = await get_proxy()  # Adjust based on your implementation
 
         client = await get_gnews_http_client(proxy_url=proxy_url)
-        response = await client.post(
-            url,
-            headers=headers,
-            data=f"f.req={quote(json.dumps([[payload]]))}"
-        )
+        response = await client.post(url, headers=headers, data=f"f.req={quote(json.dumps([[payload]]))}")
         response.raise_for_status()
 
         parsed_data = json.loads(response.text.split("\n\n")[1])[:-2]
@@ -430,6 +484,7 @@ async def decode_url(signature, timestamp, base64_str, start_date=None, end_date
     except Exception as e:
         logger.error(f"Error in decode_url: {str(e)}")
         return {"status": False, "message": f"Error in decode_url: {str(e)}"}
+
 
 async def decode_google_news_url(source_url, interval=None):
     """
@@ -459,6 +514,7 @@ async def decode_google_news_url(source_url, interval=None):
             "message": f"Error in decode_google_news_url: {str(e)}",
         }
 
+
 # -----------------------------------------------------------------------------
 # Helper function to create a new GNews instance per request
 # -----------------------------------------------------------------------------
@@ -484,7 +540,7 @@ async def get_gnews_instance(
         start_date=start_date,
         end_date=end_date,
         # exclude_websites can be set if needed, GNews constructor supports it
-        proxy=proxy_url_val  # Pass the proxy URL to GNews constructor
+        proxy=proxy_url_val,  # Pass the proxy URL to GNews constructor
     )
 
     # Set attributes not available in constructor or that need to be dynamically set
@@ -502,7 +558,7 @@ async def get_gnews_instance(
         }
         gnews.session = httpx.AsyncClient(mounts=mounts)
         logger.debug(f"GNews instance using proxy for httpx session: {proxy_url_val}")
-        if proxy_url_val: # Logging for clarity that proxy is also set for feedparser
+        if proxy_url_val:  # Logging for clarity that proxy is also set for feedparser
             logger.debug(f"GNews instance also configured with proxy for feedparser: {proxy_url_val}")
     else:
         gnews.session = httpx.AsyncClient()
@@ -510,23 +566,22 @@ async def get_gnews_instance(
 
     return gnews
 
+
 # -----------------------------------------------------------------------------
 # Helper: Decode and Process Articles (Concurrent Version)
 # -----------------------------------------------------------------------------
 async def decode_and_process_articles(
-    raw_articles: List[dict],
-    filter_by_domain: Optional[str] = None,
-    max_concurrent: int = 10
+    raw_articles: List[dict], filter_by_domain: Optional[str] = None, max_concurrent: int = 10
 ) -> List[dict]:
     """
     Decodes Google News URLs for a list of articles and processes them concurrently.
     Optionally filters articles by a specified domain.
-    
+
     Args:
         raw_articles: List of raw article dictionaries
         filter_by_domain: Optional domain to filter by
         max_concurrent: Maximum number of concurrent decoding operations
-        
+
     Returns:
         List of processed articles
     """
@@ -535,28 +590,30 @@ async def decode_and_process_articles(
 
     # Create semaphore to limit concurrent operations
     semaphore = asyncio.Semaphore(max_concurrent)
-    
+
     async def decode_single_article(article_data: dict) -> Optional[dict]:
         """Decode and process a single article with semaphore control."""
         async with semaphore:
-            if not article_data.get('url'):
+            if not article_data.get("url"):
                 return None
-            
+
             try:
                 # Decode URL
-                decoded_result = await decode_google_news_url(article_data.get('url'))
-                
+                decoded_result = await decode_google_news_url(article_data.get("url"))
+
                 if decoded_result.get("status"):
-                    article_data['url'] = decoded_result["decoded_url"]
+                    article_data["url"] = decoded_result["decoded_url"]
                     transformed_article = transform_article(article_data)
-                    
+
                     # Apply domain filtering if specified
                     if filter_by_domain:
-                        article_domain = urlparse(transformed_article["url"]).netloc.lower().replace('www.', '').strip()
+                        article_domain = urlparse(transformed_article["url"]).netloc.lower().replace("www.", "").strip()
                         if filter_by_domain not in article_domain:
-                            logger.debug(f"Skipping article '{transformed_article['title']}' as its domain '{article_domain}' does not match '{filter_by_domain}'")
+                            logger.debug(
+                                f"Skipping article '{transformed_article['title']}' as its domain '{article_domain}' does not match '{filter_by_domain}'"
+                            )
                             return None
-                    
+
                     return transformed_article
                 else:
                     logger.warning(
@@ -565,15 +622,13 @@ async def decode_and_process_articles(
                     )
                     return None
             except Exception as e:
-                logger.warning(
-                    f"Exception during URL decoding for article '{article_data.get('title', 'N/A')}': {e}"
-                )
+                logger.warning(f"Exception during URL decoding for article '{article_data.get('title', 'N/A')}': {e}")
                 return None
 
     # Process all articles concurrently
     tasks = [decode_single_article(article) for article in raw_articles]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    
+
     # Filter out None results and exceptions
     processed_articles = []
     for result in results:
@@ -582,9 +637,10 @@ async def decode_and_process_articles(
             continue
         if result is not None:
             processed_articles.append(result)
-    
+
     logger.debug(f"Successfully processed {len(processed_articles)} out of {len(raw_articles)} articles")
     return processed_articles
+
 
 # -----------------------------------------------------------------------------
 # Pydantic Models for Responses
@@ -596,11 +652,14 @@ class NewsArticle(BaseModel):
     url: str
     publisher: Optional[str]
 
+
 class NewsResponse(BaseModel):
     articles: List[NewsArticle]
 
+
 class ErrorResponse(BaseModel):
     detail: str
+
 
 # -----------------------------------------------------------------------------
 # Helper: Transform Article Data
@@ -611,18 +670,20 @@ def transform_article(article: dict) -> dict:
         "description": article.get("description"),
         "published_date": article.get("published date"),
         "url": article.get("url"),
-        "publisher": article.get("publisher", {}).get("title") if article.get("publisher") else None
+        "publisher": article.get("publisher", {}).get("title") if article.get("publisher") else None,
     }
+
 
 # -----------------------------------------------------------------------------
 # Endpoints
 # -----------------------------------------------------------------------------
 
+
 @gnews_router.get(
     "/available-languages/",
     summary="Get Available Languages",
     response_description="List of available languages for Google News.",
-    response_model=dict
+    response_model=dict,
 )
 async def get_languages():
     """
@@ -630,17 +691,19 @@ async def get_languages():
     """
     return {"available_languages": AVAILABLE_LANGUAGES}
 
+
 @gnews_router.get(
     "/available-countries/",
     summary="Get Available Countries",
     response_description="List of available countries for Google News.",
-    response_model=dict
+    response_model=dict,
 )
 async def get_available_countries():
     """
     Get a list of available countries for Google News.
     """
     return {"available_countries": AVAILABLE_COUNTRIES}
+
 
 @gnews_router.get(
     "/source/",
@@ -651,7 +714,7 @@ async def get_available_countries():
         400: {"model": ErrorResponse, "description": "Invalid source URL or domain."},
         404: {"model": ErrorResponse, "description": "No articles found for the given parameters."},
         500: {"model": ErrorResponse, "description": "Internal Server Error."},
-    }
+    },
 )
 async def get_news_by_source(
     source: str = Query(..., description="Source domain or full URL (e.g., 'cnn.com' or 'https://www.cnn.com')"),
@@ -659,7 +722,9 @@ async def get_news_by_source(
     country: str = Query("US", description="Country for the news results."),
     max_results: int = Query(5, ge=1, le=100, description="Maximum number of news results (1-100)."),
     exclude_duplicates: bool = Query(False, description="Exclude duplicate news articles."),
-    start_date: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$", description="Start date in YYYY-MM-DD format."),
+    start_date: Optional[str] = Query(
+        None, regex=r"^\d{4}-\d{2}-\d{2}$", description="Start date in YYYY-MM-DD format."
+    ),
     end_date: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$", description="End date in YYYY-MM-DD format."),
 ):
     """
@@ -687,7 +752,7 @@ async def get_news_by_source(
         # Normalize the source input by extracting the domain if a URL is provided
         parsed_source = urlparse(validated_query.source)
         domain_source = parsed_source.netloc.lower() if parsed_source.netloc else validated_query.source.lower()
-        domain_source = domain_source.replace('www.', '').strip()
+        domain_source = domain_source.replace("www.", "").strip()
 
         # Parse dates if provided
         start_date_tuple = tuple(map(int, start_date.split("-"))) if start_date else None
@@ -713,8 +778,7 @@ async def get_news_by_source(
 
         if not processed_articles:
             raise HTTPException(
-                status_code=404,
-                detail=f"No articles found from source '{domain_source}' with the given date range."
+                status_code=404, detail=f"No articles found from source '{domain_source}' with the given date range."
             )
 
         return {"articles": processed_articles}
@@ -728,6 +792,7 @@ async def get_news_by_source(
         logger.error(f"Unexpected error fetching Google News for source '{source}': {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
+
 @gnews_router.get(
     "/search/",
     summary="Search Google News",
@@ -737,7 +802,7 @@ async def get_news_by_source(
         400: {"model": ErrorResponse, "description": "Invalid query parameters."},
         404: {"model": ErrorResponse, "description": "No news found for the given query."},
         500: {"model": ErrorResponse, "description": "Internal Server Error."},
-    }
+    },
 )
 async def search_google_news(
     request: Request,
@@ -745,7 +810,9 @@ async def search_google_news(
     language: str = Query("en", description="Language for the news results."),
     country: str = Query("US", description="Country for the news results."),
     max_results: int = Query(5, ge=1, le=100, description="Maximum number of news results (1-100)."),
-    start_date: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$", description="Start date in YYYY-MM-DD format."),
+    start_date: Optional[str] = Query(
+        None, regex=r"^\d{4}-\d{2}-\d{2}$", description="Start date in YYYY-MM-DD format."
+    ),
     end_date: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$", description="End date in YYYY-MM-DD format."),
     exclude_duplicates: bool = Query(False, description="Exclude duplicate news articles."),
     exact_match: bool = Query(False, description="Search for an exact match of the query."),
@@ -788,7 +855,7 @@ async def search_google_news(
             end_date=end_date,
             exclude_duplicates=exclude_duplicates,
             exact_match=exact_match,
-            sort_by=sort_by
+            sort_by=sort_by,
         )
 
         async def fetch_search_results():
@@ -812,8 +879,8 @@ async def search_google_news(
 
             # Use the new helper function to decode URLs
             processed_articles = await decode_and_process_articles(news)
-            
-            if not processed_articles: # Check if processing yielded any articles
+
+            if not processed_articles:  # Check if processing yielded any articles
                 # This condition might be hit if all URLs failed to decode or were filtered out
                 # Depending on desired behavior, could raise 404 or return empty list
                 # For now, let's assume if news was found initially but processing failed for all, it's still a "not found" scenario for valid articles.
@@ -830,6 +897,7 @@ async def search_google_news(
         logger.error(f"Error fetching Google News for query '{query}': {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
+
 @gnews_router.get(
     "/top/",
     summary="Get Top Google News",
@@ -838,7 +906,7 @@ async def search_google_news(
     responses={
         404: {"model": ErrorResponse, "description": "No top news found."},
         500: {"model": ErrorResponse, "description": "Internal Server Error."},
-    }
+    },
 )
 async def get_top_google_news(
     language: str = Query("en", description="Language for the news results."),
@@ -875,15 +943,16 @@ async def get_top_google_news(
         # Use the new helper function to decode URLs
         processed_articles = await decode_and_process_articles(top_news)
 
-        if not processed_articles: # Similar check as in /search
+        if not processed_articles:  # Similar check as in /search
             raise HTTPException(status_code=404, detail="No processable top news found after URL decoding.")
-            
+
         return {"articles": processed_articles}
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
         logger.error(f"Error fetching top Google News: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
+
 
 @gnews_router.get(
     "/topic/",
@@ -894,7 +963,7 @@ async def get_top_google_news(
         400: {"model": ErrorResponse, "description": "Invalid topic provided."},
         404: {"model": ErrorResponse, "description": "No news found for the given topic."},
         500: {"model": ErrorResponse, "description": "Internal Server Error."},
-    }
+    },
 )
 async def get_news_by_topic(
     topic: str = Query(..., description="The topic to filter news articles."),
@@ -905,14 +974,14 @@ async def get_news_by_topic(
 ):
     """
     Get Google News articles based on a specific topic.
-    
+
     ### Parameters:
     - **topic**: The topic to filter news articles.
     - **language**: Language for the news results (default: 'en').
     - **country**: Country for the news results (default: 'US').
     - **max_results**: Maximum number of news results (1-100).
     - **exclude_duplicates**: Exclude duplicate news articles (default: False).
-    
+
     ### Responses:
     - **200 OK**: Returns a list of news articles based on the specified topic.
     - **400 Bad Request**: Invalid topic provided.
@@ -921,8 +990,7 @@ async def get_news_by_topic(
     """
     if topic.upper() not in AVAILABLE_TOPICS:
         return JSONResponse(
-            status_code=400,
-            content={"detail": "Invalid topic provided.", "available_topics": AVAILABLE_TOPICS}
+            status_code=400, content={"detail": "Invalid topic provided.", "available_topics": AVAILABLE_TOPICS}
         )
     try:
         # Create a new GNews instance without start_date and end_date
@@ -942,7 +1010,7 @@ async def get_news_by_topic(
         # Use the new helper function to decode URLs
         processed_articles = await decode_and_process_articles(news)
 
-        if not processed_articles: # Similar check
+        if not processed_articles:  # Similar check
             raise HTTPException(status_code=404, detail="No processable news found for the topic after URL decoding.")
 
         return {"articles": processed_articles}
@@ -952,6 +1020,7 @@ async def get_news_by_topic(
         logger.error(f"Error fetching Google News for topic '{topic}': {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
+
 @gnews_router.get(
     "/location/",
     summary="Get Google News by Location",
@@ -960,14 +1029,16 @@ async def get_news_by_topic(
     responses={
         404: {"model": ErrorResponse, "description": "No news found for the given location."},
         500: {"model": ErrorResponse, "description": "Internal Server Error."},
-    }
+    },
 )
 async def get_news_by_location(
     location: str = Query(..., description="The location to filter news articles."),
     language: str = Query("en", description="Language for the news results."),
     country: str = Query("US", description="Country for the news results."),
     max_results: int = Query(5, ge=1, le=100, description="Maximum number of news results (1-100)."),
-    start_date: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$", description="Start date in YYYY-MM-DD format."),
+    start_date: Optional[str] = Query(
+        None, regex=r"^\d{4}-\d{2}-\d{2}$", description="Start date in YYYY-MM-DD format."
+    ),
     end_date: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$", description="End date in YYYY-MM-DD format."),
     exclude_duplicates: bool = Query(False, description="Exclude duplicate news articles."),
 ):
@@ -1012,9 +1083,11 @@ async def get_news_by_location(
         # Use the new helper function to decode URLs
         processed_articles = await decode_and_process_articles(news_by_location)
 
-        if not processed_articles: # Similar check
-            raise HTTPException(status_code=404, detail=f"No processable news found for the location '{location}' after URL decoding.")
-            
+        if not processed_articles:  # Similar check
+            raise HTTPException(
+                status_code=404, detail=f"No processable news found for the location '{location}' after URL decoding."
+            )
+
         return {"articles": processed_articles}
     except HTTPException as http_exc:
         raise http_exc
@@ -1022,7 +1095,9 @@ async def get_news_by_location(
         logger.error(f"Error fetching Google News for location '{location}': {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
+
 # The `/source/` endpoint definition is already provided above.
+
 
 @gnews_router.get(
     "/articles/",
@@ -1032,13 +1107,15 @@ async def get_news_by_location(
     responses={
         404: {"model": ErrorResponse, "description": "No articles found for the given parameters."},
         500: {"model": ErrorResponse, "description": "Internal Server Error."},
-    }
+    },
 )
 async def get_google_news_articles(
     query: str = Query("news", description="Search query for the news articles."),
     country: str = Query("US", description="Country for the news results."),
     language: str = Query("en", description="Language for the news results."),
-    period: str = Query("1d", regex=r"^\d+[dwmy]$", description="Period for the news results (e.g., '7d' for last 7 days)."),
+    period: str = Query(
+        "1d", regex=r"^\d+[dwmy]$", description="Period for the news results (e.g., '7d' for last 7 days)."
+    ),
     max_results: int = Query(5, ge=1, le=100, description="Maximum number of articles to fetch (1-100)."),
 ):
     """
@@ -1072,9 +1149,11 @@ async def get_google_news_articles(
 
         # Use the new helper function to decode URLs
         processed_articles = await decode_and_process_articles(articles)
-        
-        if not processed_articles: # Similar check
-            raise HTTPException(status_code=404, detail="No processable articles found for the given parameters after URL decoding.")
+
+        if not processed_articles:  # Similar check
+            raise HTTPException(
+                status_code=404, detail="No processable articles found for the given parameters after URL decoding."
+            )
 
         return {"articles": processed_articles}
 
@@ -1084,6 +1163,7 @@ async def get_google_news_articles(
         logger.error(f"Error fetching Google News articles for query '{query}': {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
+
 @gnews_router.get(
     "/article-details/",
     summary="Get Article Details",
@@ -1092,11 +1172,9 @@ async def get_google_news_articles(
     responses={
         500: {"model": ErrorResponse, "description": "Internal Server Error."},
         503: {"model": ErrorResponse, "description": "Service unavailable: Could not process article from URL."},
-    }
+    },
 )
-async def get_article_details(
-    url: str = Query(..., description="URL of the article to retrieve details for.")
-):
+async def get_article_details(url: str = Query(..., description="URL of the article to retrieve details for.")):
     """
     Get detailed information about a specific article.
 
@@ -1112,7 +1190,7 @@ async def get_article_details(
     try:
         # Ensure NLTK is set up (only runs once)
         await ensure_nltk_setup()
-        
+
         proxy_url = await get_proxy()  # Adjust if needed
 
         config = Config()
@@ -1120,20 +1198,17 @@ async def get_article_details(
         config.thread_timeout = settings.HTTP_READ_TIMEOUT
         if proxy_url:
             logger.debug(f"Using proxy settings for requests: {proxy_url}")
-            config.proxies = {
-                "http": proxy_url,
-                "https": proxy_url
-            }
+            config.proxies = {"http": proxy_url, "https": proxy_url}
         else:
             logger.debug("No proxy is being used.")
 
         # Use asyncio to run newspaper operations
         loop = asyncio.get_event_loop()
-        
+
         # Download article
         article = Article(url, config=config)
         await loop.run_in_executor(None, article.download)
-        
+
         # Parse article
         await loop.run_in_executor(None, article.parse)
 
@@ -1141,7 +1216,7 @@ async def get_article_details(
         nlp_success = True
         try:
             await loop.run_in_executor(None, article.nlp)
-        except LookupError as le: # Specific exception for NLTK resource not found
+        except LookupError as le:  # Specific exception for NLTK resource not found
             logger.warning(f"NLTK resource not found for URL '{url}': {str(le)}")
             nlp_success = False
 
@@ -1156,22 +1231,21 @@ async def get_article_details(
             "videos": article.movies,
             "meta_data": article.meta_data,
             "meta_description": article.meta_description,
-            "meta_keywords": article.meta_keywords
+            "meta_keywords": article.meta_keywords,
         }
-        
+
         if nlp_success:
-            response_data.update({
-                "summary": article.summary,
-                "keywords": article.keywords
-            })
+            response_data.update({"summary": article.summary, "keywords": article.keywords})
         else:
             response_data["error"] = "Unable to perform NLP analysis due to missing NLTK resource."
 
         return response_data
-        
+
     except ArticleException as ae:
         logger.error(f"Newspaper library error for URL '{url}': {str(ae)}")
-        raise HTTPException(status_code=503, detail=f"Service unavailable: Could not process article from URL. Error: {str(ae)}")
+        raise HTTPException(
+            status_code=503, detail=f"Service unavailable: Could not process article from URL. Error: {str(ae)}"
+        )
     except Exception as e:
         logger.error(f"Unexpected error fetching article details for URL '{url}': {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
