@@ -19,12 +19,16 @@ celery>=5.4.0
 # Caching & Database
 redis>=5.2.0
 psycopg2-binary>=2.9.10
+asyncpg>=0.30.0  # Async PostgreSQL driver for better performance
+sqlalchemy[asyncio]>=2.0.35  # SQLAlchemy with async support
+alembic>=1.13.0  # Database migrations
 
 # Vector Database
 qdrant-client>=1.12.0
 
 # Logging
 loguru>=0.7.3
+python-json-logger>=2.0.7  # Structured JSON logging
 
 # Docker
 docker>=7.1.0
@@ -52,6 +56,11 @@ slowapi>=0.1.9
 # Metrics & Monitoring
 prometheus-client>=0.21.0
 prometheus-fastapi-instrumentator>=7.0.0
+sentry-sdk[fastapi]>=2.18.0  # Error tracking and APM
+opentelemetry-api>=1.28.0  # Distributed tracing
+opentelemetry-sdk>=1.28.0
+opentelemetry-instrumentation-fastapi>=0.49b0
+opentelemetry-exporter-otlp>=1.28.0  # OTLP exporter for traces
 
 # Security
 bandit>=1.8.0

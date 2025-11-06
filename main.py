@@ -14,6 +14,7 @@ from fastapi import FastAPI, Depends, Request, Response, APIRouter
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from fastapi.openapi.utils import get_openapi
 from starlette.exceptions import HTTPException
@@ -27,6 +28,7 @@ from app.core.exceptions import (
     RateLimitExceededError
 )
 from app.core.middleware import setup_middleware
+from app.core.request_id_middleware import RequestIDMiddleware
 from app.core.health_checks import check_health
 from app.core.auth import get_api_key
 
@@ -104,7 +106,14 @@ def create_application() -> FastAPI:
     
     # Setup middleware
     setup_middleware(app, settings)
-    
+
+    # Add performance middleware
+    # Response compression (reduces bandwidth by 60-80%)
+    app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+    # Request ID tracking (for logging and debugging)
+    app.add_middleware(RequestIDMiddleware)
+
     # Configure exception handlers
     configure_exception_handlers(app)
     
