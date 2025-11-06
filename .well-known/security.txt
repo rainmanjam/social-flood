@@ -1,0 +1,51 @@
+Contact: https://github.com/rainmanjam/social-flood/security/advisories/new
+Contact: mailto:security@socialflood.com
+Expires: 2026-12-31T23:59:59.000Z
+Preferred-Languages: en
+Canonical: https://github.com/rainmanjam/social-flood/blob/main/.well-known/security.txt
+Policy: https://github.com/rainmanjam/social-flood/blob/main/SECURITY.md
+Acknowledgments: https://github.com/rainmanjam/social-flood/blob/main/SECURITY.md#hall-of-fame
+
+# Security Policy
+
+We take the security of Social Flood seriously. If you believe you have found a
+security vulnerability in Social Flood, please report it to us as described below.
+
+## Reporting Security Issues
+
+**Please do not report security vulnerabilities through public GitHub issues.**
+
+Instead, please report them via:
+- GitHub Security Advisory: https://github.com/rainmanjam/social-flood/security/advisories/new
+- Email: security@socialflood.com
+
+You should receive a response within 48 hours. If for some reason you do not,
+please follow up via email to ensure we received your original message.
+
+Please include the following information:
+- Type of issue (e.g. buffer overflow, SQL injection, cross-site scripting, etc.)
+- Full paths of source file(s) related to the manifestation of the issue
+- The location of the affected source code (tag/branch/commit or direct URL)
+- Any special configuration required to reproduce the issue
+- Step-by-step instructions to reproduce the issue
+- Proof-of-concept or exploit code (if possible)
+- Impact of the issue, including how an attacker might exploit it
+
+## Supported Versions
+
+| Version | Supported          |
+| ------- | ------------------ |
+| 1.6.x   | :white_check_mark: |
+| 1.5.x   | :white_check_mark: |
+| < 1.5   | :x:                |
+
+## Security Features
+
+- API Key Authentication
+- Rate Limiting
+- Input Sanitization
+- CORS Configuration
+- Security Headers
+- Container Security (non-root user)
+- Dependency Scanning
+- Automated Security Updates (Dependabot)

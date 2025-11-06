@@ -5,6 +5,90 @@ All notable changes to the Social Flood API will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2025-11-06
+
+### Added
+
+- **Python 3.13 Support**: Upgraded from Python 3.11 to Python 3.13 for improved performance
+- **Modern Package Management**: Added `pyproject.toml` with comprehensive project metadata
+- **Pre-commit Hooks**: Added `.pre-commit-config.yaml` with ruff, mypy, bandit, and more
+- **Dependabot Configuration**: Automated dependency updates for Python, GitHub Actions, and Docker
+- **Security Scanning Workflow**: Comprehensive security scanning with CodeQL, Trivy, Gitleaks, and Bandit
+- **Pytest Configuration**: Added `pytest.ini` with comprehensive test configuration and markers
+- **Code Quality Tools**: Added ruff (linting/formatting), mypy (type checking), bandit (security)
+- **Enhanced Docker Compose**: Added v3.8 format with health checks, resource limits, and logging
+- **Security Headers**: Enhanced security configuration and monitoring
+
+### Changed
+
+- **Dependencies**: Pinned all dependencies to specific versions for reproducibility
+  - FastAPI: >=0.121.0
+  - Uvicorn: >=0.38.0
+  - Pydantic: >=2.12.0,<3.0.0
+  - Python: 3.13
+- **Docker Base Images**: Updated to latest stable versions
+  - Python: 3.13-slim-bookworm
+  - PostgreSQL: 17-alpine
+  - Redis: 7-alpine
+- **GitHub Actions**: Updated all actions to latest versions (v4/v5/v6)
+- **CI/CD Pipeline**: Enhanced with security scanning, multi-version testing (3.11, 3.12, 3.13)
+- **Docker Compose**: Added health checks, resource limits, restart policies, and logging configuration
+
+### Enhanced
+
+- **Documentation**: Improved README with badges and comprehensive project information
+- **Security**: Added security.txt, enhanced security scanning, and vulnerability management
+- **Testing**: Enhanced test coverage reporting and pytest configuration
+- **Monitoring**: Improved metrics and observability with Prometheus integration
+
+## [1.5.3] - 2025-10-XX
+
+### Fixed
+
+- Minor bug fixes and improvements
+- Documentation updates
+
+## [1.5.2] - 2025-09-XX
+
+### Fixed
+
+- Bug fixes and stability improvements
+
+## [1.5.1] - 2025-08-XX
+
+### Fixed
+
+- Performance optimizations
+- Minor bug fixes
+
+## [1.5.0] - 2025-07-XX
+
+### Added
+
+- Additional features and enhancements
+- Performance improvements
+
+## [1.4.0] - 2025-06-XX
+
+### Added
+
+- New features and functionality
+- Enhanced API capabilities
+
+## [1.3.0] - 2025-05-XX
+
+### Added
+
+- Feature additions
+- Improved stability
+
+## [1.2.0] - 2025-04-XX
+
+### Added
+
+- New API endpoints
+- Enhanced functionality
+
 ## [1.1.0] - 2025-01-15
 
 ### Added

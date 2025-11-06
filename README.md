@@ -1,5 +1,13 @@
 # Social Flood API
 
+[![CI/CD Pipeline](https://github.com/rainmanjam/social-flood/actions/workflows/main.yml/badge.svg)](https://github.com/rainmanjam/social-flood/actions/workflows/main.yml)
+[![Security Scanning](https://github.com/rainmanjam/social-flood/actions/workflows/security.yml/badge.svg)](https://github.com/rainmanjam/social-flood/actions/workflows/security.yml)
+[![Python Version](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](https://www.python.org/downloads/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.121.0+-00a393.svg?logo=fastapi)](https://fastapi.tiangolo.com)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
+[![Docker](https://img.shields.io/badge/docker-supported-2496ED.svg?logo=docker)](https://hub.docker.com)
+
 A powerful API for accessing and aggregating data from various Google services including Google News, Google Trends, Google Autocomplete, and YouTube Transcripts.
 
 ## Features
@@ -18,7 +26,8 @@ A powerful API for accessing and aggregating data from various Google services i
 
 ### Prerequisites
 
-- Docker and Docker Compose
+- Python 3.11+ (3.13 recommended)
+- Docker and Docker Compose (v3.8+)
 - Google API credentials (see [GOOGLE_SERVICES.md](GOOGLE_SERVICES.md))
 
 ### Installation

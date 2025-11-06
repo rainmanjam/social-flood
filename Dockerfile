@@ -1,7 +1,7 @@
 # Dockerfile
 # Using an official Python image from Docker Hub (approved base image)
 # Pinned to a specific version for reproducibility and security
-FROM python:3.11-slim-bookworm
+FROM python:3.13-slim-bookworm
 
 # Set working directory
 WORKDIR /app

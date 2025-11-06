@@ -1,0 +1,209 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "social-flood"
+version = "1.6.0"
+description = "API for social media data aggregation and analysis"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Social Flood Team", email = "info@socialflood.com"}
+]
+keywords = ["api", "fastapi", "google-news", "google-trends", "youtube", "social-media"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Framework :: FastAPI",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+
+dependencies = [
+    "fastapi>=0.121.0",
+    "uvicorn[standard]>=0.38.0",
+    "pydantic>=2.12.0,<3.0.0",
+    "pydantic-settings>=2.6.0",
+    "requests>=2.32.0",
+    "httpx>=0.28.0",
+    "celery>=5.4.0",
+    "redis>=5.2.0",
+    "psycopg2-binary>=2.9.10",
+    "qdrant-client>=1.12.0",
+    "loguru>=0.7.3",
+    "docker>=7.1.0",
+    "trendspy>=0.2.2",
+    "gnews>=0.3.7",
+    "newspaper4k>=0.9.3",
+    "lxml_html_clean>=0.3.1",
+    "selectolax>=0.3.21",
+    "nltk>=3.9.1",
+    "youtube-transcript-api>=0.6.2",
+    "google-auth>=2.36.0",
+    "pandas>=2.2.0",
+    "matplotlib>=3.9.0",
+    "email-validator>=2.2.0",
+    "slowapi>=0.1.9",
+    "prometheus-client>=0.21.0",
+    "prometheus-fastapi-instrumentator>=7.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-cov>=6.0.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+    "bandit>=1.8.0",
+    "safety>=3.2.0",
+    "types-requests>=2.32.0",
+    "types-redis>=4.6.0",
+    "pre-commit>=4.0.0",
+]
+
+test = [
+    "pytest>=8.3.0",
+    "pytest-cov>=6.0.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.28.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/rainmanjam/social-flood"
+Documentation = "https://github.com/rainmanjam/social-flood#readme"
+Repository = "https://github.com/rainmanjam/social-flood"
+Issues = "https://github.com/rainmanjam/social-flood/issues"
+Changelog = "https://github.com/rainmanjam/social-flood/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--cov=app",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+    "--cov-report=xml",
+]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["app"]
+omit = [
+    "tests/*",
+    "**/__pycache__/*",
+    "**/site-packages/*",
+]
+
+[tool.coverage.report]
+precision = 2
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+indent-width = 4
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+    "ARG",    # flake8-unused-arguments
+    "SIM",    # flake8-simplify
+    "TCH",    # flake8-type-checking
+    "PTH",    # flake8-use-pathlib
+    "RUF",    # Ruff-specific rules
+]
+ignore = [
+    "E501",   # Line too long (handled by formatter)
+    "B008",   # Do not perform function call in argument defaults
+    "B905",   # zip() without an explicit strict= parameter
+    "UP007",  # Use X | Y for type annotations (not compatible with Python 3.9)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # Unused imports in __init__.py
+"tests/**/*" = ["ARG", "SIM"]  # Be more lenient in tests
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+force-sort-within-sections = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_any_generics = true
+disallow_subclassing_any = true
+disallow_untyped_calls = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+follow_imports = "normal"
+ignore_missing_imports = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = [
+    "gnews.*",
+    "trendspy.*",
+    "newspaper.*",
+    "selectolax.*",
+    "qdrant_client.*",
+]
+ignore_missing_imports = true
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[tool.bandit]
+exclude_dirs = ["tests", "scripts"]
+skips = ["B101", "B601"]  # Skip assert_used and shell_injection warnings in tests
+
+[tool.bandit.assert_used]
+exclude = ["*/test_*.py"]
