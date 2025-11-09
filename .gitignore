@@ -79,6 +79,7 @@ config/config.py  # Assuming sensitive information is here
 .coverage
 coverage/
 htmlcov/
+coverage.xml
 
 # Jupyter Notebook
 .ipynb_checkpoints/
