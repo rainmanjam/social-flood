@@ -34,9 +34,9 @@ python-json-logger>=2.0.7  # Structured JSON logging
 docker>=7.1.0
 
 # Google Services & Web Scraping
-trendspy>=0.2.2
-gnews>=0.3.7
-newspaper4k>=0.9.3
+trendspy>=0.1.6
+GoogleNews>=1.6.0  # Replaced gnews due to Python 3.11+ compatibility
+# newspaper3k/newspaper4k removed - incompatible with Python 3.11+ (sgmllib3k dependency)
 lxml_html_clean>=0.3.1
 selectolax>=0.3.21
 nltk>=3.9.1

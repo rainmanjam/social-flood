@@ -12,7 +12,7 @@ except ImportError:
     app_version = "1.0.0"  # Fallback version
 
 # Import API routers
-# from app.api.google_news.google_news_api import gnews_router  # Temporarily disabled - dependency issue
+from app.api.google_news.google_news_api import gnews_router
 from app.api.google_trends.google_trends_api import google_trends_router
 from app.api.google_autocomplete.google_autocomplete_api import router as google_autocomplete_router
 from app.api.youtube_transcripts.youtube_transcripts_api import youtube_transcripts_router
@@ -50,7 +50,7 @@ app = FastAPI(
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # Include API routers
-# app.include_router(gnews_router, prefix="/api/v1/google-news", tags=["Google News"])  # Temporarily disabled
+app.include_router(gnews_router, prefix="/api/v1/google-news", tags=["Google News"])
 app.include_router(google_trends_router, prefix="/api/v1/google-trends", tags=["Google Trends"])
 app.include_router(google_autocomplete_router, prefix="/api/v1/google-autocomplete", tags=["Google Autocomplete"])
 app.include_router(youtube_transcripts_router, prefix="/api/v1/youtube-transcripts", tags=["YouTube Transcripts"])
@@ -65,7 +65,7 @@ async def root():
         "docs": "/docs",
         "redoc": "/redoc",
         "apis": {
-            # "google_news": "/api/v1/google-news",  # Temporarily disabled
+            "google_news": "/api/v1/google-news",
             "google_trends": "/api/v1/google-trends",
             "google_autocomplete": "/api/v1/google-autocomplete",
             "youtube_transcripts": "/api/v1/youtube-transcripts",
