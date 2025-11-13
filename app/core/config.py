@@ -95,7 +95,20 @@ class Settings(BaseSettings):
     TWITTER_ACCESS_TOKEN: Optional[str] = None
     TWITTER_ACCESS_TOKEN_SECRET: Optional[str] = None
     TWITTER_BEARER_TOKEN: Optional[str] = None
-    
+
+    # Google Ads API settings
+    GOOGLE_ADS_DEVELOPER_TOKEN: Optional[str] = None
+    GOOGLE_ADS_CLIENT_ID: Optional[str] = None
+    GOOGLE_ADS_CLIENT_SECRET: Optional[str] = None
+    GOOGLE_ADS_REFRESH_TOKEN: Optional[str] = None
+    GOOGLE_ADS_CUSTOMER_ID: Optional[str] = None  # Primary account
+    GOOGLE_ADS_LOGIN_CUSTOMER_ID: Optional[str] = None  # MCC account (optional)
+    GOOGLE_ADS_USE_PROTO_PLUS: bool = True  # Use proto-plus messages
+    GOOGLE_ADS_ENABLED: bool = False  # Enable/disable Google Ads features
+
+    # Google Ads Multiple Accounts (comma-separated customer IDs)
+    GOOGLE_ADS_CUSTOMER_IDS: List[str] = []  # For multi-account support
+
     # Security
     SECRET_KEY: str = "development-secret-key-change-in-production"
     X_BEARER_TOKEN: Optional[str] = None
@@ -130,10 +143,10 @@ class Settings(BaseSettings):
     def assemble_cors_origins(cls, v: Union[str, List[str]]) -> List[str]:
         """
         Parse CORS_ORIGINS from string to list if needed.
-        
+
         Args:
             v: The CORS_ORIGINS value from environment
-            
+
         Returns:
             List[str]: List of allowed origins
         """
@@ -142,7 +155,25 @@ class Settings(BaseSettings):
         if isinstance(v, list):
             return v
         return []
-    
+
+    @field_validator("GOOGLE_ADS_CUSTOMER_IDS", mode="before")
+    @classmethod
+    def assemble_google_ads_customer_ids(cls, v: Union[str, List[str]]) -> List[str]:
+        """
+        Parse GOOGLE_ADS_CUSTOMER_IDS from string to list if needed.
+
+        Args:
+            v: The GOOGLE_ADS_CUSTOMER_IDS value from environment
+
+        Returns:
+            List[str]: List of Google Ads customer IDs
+        """
+        if isinstance(v, str) and v:
+            return [cid.strip() for cid in v.split(",") if cid.strip()]
+        if isinstance(v, list):
+            return v
+        return []
+
     model_config = {
         "env_file": ".env",
         "case_sensitive": False,

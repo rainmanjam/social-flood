@@ -42,6 +42,7 @@ selectolax>=0.3.21
 nltk>=3.9.1
 youtube-transcript-api>=0.6.2
 google-auth>=2.36.0
+google-ads>=24.1.0  # Google Ads API client
 
 # Data Processing
 pandas>=2.2.0
