@@ -25,6 +25,12 @@ T = TypeVar('T')
 # Format: {key: (value, expiry_timestamp)}
 _cache_store: Dict[str, Tuple[Any, float]] = {}
 
+# Thread-safe lock for in-memory cache operations
+_cache_lock: asyncio.Lock = asyncio.Lock()
+
+# Cleanup task reference to prevent garbage collection
+_cleanup_task: Optional[asyncio.Task] = None
+
 
 class CacheManager:
     """
@@ -153,18 +159,19 @@ class CacheManager:
             except Exception as e:
                 logger.error(f"Redis error in get: {str(e)}")
         
-        # Fall back to in-memory cache
-        if full_key in _cache_store:
-            value, expiry = _cache_store[full_key]
-            
-            # Check if expired
-            if expiry > time.time():
-                logger.debug(f"Cache hit (memory): {full_key}")
-                return value
-            
-            # Remove expired entry
-            del _cache_store[full_key]
-        
+        # Fall back to in-memory cache with thread-safe access
+        async with _cache_lock:
+            if full_key in _cache_store:
+                value, expiry = _cache_store[full_key]
+
+                # Check if expired
+                if expiry > time.time():
+                    logger.debug(f"Cache hit (memory): {full_key}")
+                    return value
+
+                # Remove expired entry
+                del _cache_store[full_key]
+
         logger.debug(f"Cache miss: {full_key}")
         return default
     
@@ -204,10 +211,11 @@ class CacheManager:
             except Exception as e:
                 logger.error(f"Redis error in set: {str(e)}")
         
-        # Fall back to in-memory cache
-        expiry = time.time() + ttl
-        _cache_store[full_key] = (value, expiry)
-        logger.debug(f"Cache set (memory): {full_key}, TTL: {ttl}s")
+        # Fall back to in-memory cache with thread-safe access
+        async with _cache_lock:
+            expiry = time.time() + ttl
+            _cache_store[full_key] = (value, expiry)
+            logger.debug(f"Cache set (memory): {full_key}, TTL: {ttl}s")
         return True
     
     async def delete(
@@ -239,12 +247,13 @@ class CacheManager:
             except Exception as e:
                 logger.error(f"Redis error in delete: {str(e)}")
         
-        # Also delete from in-memory cache
-        if full_key in _cache_store:
-            del _cache_store[full_key]
-            logger.debug(f"Cache delete (memory): {full_key}")
-            return True
-        
+        # Also delete from in-memory cache with thread-safe access
+        async with _cache_lock:
+            if full_key in _cache_store:
+                del _cache_store[full_key]
+                logger.debug(f"Cache delete (memory): {full_key}")
+                return True
+
         return False
     
     async def clear(self, namespace: Optional[str] = None) -> bool:
@@ -279,18 +288,19 @@ class CacheManager:
             except Exception as e:
                 logger.error(f"Redis error in clear: {str(e)}")
         
-        # Clear in-memory cache
-        if namespace:
-            prefix = f"cache:{namespace}:"
-            keys_to_delete = [k for k in _cache_store.keys() if k.startswith(prefix)]
-            for k in keys_to_delete:
-                del _cache_store[k]
-            logger.debug(f"Cache clear (memory) for namespace: {namespace}, {len(keys_to_delete)} keys")
-        else:
-            count = len(_cache_store)
-            _cache_store.clear()
-            logger.debug(f"Cache clear (memory): {count} keys")
-        
+        # Clear in-memory cache with thread-safe access
+        async with _cache_lock:
+            if namespace:
+                prefix = f"cache:{namespace}:"
+                keys_to_delete = [k for k in _cache_store.keys() if k.startswith(prefix)]
+                for k in keys_to_delete:
+                    del _cache_store[k]
+                logger.debug(f"Cache clear (memory) for namespace: {namespace}, {len(keys_to_delete)} keys")
+            else:
+                count = len(_cache_store)
+                _cache_store.clear()
+                logger.debug(f"Cache clear (memory): {count} keys")
+
         return True
     
     def cached(
@@ -360,38 +370,67 @@ class CacheManager:
 async def cleanup_cache_store():
     """
     Periodically clean up expired cache entries.
-    
+
     This task runs in the background to remove expired entries from
-    the in-memory cache store.
+    the in-memory cache store. Uses thread-safe access to the cache store.
     """
     while True:
         try:
             now = time.time()
-            
-            # Find expired keys
-            expired_keys = []
-            for key, (_, expiry) in _cache_store.items():
-                if expiry <= now:
-                    expired_keys.append(key)
-            
-            # Remove expired keys
-            for key in expired_keys:
-                del _cache_store[key]
-            
-            # Log cleanup
-            if expired_keys:
-                logger.debug(f"Cleaned up {len(expired_keys)} expired cache entries")
+
+            # Thread-safe access to find and remove expired keys
+            async with _cache_lock:
+                # Find expired keys
+                expired_keys = []
+                for key, (_, expiry) in _cache_store.items():
+                    if expiry <= now:
+                        expired_keys.append(key)
+
+                # Remove expired keys
+                for key in expired_keys:
+                    del _cache_store[key]
+
+                # Log cleanup
+                if expired_keys:
+                    logger.debug(f"Cleaned up {len(expired_keys)} expired cache entries")
+        except asyncio.CancelledError:
+            logger.info("Cache cleanup task cancelled")
+            break
         except Exception as e:
             logger.error(f"Error in cache store cleanup: {str(e)}")
-        
+
         # Sleep for a while
         await asyncio.sleep(60)  # Clean up every minute
 
 
-# Start the cleanup task
 def start_cleanup_task():
-    """Start the cache store cleanup task."""
-    asyncio.create_task(cleanup_cache_store())
+    """
+    Start the cache store cleanup task.
+
+    Stores the task reference to prevent garbage collection and allow
+    graceful shutdown.
+    """
+    global _cleanup_task
+    if _cleanup_task is None or _cleanup_task.done():
+        _cleanup_task = asyncio.create_task(cleanup_cache_store())
+        logger.debug("Cache cleanup task started")
+
+
+async def stop_cleanup_task():
+    """
+    Stop the cache store cleanup task gracefully.
+
+    Cancels the running cleanup task and waits for it to complete.
+    """
+    global _cleanup_task
+    if _cleanup_task is not None and not _cleanup_task.done():
+        _cleanup_task.cancel()
+        try:
+            await _cleanup_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Cache cleanup task stopped")
+    _cleanup_task = None
 
 
 # Create a global cache manager instance

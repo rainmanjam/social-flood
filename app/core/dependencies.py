@@ -6,11 +6,10 @@ the application for common functionality like authentication,
 database access, and more.
 """
 from fastapi import Depends, Request, Header
-from typing import Optional, Dict, Any, List
+from typing import Optional
 
-from app.core.auth import authenticate_api_key, get_current_api_key
+from app.core.auth import authenticate_api_key
 from app.core.config import get_settings, Settings
-from app.core.exceptions import AuthenticationError, PermissionDeniedError
 
 
 # Settings dependency
@@ -65,178 +64,95 @@ async def get_optional_api_key(
         return None
 
 
-async def get_current_user(
-    request: Request,
-    authorization: Optional[str] = Header(None)
-) -> Dict[str, Any]:
+# -----------------------------------------------------------------------------
+# Service dependencies for testability
+# -----------------------------------------------------------------------------
+from app.core.http_client import HTTPClientManager, get_http_client_manager
+from app.core.cache_manager import CacheManager, cache_manager
+
+
+def get_http_client_dependency() -> HTTPClientManager:
     """
-    Get the current user from the Authorization header.
-    
-    This is a placeholder for future user authentication.
-    Currently, it just returns a dummy user.
-    
-    Args:
-        request: The request object
-        authorization: The Authorization header
-        
+    Dependency provider for HTTPClientManager.
+
     Returns:
-        Dict[str, Any]: The current user
-        
-    Raises:
-        AuthenticationError: If authentication fails
+        HTTPClientManager: HTTP client manager instance
     """
-    settings = get_settings()
-    
-    # This is a placeholder for future user authentication
-    # In a real application, you would validate the token and get the user
-    if not authorization:
-        raise AuthenticationError("Authorization header is required")
-    
-    if not authorization.startswith("Bearer "):
-        raise AuthenticationError("Invalid authorization scheme")
-    
-    token = authorization.replace("Bearer ", "")
-    
-    # Placeholder: validate token and get user
-    # For now, just check if it matches the configured bearer token
-    if settings.X_BEARER_TOKEN and token == settings.X_BEARER_TOKEN:
-        return {
-            "id": "user-1",
-            "username": "admin",
-            "roles": ["admin"]
-        }
-    
-    raise AuthenticationError("Invalid token")
+    return get_http_client_manager()
 
 
-async def get_optional_user(
-    request: Request,
-    authorization: Optional[str] = Header(None)
-) -> Optional[Dict[str, Any]]:
+def get_cache_manager_dependency() -> CacheManager:
     """
-    Get the current user if authenticated, but don't require it.
-    
-    Args:
-        request: The request object
-        authorization: The Authorization header
-        
+    Dependency provider for CacheManager.
+
     Returns:
-        Optional[Dict[str, Any]]: The current user if authenticated, None otherwise
+        CacheManager: Cache manager instance
     """
-    if not authorization:
-        return None
-    
-    try:
-        return await get_current_user(request, authorization)
-    except:
-        return None
+    return cache_manager
 
 
-# Role-based access control
-async def require_role(
-    role: str,
-    user: Dict[str, Any] = Depends(get_current_user)
-) -> Dict[str, Any]:
+class ServiceDependencies:
     """
-    Require that the current user has a specific role.
-    
-    Args:
-        role: The required role
-        user: The current user
-        
+    Container class for service dependencies.
+
+    Can be used to override dependencies in tests by creating
+    a test instance with mocked dependencies.
+    """
+
+    def __init__(
+        self,
+        settings: Optional[Settings] = None,
+        http_client: Optional[HTTPClientManager] = None,
+        cache: Optional[CacheManager] = None
+    ):
+        self._settings = settings
+        self._http_client = http_client
+        self._cache = cache
+
+    @property
+    def settings(self) -> Settings:
+        """Get settings instance."""
+        return self._settings or get_settings()
+
+    @property
+    def http_client(self) -> HTTPClientManager:
+        """Get HTTP client manager instance."""
+        return self._http_client or get_http_client_manager()
+
+    @property
+    def cache(self) -> CacheManager:
+        """Get cache manager instance."""
+        return self._cache or cache_manager
+
+
+_default_dependencies: Optional[ServiceDependencies] = None
+
+
+def get_service_dependencies() -> ServiceDependencies:
+    """
+    Get the service dependencies container.
+
     Returns:
-        Dict[str, Any]: The current user
-        
-    Raises:
-        PermissionDeniedError: If the user doesn't have the required role
+        ServiceDependencies: Container with service dependencies
     """
-    if "roles" not in user or role not in user["roles"]:
-        raise PermissionDeniedError(f"Role '{role}' is required")
-    
-    return user
+    global _default_dependencies
+    if _default_dependencies is None:
+        _default_dependencies = ServiceDependencies()
+    return _default_dependencies
 
 
-async def require_admin(
-    user: Dict[str, Any] = Depends(get_current_user)
-) -> Dict[str, Any]:
+def set_service_dependencies(deps: ServiceDependencies) -> None:
     """
-    Require that the current user has the admin role.
-    
+    Set custom service dependencies (primarily for testing).
+
     Args:
-        user: The current user
-        
-    Returns:
-        Dict[str, Any]: The current user
-        
-    Raises:
-        PermissionDeniedError: If the user doesn't have the admin role
+        deps: Custom dependencies container
     """
-    return await require_role("admin", user)
+    global _default_dependencies
+    _default_dependencies = deps
 
 
-# Request context
-async def get_request_id(
-    request: Request,
-    x_request_id: Optional[str] = Header(None, alias="X-Request-ID")
-) -> str:
-    """
-    Get the request ID from the X-Request-ID header or generate a new one.
-    
-    Args:
-        request: The request object
-        x_request_id: The X-Request-ID header
-        
-    Returns:
-        str: The request ID
-    """
-    if x_request_id:
-        return x_request_id
-    
-    # If no request ID is provided, use the one from the request state
-    # or generate a new one
-    if not hasattr(request.state, "request_id"):
-        import uuid
-        request.state.request_id = str(uuid.uuid4())
-    
-    return request.state.request_id
-
-
-# Feature flags
-async def feature_enabled(
-    feature_name: str,
-    settings: Settings = Depends(get_app_settings)
-) -> bool:
-    """
-    Check if a feature is enabled.
-    
-    Args:
-        feature_name: The name of the feature
-        settings: Application settings
-        
-    Returns:
-        bool: True if the feature is enabled, False otherwise
-    """
-    # This is a simple implementation that checks environment variables
-    # In a real application, you might use a feature flag service
-    
-    # Convert feature_name to uppercase and check if it exists in settings
-    feature_flag = f"ENABLE_{feature_name.upper()}"
-    return getattr(settings, feature_flag, False)
-
-
-async def require_feature(
-    feature_name: str,
-    enabled: bool = Depends(feature_enabled)
-) -> None:
-    """
-    Require that a feature is enabled.
-    
-    Args:
-        feature_name: The name of the feature
-        enabled: Whether the feature is enabled
-        
-    Raises:
-        PermissionDeniedError: If the feature is not enabled
-    """
-    if not enabled:
-        raise PermissionDeniedError(f"Feature '{feature_name}' is not enabled")
+def reset_service_dependencies() -> None:
+    """Reset to default dependencies."""
+    global _default_dependencies
+    _default_dependencies = None

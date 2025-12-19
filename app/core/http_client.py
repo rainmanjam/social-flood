@@ -12,6 +12,7 @@ from typing import Optional, Dict, Any, List
 from contextlib import asynccontextmanager
 import httpx
 from app.core.config import get_settings
+from app.core.constants import DEFAULT_USER_AGENT
 
 logger = logging.getLogger("uvicorn")
 
@@ -67,12 +68,13 @@ class HTTPClientManager:
                     "timeout": timeout,
                     "follow_redirects": True,
                     "headers": {
-                        "User-Agent": "Mozilla/5.0 (compatible; SocialFlood/1.0)"
+                        "User-Agent": DEFAULT_USER_AGENT
                     }
                 }
 
                 if proxy_url:
-                    client_config["proxies"] = proxy_url
+                    # httpx 0.28+ uses 'proxy' instead of 'proxies'
+                    client_config["proxy"] = proxy_url
                     logger.debug("Created HTTP client with proxy: %s", proxy_url)
                 else:
                     logger.debug("Created HTTP client without proxy")
@@ -183,7 +185,8 @@ class HTTPClientManager:
     async def batch_requests(
         self,
         requests: List[Dict[str, Any]],
-        max_concurrent: Optional[int] = None
+        max_concurrent: Optional[int] = None,
+        timeout: Optional[float] = None
     ) -> List[Dict[str, Any]]:
         """
         Execute multiple HTTP requests in parallel with batch processing.
@@ -191,6 +194,7 @@ class HTTPClientManager:
         Args:
             requests: List of request dictionaries
             max_concurrent: Maximum concurrent requests
+            timeout: Optional timeout in seconds (defaults to BATCH_TIMEOUT setting)
 
         Returns:
             List of response dictionaries
@@ -204,15 +208,36 @@ class HTTPClientManager:
             return results
 
         max_concurrent = max_concurrent or self.settings.MAX_CONCURRENT_BATCHES
+        batch_timeout = timeout or self.settings.BATCH_TIMEOUT
         semaphore = asyncio.Semaphore(max_concurrent)
 
         async def make_request_with_semaphore(req: Dict[str, Any]) -> Dict[str, Any]:
             async with semaphore:
                 return await self.make_request(**req)
 
-        # Execute all requests in parallel
+        # Execute all requests in parallel with timeout protection
         tasks = [make_request_with_semaphore(req) for req in requests]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        try:
+            # Wrap gather with timeout to prevent indefinite hanging
+            results = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=batch_timeout
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Batch request timed out after %.1f seconds with %d requests",
+                batch_timeout, len(requests)
+            )
+            # Return timeout errors for all requests
+            return [
+                {
+                    "success": False,
+                    "error": f"Batch request timed out after {batch_timeout} seconds",
+                    "request_metadata": req
+                }
+                for req in requests
+            ]
 
         # Handle any exceptions that occurred
         processed_results = []
@@ -248,6 +273,22 @@ class HTTPClientManager:
             **self._stats,
             "active_clients": len(self._clients),
             "connection_pool_efficiency": (
+                self._stats["connection_pool_hits"] /
+                max(1, self._stats["connection_pool_hits"] + self._stats["connection_pool_misses"])
+            ) * 100
+        }
+
+    def get_request_count(self) -> int:
+        """Get total number of requests made."""
+        return self._stats["total_requests"]
+
+    def get_connection_stats(self) -> Dict[str, Any]:
+        """Get connection pool statistics."""
+        return {
+            "active_clients": len(self._clients),
+            "pool_hits": self._stats["connection_pool_hits"],
+            "pool_misses": self._stats["connection_pool_misses"],
+            "pool_efficiency": (
                 self._stats["connection_pool_hits"] /
                 max(1, self._stats["connection_pool_hits"] + self._stats["connection_pool_misses"])
             ) * 100

@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import quote
 from app.core.config import get_settings
 
-logger = logging.getLogger("uvicorn")
+logger = logging.getLogger(__name__)
 
 
 class InputSanitizer:

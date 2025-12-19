@@ -1,0 +1,22 @@
+# Social Flood API - Development Dependencies
+# Install with: pip install -r requirements-dev.txt
+
+# Include production dependencies
+-r requirements.txt
+
+# Testing
+pytest>=7.0.0
+pytest-cov>=4.0.0
+pytest-asyncio>=0.21.0
+
+# Code Quality
+flake8>=6.0.0
+black>=23.0.0
+isort>=5.12.0
+
+# Type Checking (optional)
+# mypy>=1.0.0
+
+# Development Tools
+httpie  # CLI HTTP client for API testing
+watchfiles  # For uvicorn auto-reload

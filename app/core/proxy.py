@@ -44,3 +44,23 @@ async def get_proxy():
             logger.warning("Proxying is enabled, but no valid proxy URLs were found in PROXY_URLS or the list is empty.")
             return None
     return None
+
+
+def get_proxy_sync():
+    """
+    Synchronous version of get_proxy.
+    Returns a single proxy URL string, or None if proxying is disabled or no valid URLs exist.
+
+    Note: This version does not use locking and should only be used in synchronous contexts
+    where thread-safety is handled externally or not required.
+    """
+    if ENABLE_PROXY:
+        if PROXY_LIST:
+            # Return first proxy for sync contexts (no round-robin to avoid race conditions)
+            proxy_url = PROXY_LIST[0]
+            logger.debug(f"Selected proxy (sync): {proxy_url}")
+            return proxy_url
+        else:
+            logger.warning("Proxying is enabled, but no valid proxy URLs were found in PROXY_URLS or the list is empty.")
+            return None
+    return None

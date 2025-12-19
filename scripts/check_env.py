@@ -114,7 +114,6 @@ def check_dependencies():
         "requests",
         "pydantic",
         "pytest",
-        "celery",
         "redis",
         "httpx",
     ]

@@ -38,10 +38,10 @@ async def check_database_connection() -> Dict[str, Any]:
     
     try:
         # Import here to avoid circular imports
-        from app.core.database import get_db_session
-        
+        from app.core.database import get_db
+
         # Get a database session
-        session = await get_db_session()
+        session = await get_db()
         
         # Execute a simple query
         start_time = time.time()

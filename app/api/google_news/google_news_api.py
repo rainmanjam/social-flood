@@ -16,8 +16,10 @@ import re
 from app.core.proxy import get_proxy  # adjust if needed
 import datetime
 from app.core.rate_limiter import rate_limit
-from app.core.cache_manager import cache_manager
+from app.core.cache_manager import cache_manager, generate_cache_key, get_cached_or_fetch
 from app.core.config import get_settings
+from app.core.http_client import get_http_client_manager
+from app.core.constants import USER_AGENTS
 
 # Initialize NLTK asynchronously at module level
 async def setup_nltk():
@@ -206,104 +208,20 @@ AVAILABLE_COUNTRIES = {
 # Global cache manager instance
 settings = get_settings()
 
-# -----------------------------------------------------------------------------
-# Cache key generation functions
-# -----------------------------------------------------------------------------
-def generate_cache_key(endpoint: str, **params) -> str:
-    """
-    Generate a cache key for Google News API calls.
-    
-    Args:
-        endpoint: The API endpoint name
-        **params: Query parameters
-        
-    Returns:
-        str: Cache key
-    """
-    # Sort parameters for consistent key generation
-    sorted_params = sorted(params.items())
-    param_str = "_".join(f"{k}:{v}" for k, v in sorted_params if v is not None)
-    return f"gnews:{endpoint}:{param_str}"
 
-async def get_cached_or_fetch(key: str, fetch_func, ttl: int = None):
-    """
-    Get data from cache or fetch and cache it.
-    
-    Args:
-        key: Cache key
-        fetch_func: Async function to fetch data if not cached
-        ttl: Time to live in seconds
-        
-    Returns:
-        The fetched or cached data
-    """
-    if not settings.ENABLE_CACHE:
-        return await fetch_func()
-    
-    # Try to get from cache
-    cached_data = await cache_manager.get(key, namespace="gnews")
-    if cached_data is not None:
-        logger.debug(f"Cache hit for key: {key}")
-        return cached_data
-    
-    # Fetch data
-    data = await fetch_func()
-    
-    # Cache the result
-    if data:
-        ttl = ttl or settings.CACHE_TTL
-        await cache_manager.set(key, data, ttl=ttl, namespace="gnews")
-        logger.debug(f"Cached data for key: {key}, TTL: {ttl}s")
-    
-    return data
-
-# Global HTTP client pool for GNews operations
-_gnews_http_client: Optional[httpx.AsyncClient] = None
-
+# Use centralized HTTP client manager for GNews operations
 async def get_gnews_http_client(proxy_url: Optional[str] = None) -> httpx.AsyncClient:
     """
-    Get or create a shared HTTP client for GNews operations with connection pooling.
-    
+    Get a shared HTTP client for GNews operations using centralized HTTPClientManager.
+
     Args:
         proxy_url: Optional proxy URL
-        
+
     Returns:
-        httpx.AsyncClient: Shared HTTP client
+        httpx.AsyncClient: Shared HTTP client from connection pool
     """
-    global _gnews_http_client
-    
-    if _gnews_http_client is None:
-        # Configure connection limits based on settings
-        limits = httpx.Limits(
-            max_keepalive_connections=settings.HTTP_MAX_KEEPALIVE_CONNECTIONS,
-            max_connections=settings.HTTP_MAX_CONNECTIONS_PER_HOST,
-            keepalive_expiry=30.0
-        )
-        
-        # Configure timeouts
-        timeout = httpx.Timeout(
-            connect=settings.HTTP_CONNECTION_TIMEOUT,
-            read=settings.HTTP_READ_TIMEOUT,
-            write=10.0,
-            pool=5.0
-        )
-        
-        mounts = None
-        if proxy_url:
-            mounts = {
-                "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-                "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-            }
-        
-        _gnews_http_client = httpx.AsyncClient(
-            limits=limits,
-            timeout=timeout,
-            mounts=mounts,
-            follow_redirects=True
-        )
-        logger.debug("Created shared HTTP client for GNews operations")
-    
-    return _gnews_http_client
+    http_manager = get_http_client_manager()
+    return await http_manager.get_client(proxy_url)
 
 # -----------------------------------------------------------------------------
 # Decoding functions
@@ -396,10 +314,7 @@ async def decode_url(signature, timestamp, base64_str, start_date=None, end_date
         ]
         headers = {
             "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": USER_AGENTS["windows_chrome"],
         }
 
         proxy_url = await get_proxy()  # Adjust based on your implementation
@@ -618,68 +533,31 @@ def transform_article(article: dict) -> dict:
 # Endpoints
 # -----------------------------------------------------------------------------
 
-@gnews_router.get(
-    "/available-languages/",
-    summary="Get Available Languages",
-    response_description="List of available languages for Google News.",
-    response_model=dict
-)
+@gnews_router.get("/available-languages/", summary="Available Languages", response_model=dict)
 async def get_languages():
-    """
-    Get a list of available languages for Google News.
-    """
+    """Get supported languages for Google News."""
     return {"available_languages": AVAILABLE_LANGUAGES}
 
-@gnews_router.get(
-    "/available-countries/",
-    summary="Get Available Countries",
-    response_description="List of available countries for Google News.",
-    response_model=dict
-)
+@gnews_router.get("/available-countries/", summary="Available Countries", response_model=dict)
 async def get_available_countries():
-    """
-    Get a list of available countries for Google News.
-    """
+    """Get supported countries for Google News."""
     return {"available_countries": AVAILABLE_COUNTRIES}
 
-@gnews_router.get(
-    "/source/",
-    summary="Get Google News by Source",
-    response_description="List of news articles from a specific source.",
-    response_model=NewsResponse,
-    responses={
-        400: {"model": ErrorResponse, "description": "Invalid source URL or domain."},
-        404: {"model": ErrorResponse, "description": "No articles found for the given parameters."},
-        500: {"model": ErrorResponse, "description": "Internal Server Error."},
-    }
-)
+@gnews_router.get("/source/", summary="News by Source", response_model=NewsResponse)
 async def get_news_by_source(
-    source: str = Query(..., description="Source domain or full URL (e.g., 'cnn.com' or 'https://www.cnn.com')"),
-    language: str = Query("en", description="Language for the news results."),
-    country: str = Query("US", description="Country for the news results."),
-    max_results: int = Query(5, ge=1, le=100, description="Maximum number of news results (1-100)."),
-    exclude_duplicates: bool = Query(False, description="Exclude duplicate news articles."),
-    start_date: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$", description="Start date in YYYY-MM-DD format."),
-    end_date: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$", description="End date in YYYY-MM-DD format."),
+    # === REQUIRED ===
+    source: str = Query(..., description="Source domain or URL", example="cnn.com"),
+    # === COMMONLY USED ===
+    language: str = Query("en", description="Language code", example="en"),
+    country: str = Query("US", description="Country code", example="US"),
+    max_results: int = Query(5, ge=1, le=100, description="Max results (1-100)"),
+    # === DATE FILTERS ===
+    start_date: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$", description="Start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$", description="End date (YYYY-MM-DD)"),
+    # === OPTIONS ===
+    exclude_duplicates: bool = Query(False, description="Exclude duplicates"),
 ):
-    """
-    Get Google News articles based on a specific source with optional date filtering.
-
-    ### Parameters:
-    - **source**: Source domain or full URL (e.g., 'cnn.com' or 'https://www.cnn.com')
-    - **language**: Language for the news results (default: 'en')
-    - **country**: Country for the news results (default: 'US')
-    - **max_results**: Maximum number of news results (1-100)
-    - **exclude_duplicates**: Exclude duplicate news articles (default: False)
-    - **start_date**: Start date in YYYY-MM-DD format (optional)
-    - **end_date**: End date in YYYY-MM-DD format (optional)
-
-    ### Responses:
-    - **200 OK**: Returns a list of news articles from the specified source.
-    - **400 Bad Request**: Invalid source URL or domain.
-    - **404 Not Found**: No articles found for the given parameters.
-    - **500 Internal Server Error**: Unexpected server error.
-    """
+    """Get news articles from a specific source."""
     try:
         # Validate input using SourceQuery
         validated_query = SourceQuery(source=source)
@@ -728,50 +606,26 @@ async def get_news_by_source(
         logger.error(f"Unexpected error fetching Google News for source '{source}': {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
-@gnews_router.get(
-    "/search/",
-    summary="Search Google News",
-    response_description="List of news articles based on the search query.",
-    response_model=NewsResponse,
-    responses={
-        400: {"model": ErrorResponse, "description": "Invalid query parameters."},
-        404: {"model": ErrorResponse, "description": "No news found for the given query."},
-        500: {"model": ErrorResponse, "description": "Internal Server Error."},
-    }
-)
+@gnews_router.get("/search/", summary="Search News", response_model=NewsResponse)
 async def search_google_news(
     request: Request,
-    query: str = Query(..., description="The search query string."),
-    language: str = Query("en", description="Language for the news results."),
-    country: str = Query("US", description="Country for the news results."),
-    max_results: int = Query(5, ge=1, le=100, description="Maximum number of news results (1-100)."),
-    start_date: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$", description="Start date in YYYY-MM-DD format."),
-    end_date: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$", description="End date in YYYY-MM-DD format."),
-    exclude_duplicates: bool = Query(False, description="Exclude duplicate news articles."),
-    exact_match: bool = Query(False, description="Search for an exact match of the query."),
-    sort_by: str = Query("relevance", regex="^(relevance|date)$", description="Sort news by 'relevance' or 'date'."),
+    # === REQUIRED ===
+    query: str = Query(..., description="Search query", example="climate change"),
+    # === COMMONLY USED ===
+    language: str = Query("en", description="Language code", example="en"),
+    country: str = Query("US", description="Country code", example="US"),
+    max_results: int = Query(5, ge=1, le=100, description="Max results (1-100)"),
+    sort_by: str = Query("relevance", regex="^(relevance|date)$", description="Sort by: relevance, date"),
+    # === DATE FILTERS ===
+    start_date: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$", description="Start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$", description="End date (YYYY-MM-DD)"),
+    # === OPTIONS ===
+    exclude_duplicates: bool = Query(False, description="Exclude duplicates"),
+    exact_match: bool = Query(False, description="Exact match only"),
+    # === AUTH ===
     rate_limit_check: None = Depends(rate_limit),
 ):
-    """
-    Search Google News articles based on a query string.
-
-    ### Parameters:
-    - **query**: The search query string.
-    - **language**: Language for the news results (default: 'en').
-    - **country**: Country for the news results (default: 'US').
-    - **max_results**: Maximum number of news results (1-100).
-    - **start_date**: Start date in YYYY-MM-DD format (optional).
-    - **end_date**: End date in YYYY-MM-DD format (optional).
-    - **exclude_duplicates**: Exclude duplicate news articles (default: False).
-    - **exact_match**: Search for an exact match of the query (default: False).
-    - **sort_by**: Sort news by 'relevance' or 'date' (default: 'relevance').
-
-    ### Responses:
-    - **200 OK**: Returns a list of news articles based on the search query.
-    - **400 Bad Request**: Invalid query parameters.
-    - **404 Not Found**: No news found for the given query.
-    - **500 Internal Server Error**: Unexpected server error.
-    """
+    """Search news articles by query."""
     try:
         # Parse dates if provided
         start_date_tuple = tuple(map(int, start_date.split("-"))) if start_date else None
@@ -779,7 +633,7 @@ async def search_google_news(
 
         # Generate cache key
         cache_key = generate_cache_key(
-            "search",
+            "gnews:search",
             query=query,
             language=language,
             country=country,
@@ -830,34 +684,14 @@ async def search_google_news(
         logger.error(f"Error fetching Google News for query '{query}': {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
-@gnews_router.get(
-    "/top/",
-    summary="Get Top Google News",
-    response_description="List of top news articles.",
-    response_model=NewsResponse,
-    responses={
-        404: {"model": ErrorResponse, "description": "No top news found."},
-        500: {"model": ErrorResponse, "description": "Internal Server Error."},
-    }
-)
+@gnews_router.get("/top/", summary="Top News", response_model=NewsResponse)
 async def get_top_google_news(
-    language: str = Query("en", description="Language for the news results."),
-    country: str = Query("US", description="Country for the news results."),
-    max_results: int = Query(10, ge=1, le=100, description="Maximum number of news results (1-100)."),
+    # === COMMONLY USED ===
+    language: str = Query("en", description="Language code", example="en"),
+    country: str = Query("US", description="Country code", example="US"),
+    max_results: int = Query(10, ge=1, le=100, description="Max results (1-100)"),
 ):
-    """
-    Get the top Google News articles.
-
-    ### Parameters:
-    - **language**: Language for the news results (default: 'en').
-    - **country**: Country for the news results (default: 'US').
-    - **max_results**: Maximum number of news results (1-100).
-
-    ### Responses:
-    - **200 OK**: Returns a list of top news articles.
-    - **404 Not Found**: No top news found.
-    - **500 Internal Server Error**: Unexpected server error.
-    """
+    """Get top news articles."""
     try:
         # Create a new GNews instance
         gnews = await get_gnews_instance(
@@ -885,40 +719,18 @@ async def get_top_google_news(
         logger.error(f"Error fetching top Google News: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
-@gnews_router.get(
-    "/topic/",
-    summary="Get Google News by Topic",
-    response_description="List of news articles based on the specified topic.",
-    response_model=NewsResponse,
-    responses={
-        400: {"model": ErrorResponse, "description": "Invalid topic provided."},
-        404: {"model": ErrorResponse, "description": "No news found for the given topic."},
-        500: {"model": ErrorResponse, "description": "Internal Server Error."},
-    }
-)
+@gnews_router.get("/topic/", summary="News by Topic", response_model=NewsResponse)
 async def get_news_by_topic(
-    topic: str = Query(..., description="The topic to filter news articles."),
-    language: str = Query("en", description="Language for the news results."),
-    country: str = Query("US", description="Country for the news results."),
-    max_results: int = Query(5, ge=1, le=100, description="Maximum number of news results (1-100)."),
-    exclude_duplicates: bool = Query(False, description="Exclude duplicate news articles."),
+    # === REQUIRED ===
+    topic: str = Query(..., description="Topic name (WORLD, TECHNOLOGY, SPORTS, etc.)", example="TECHNOLOGY"),
+    # === COMMONLY USED ===
+    language: str = Query("en", description="Language code", example="en"),
+    country: str = Query("US", description="Country code", example="US"),
+    max_results: int = Query(5, ge=1, le=100, description="Max results (1-100)"),
+    # === OPTIONS ===
+    exclude_duplicates: bool = Query(False, description="Exclude duplicates"),
 ):
-    """
-    Get Google News articles based on a specific topic.
-    
-    ### Parameters:
-    - **topic**: The topic to filter news articles.
-    - **language**: Language for the news results (default: 'en').
-    - **country**: Country for the news results (default: 'US').
-    - **max_results**: Maximum number of news results (1-100).
-    - **exclude_duplicates**: Exclude duplicate news articles (default: False).
-    
-    ### Responses:
-    - **200 OK**: Returns a list of news articles based on the specified topic.
-    - **400 Bad Request**: Invalid topic provided.
-    - **404 Not Found**: No news found for the given topic.
-    - **500 Internal Server Error**: Unexpected server error.
-    """
+    """Get news articles by topic."""
     if topic.upper() not in AVAILABLE_TOPICS:
         return JSONResponse(
             status_code=400,
@@ -952,42 +764,21 @@ async def get_news_by_topic(
         logger.error(f"Error fetching Google News for topic '{topic}': {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
-@gnews_router.get(
-    "/location/",
-    summary="Get Google News by Location",
-    response_description="List of news articles based on a specific location.",
-    response_model=NewsResponse,
-    responses={
-        404: {"model": ErrorResponse, "description": "No news found for the given location."},
-        500: {"model": ErrorResponse, "description": "Internal Server Error."},
-    }
-)
+@gnews_router.get("/location/", summary="News by Location", response_model=NewsResponse)
 async def get_news_by_location(
-    location: str = Query(..., description="The location to filter news articles."),
-    language: str = Query("en", description="Language for the news results."),
-    country: str = Query("US", description="Country for the news results."),
-    max_results: int = Query(5, ge=1, le=100, description="Maximum number of news results (1-100)."),
-    start_date: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$", description="Start date in YYYY-MM-DD format."),
-    end_date: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$", description="End date in YYYY-MM-DD format."),
-    exclude_duplicates: bool = Query(False, description="Exclude duplicate news articles."),
+    # === REQUIRED ===
+    location: str = Query(..., description="Location name", example="New York"),
+    # === COMMONLY USED ===
+    language: str = Query("en", description="Language code", example="en"),
+    country: str = Query("US", description="Country code", example="US"),
+    max_results: int = Query(5, ge=1, le=100, description="Max results (1-100)"),
+    # === DATE FILTERS ===
+    start_date: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$", description="Start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$", description="End date (YYYY-MM-DD)"),
+    # === OPTIONS ===
+    exclude_duplicates: bool = Query(False, description="Exclude duplicates"),
 ):
-    """
-    Get Google News articles based on a specific location.
-
-    ### Parameters:
-    - **location**: The location to filter news articles.
-    - **language**: Language for the news results (default: 'en').
-    - **country**: Country for the news results (default: 'US').
-    - **max_results**: Maximum number of news results (1-100).
-    - **start_date**: Start date in YYYY-MM-DD format (optional).
-    - **end_date**: End date in YYYY-MM-DD format (optional).
-    - **exclude_duplicates**: Exclude duplicate news articles (default: False).
-
-    ### Responses:
-    - **200 OK**: Returns a list of news articles based on the specified location.
-    - **404 Not Found**: No news found for the given location.
-    - **500 Internal Server Error**: Unexpected server error.
-    """
+    """Get news articles by location."""
     try:
         # Parse dates if provided
         start_date_tuple = tuple(map(int, start_date.split("-"))) if start_date else None
@@ -1024,38 +815,17 @@ async def get_news_by_location(
 
 # The `/source/` endpoint definition is already provided above.
 
-@gnews_router.get(
-    "/articles/",
-    summary="Get Google News Articles in Bulk",
-    response_description="Bulk list of Google News articles based on a search query and period.",
-    response_model=NewsResponse,
-    responses={
-        404: {"model": ErrorResponse, "description": "No articles found for the given parameters."},
-        500: {"model": ErrorResponse, "description": "Internal Server Error."},
-    }
-)
+@gnews_router.get("/articles/", summary="Bulk Articles", response_model=NewsResponse)
 async def get_google_news_articles(
-    query: str = Query("news", description="Search query for the news articles."),
-    country: str = Query("US", description="Country for the news results."),
-    language: str = Query("en", description="Language for the news results."),
-    period: str = Query("1d", regex=r"^\d+[dwmy]$", description="Period for the news results (e.g., '7d' for last 7 days)."),
-    max_results: int = Query(5, ge=1, le=100, description="Maximum number of articles to fetch (1-100)."),
+    # === COMMONLY USED ===
+    query: str = Query("news", description="Search query", example="technology"),
+    language: str = Query("en", description="Language code", example="en"),
+    country: str = Query("US", description="Country code", example="US"),
+    max_results: int = Query(5, ge=1, le=100, description="Max results (1-100)"),
+    # === TIME PERIOD ===
+    period: str = Query("1d", regex=r"^\d+[dwmy]$", description="Period: 7d, 1w, 1m, 1y"),
 ):
-    """
-    Get multiple Google News articles over a period based on a search query.
-
-    ### Parameters:
-    - **query**: Search query for the news articles (default: 'news').
-    - **country**: Country for the news results (default: 'US').
-    - **language**: Language for the news results (default: 'en').
-    - **period**: Period for the news results (e.g., '7d' for last 7 days).
-    - **max_results**: Maximum number of articles to fetch (1-100).
-
-    ### Responses:
-    - **200 OK**: Returns a bulk list of news articles based on the search query and period.
-    - **404 Not Found**: No articles found for the given parameters.
-    - **500 Internal Server Error**: Unexpected server error.
-    """
+    """Get bulk news articles over a time period."""
     try:
         # Create a new GNews instance
         gnews = await get_gnews_instance(
@@ -1084,30 +854,12 @@ async def get_google_news_articles(
         logger.error(f"Error fetching Google News articles for query '{query}': {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
-@gnews_router.get(
-    "/article-details/",
-    summary="Get Article Details",
-    response_description="Detailed information about a specific article.",
-    response_model=dict,
-    responses={
-        500: {"model": ErrorResponse, "description": "Internal Server Error."},
-        503: {"model": ErrorResponse, "description": "Service unavailable: Could not process article from URL."},
-    }
-)
+@gnews_router.get("/article-details/", summary="Article Details", response_model=dict)
 async def get_article_details(
-    url: str = Query(..., description="URL of the article to retrieve details for.")
+    # === REQUIRED ===
+    url: str = Query(..., description="Article URL to analyze"),
 ):
-    """
-    Get detailed information about a specific article.
-
-    ### Parameters:
-    - **url**: URL of the article to retrieve details for.
-
-    ### Responses:
-    - **200 OK**: Returns detailed information about the specified article.
-    - **500 Internal Server Error**: Unexpected server error.
-    - **503 Service Unavailable**: Could not process article from URL due to an issue with the article source or processing.
-    """
+    """Get detailed article information (title, text, summary, keywords)."""
     logger.info(f"Received request to get article details for URL: {url}")
     try:
         # Ensure NLTK is set up (only runs once)

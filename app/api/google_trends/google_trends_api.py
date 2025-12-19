@@ -14,6 +14,7 @@ from app.core.proxy import get_proxy
 from app.core.cache_manager import generate_cache_key, get_cached_or_fetch
 from app.core.rate_limiter import rate_limit
 from app.core.http_client import get_http_client_manager
+from app.core.constants import USER_AGENT_LIST, REFERER_LIST
 import random
 import json
 
@@ -91,33 +92,9 @@ def to_jsonable(value):
     return value
 
 # -------------------------------------------------------------------------
-# Header Configuration
+# Header Configuration - imported from app.core.constants
+# REFERER_LIST and USER_AGENT_LIST are used for header rotation
 # -------------------------------------------------------------------------
-REFERER_LIST = [
-    "https://www.google.com/",
-    "https://news.google.com/",
-    "https://www.bing.com/",
-    "https://www.yahoo.com/",
-    "https://www.duckduckgo.com/",
-    "https://www.ask.com/",
-    "https://www.aol.com/",
-    "https://www.ecosia.org/",
-    "https://www.startpage.com/",
-    "https://www.qwant.com/"
-]
-
-USER_AGENT_LIST = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-    "Mozilla/5.0 (X11; Linux x86_64)",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X)",
-    "Mozilla/5.0 (iPad; CPU OS 14_0 like Mac OS X)",
-    "Mozilla/5.0 (Android 10; Mobile; rv:79.0)",
-    "Mozilla/5.0 (Windows NT 6.1; WOW64)",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6)",
-    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:92.0)",
-    "Mozilla/5.0 (iPod touch; CPU iPhone OS 14_0 like Mac OS X)"
-]
 
 def get_random_headers():
     """
@@ -154,18 +131,20 @@ async def get_trends_instance():
 # -------------------------------------------------------------------------
 # 1) Interest Over Time
 # -------------------------------------------------------------------------
-@google_trends_router.get("/interest-over-time", summary="Google Trends: Interest Over Time")
+@google_trends_router.get("/interest-over-time", summary="Interest Over Time")
 async def interest_over_time(
-    keywords: str = Query(..., description="Comma-separated keywords (e.g., 'python,javascript')"),
-    timeframe: str = Query("today 12-m", description="Timeframe for the query (e.g., 'now 4-H', 'today 3-m')."),
-    geo: Optional[str] = Query(None, description="Geolocation code (e.g., 'US', 'US-NY')."),
-    cat: Optional[str] = Query(None, description="Category ID (e.g., '13' for Computers & Electronics)."),
-    gprop: Optional[str] = Query(None, description="Google property (e.g., 'images', 'youtube')."),
+    # === REQUIRED ===
+    keywords: str = Query(..., description="Comma-separated keywords", example="python,javascript"),
+    # === COMMONLY USED ===
+    timeframe: str = Query("today 12-m", description="Time range: now 1-H, now 4-H, today 1-m, today 3-m, today 12-m"),
+    geo: Optional[str] = Query(None, description="Location code (US, US-NY, GB)", example="US"),
+    # === FILTERS ===
+    cat: Optional[str] = Query(None, description="Category ID (e.g., 13=Computers)"),
+    gprop: Optional[str] = Query(None, description="Property: images, youtube, news, froogle"),
+    # === AUTH ===
     rate_limit: None = Depends(rate_limit)
 ):
-    """
-    Retrieves Google Trends interest over time for the specified keywords.
-    """
+    """Get search interest over time for keywords."""
     try:
         kw_list = [kw.strip() for kw in keywords.split(",") if kw.strip()]
         if not kw_list:
@@ -236,18 +215,20 @@ async def interest_over_time(
 # -------------------------------------------------------------------------
 # 2) Interest By Region
 # -------------------------------------------------------------------------
-@google_trends_router.get("/interest-by-region", summary="Google Trends: Interest By Region")
+@google_trends_router.get("/interest-by-region", summary="Interest By Region")
 async def interest_by_region(
-    keyword: str = Query(..., description="Single keyword (e.g., 'python')."),
-    timeframe: str = Query("today 12-m", description="Timeframe."),
-    geo: Optional[str] = Query(None, description="Geolocation code."),
-    cat: Optional[str] = Query(None, description="Category ID."),
-    resolution: str = Query("COUNTRY", description="Resolution level (COUNTRY, REGION, CITY)."),
+    # === REQUIRED ===
+    keyword: str = Query(..., description="Single keyword", example="python"),
+    # === COMMONLY USED ===
+    geo: Optional[str] = Query(None, description="Location code (US, GB)", example="US"),
+    resolution: str = Query("COUNTRY", description="Detail level: COUNTRY, REGION, CITY, DMA"),
+    timeframe: str = Query("today 12-m", description="Time range"),
+    # === FILTERS ===
+    cat: Optional[str] = Query(None, description="Category ID"),
+    # === AUTH ===
     rate_limit: None = Depends(rate_limit)
 ):
-    """
-    Retrieves Google Trends interest by region for the specified keyword.
-    """
+    """Get geographic breakdown of search interest."""
     try:
         # Generate cache key
         cache_key = generate_cache_key(
@@ -312,19 +293,20 @@ async def interest_by_region(
 # -------------------------------------------------------------------------
 # 3) Related Queries (Uses a Custom Referer in the Headers)
 # -------------------------------------------------------------------------
-@google_trends_router.get("/related-queries", summary="Google Trends: Related Queries")
+@google_trends_router.get("/related-queries", summary="Related Queries")
 async def related_queries(
-    keyword: str = Query(..., description="Single keyword (e.g., 'python')."),
-    timeframe: str = Query("today 12-m", description="Timeframe."),
-    geo: Optional[str] = Query(None, description="Geolocation code."),
-    cat: Optional[str] = Query(None, description="Category ID."),
-    gprop: Optional[str] = Query(None, description="Google property (e.g., 'images', 'youtube')."),
+    # === REQUIRED ===
+    keyword: str = Query(..., description="Single keyword", example="python"),
+    # === COMMONLY USED ===
+    geo: Optional[str] = Query(None, description="Location code (US, GB)", example="US"),
+    timeframe: str = Query("today 12-m", description="Time range"),
+    # === FILTERS ===
+    cat: Optional[str] = Query(None, description="Category ID"),
+    gprop: Optional[str] = Query(None, description="Property: images, youtube, news, froogle"),
+    # === AUTH ===
     rate_limit: None = Depends(rate_limit)
 ):
-    """
-    Retrieves related queries for a specified keyword.
-    Adds a custom referer header to help bypass certain rate limits.
-    """
+    """Get related search queries (rising and top)."""
     try:
         # Generate cache key
         cache_key = generate_cache_key(
@@ -389,19 +371,20 @@ async def related_queries(
 # -------------------------------------------------------------------------
 # 4) Related Topics
 # -------------------------------------------------------------------------
-@google_trends_router.get("/related-topics", summary="Google Trends: Related Topics")
+@google_trends_router.get("/related-topics", summary="Related Topics")
 async def related_topics(
-    keyword: str = Query(..., description="Single keyword."),
-    timeframe: str = Query("today 12-m", description="Timeframe."),
-    geo: Optional[str] = Query(None, description="Geolocation code."),
-    cat: Optional[str] = Query(None, description="Category ID."),
-    gprop: Optional[str] = Query(None, description="Google property."),
+    # === REQUIRED ===
+    keyword: str = Query(..., description="Single keyword", example="python"),
+    # === COMMONLY USED ===
+    geo: Optional[str] = Query(None, description="Location code (US, GB)", example="US"),
+    timeframe: str = Query("today 12-m", description="Time range"),
+    # === FILTERS ===
+    cat: Optional[str] = Query(None, description="Category ID"),
+    gprop: Optional[str] = Query(None, description="Property: images, youtube, news, froogle"),
+    # === AUTH ===
     rate_limit: None = Depends(rate_limit)
 ):
-    """
-    Retrieves related topics for a specified keyword.
-    Adds a custom Referer header to help bypass certain rate limits.
-    """
+    """Get related topics (rising and top)."""
     try:
         # Generate cache key
         cache_key = generate_cache_key(
@@ -466,14 +449,14 @@ async def related_topics(
 # -------------------------------------------------------------------------
 # 5) Trending Now
 # -------------------------------------------------------------------------
-@google_trends_router.get("/trending-now", summary="Google Trends: Trending Now")
+@google_trends_router.get("/trending-now", summary="Trending Now")
 async def trending_now(
-    geo: Optional[str] = Query("US", description="Geolocation code for trending searches (e.g., 'US')."),
+    # === COMMONLY USED ===
+    geo: Optional[str] = Query("US", description="Location code (US, GB)", example="US"),
+    # === AUTH ===
     rate_limit: None = Depends(rate_limit)
 ):
-    """
-    Retrieves current trending searches for the specified geo.
-    """
+    """Get current trending searches."""
     try:
         # Generate cache key
         cache_key = generate_cache_key(
@@ -528,14 +511,14 @@ async def trending_now(
 # -------------------------------------------------------------------------
 # 6) Trending Now by RSS
 # -------------------------------------------------------------------------
-@google_trends_router.get("/trending-now-by-rss", summary="Google Trends: Trending Now by RSS")
+@google_trends_router.get("/trending-now-by-rss", summary="Trending Now (RSS)")
 async def trending_now_by_rss(
-    geo: Optional[str] = Query("US", description="Geolocation code for trending searches (e.g., 'US')."),
+    # === COMMONLY USED ===
+    geo: Optional[str] = Query("US", description="Location code (US, GB)", example="US"),
+    # === AUTH ===
     rate_limit: None = Depends(rate_limit)
 ):
-    """
-    Retrieves current trending searches by RSS for the specified geo. Includes related news.
-    """
+    """Get trending searches with related news via RSS."""
     try:
         # Generate cache key
         cache_key = generate_cache_key(
@@ -590,16 +573,16 @@ async def trending_now_by_rss(
 # -------------------------------------------------------------------------
 # 7) Trending Now News by IDs
 # -------------------------------------------------------------------------
-@google_trends_router.get("/trending-now-news-by-ids", summary="Related News by IDs")
+@google_trends_router.get("/trending-now-news-by-ids", summary="News by IDs")
 async def trending_now_news_by_ids(
-    news_tokens: str = Query(..., description="Comma-separated news tokens from a trending topic."),
-    max_news: int = Query(3, description="Number of articles to retrieve."),
+    # === REQUIRED ===
+    news_tokens: str = Query(..., description="Comma-separated news tokens from trending topic"),
+    # === OPTIONS ===
+    max_news: int = Query(3, description="Max articles to retrieve", example=3),
+    # === AUTH ===
     rate_limit: None = Depends(rate_limit)
 ):
-    """
-    Retrieves related news articles for specified news tokens.
-    Adds randomized headers to each API call.
-    """
+    """Get related news articles for news tokens."""
     try:
         logger.debug(f"Received request with tokens: {news_tokens}, max_news: {max_news}")
 
@@ -710,16 +693,15 @@ async def trending_now_news_by_ids(
 # -------------------------------------------------------------------------
 # 8) Trending Now Showcase Timeline (Independent Historical Data)
 # -------------------------------------------------------------------------
-@google_trends_router.get("/trending-now-showcase-timeline", summary="Get Trending Timeline")
+@google_trends_router.get("/trending-now-showcase-timeline", summary="Trending Timeline")
 async def trending_now_showcase_timeline(
-    keywords: str = Query(..., description="Comma-separated keywords to analyze"),
-    timeframe: HumanFriendlyBatchPeriod = Query(..., description="Timeframe value (past_4h, past_24h, past_48h, past_7d)"),
+    # === REQUIRED ===
+    keywords: str = Query(..., description="Comma-separated keywords", example="python,javascript"),
+    timeframe: HumanFriendlyBatchPeriod = Query(..., description="Time range: past_4h, past_24h, past_48h, past_7d"),
+    # === AUTH ===
     rate_limit: None = Depends(rate_limit)
 ):
-    """
-    Get trending timeline data for specified keywords.
-    Adds randomized headers to each API call.
-    """
+    """Get trending timeline data for keywords."""
     try:
         # Parse keywords
         keyword_list = [k.strip() for k in keywords.split(",") if k.strip()]
@@ -799,16 +781,15 @@ async def trending_now_showcase_timeline(
 # -------------------------------------------------------------------------
 # 9) Categories
 # -------------------------------------------------------------------------
-@google_trends_router.get("/categories", summary="Search or List Google Trends Categories")
+@google_trends_router.get("/categories", summary="Categories")
 async def get_categories(
-    find: Optional[str] = Query(None, description="String to match category name (e.g., 'tech')."),
-    root: Optional[str] = Query(None, description="Root category ID to list subcategories."),
+    # === SEARCH OPTIONS ===
+    find: Optional[str] = Query(None, description="Search category names", example="tech"),
+    root: Optional[str] = Query(None, description="Root category ID for subcategories"),
+    # === AUTH ===
     rate_limit: None = Depends(rate_limit)
 ):
-    """
-    Searches or lists categories in the Google Trends taxonomy.
-    Adds randomized headers to each API call.
-    """
+    """Search or list Google Trends categories."""
     try:
         # Generate cache key
         cache_key = generate_cache_key(
@@ -864,15 +845,14 @@ async def get_categories(
 # -------------------------------------------------------------------------
 # 10) Geo
 # -------------------------------------------------------------------------
-@google_trends_router.get("/geo", summary="Search or List Google Trends Geolocations")
+@google_trends_router.get("/geo", summary="Geolocations")
 async def get_geo(
-    find: Optional[str] = Query(None, description="String to match location name (e.g., 'york')."),
+    # === SEARCH OPTIONS ===
+    find: Optional[str] = Query(None, description="Search location names", example="york"),
+    # === AUTH ===
     rate_limit: None = Depends(rate_limit)
 ):
-    """
-    Searches available geolocation codes in Google Trends (countries, states, cities).
-    Adds randomized headers to each API call.
-    """
+    """Search available geolocation codes (countries, states, cities)."""
     try:
         # Generate cache key
         cache_key = generate_cache_key(

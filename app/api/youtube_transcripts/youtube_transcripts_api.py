@@ -1,7 +1,12 @@
 from fastapi import APIRouter, Query, HTTPException, Depends
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptList, Transcript, NoTranscriptFound, TranscriptsDisabled, VideoUnavailable
+from youtube_transcript_api import (
+    YouTubeTranscriptApi,
+    NoTranscriptFound,
+    TranscriptsDisabled,
+    VideoUnavailable,
+)
 from app.core.auth import get_api_key
 from app.core.cache_manager import generate_cache_key, get_cached_or_fetch
 from app.core.rate_limiter import rate_limit
@@ -13,6 +18,9 @@ import io
 
 logger = logging.getLogger(__name__)
 youtube_transcripts_router = APIRouter()
+
+# Create a module-level API instance for reuse
+_youtube_api = YouTubeTranscriptApi()
 
 # Pydantic models
 class TranslationLanguage(BaseModel):
@@ -37,10 +45,19 @@ class TranscriptListResponse(BaseModel):
     transcripts: List[Dict[str, Any]]
 
 # Helper function to fetch transcript
-def fetch_transcript(video_id: str, languages: List[str] = ["en"]) -> Transcript:
+def fetch_transcript(video_id: str, languages: List[str] = None) -> List[Dict[str, Any]]:
+    """
+    Fetch transcript for a video using youtube-transcript-api v1.x.
+
+    Returns the raw transcript data as a list of dicts with text, start, duration.
+    """
+    if languages is None:
+        languages = ["en"]
     try:
-        transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=languages)
-        return transcript
+        # v1.x API: use instance method fetch() instead of class method get_transcript()
+        fetched = _youtube_api.fetch(video_id, languages=tuple(languages))
+        # Return raw data format for compatibility with existing code
+        return fetched.to_raw_data()
     except NoTranscriptFound:
         raise HTTPException(status_code=404, detail="No transcript found for the given video ID.")
     except TranscriptsDisabled:
@@ -52,17 +69,18 @@ def fetch_transcript(video_id: str, languages: List[str] = ["en"]) -> Transcript
         raise HTTPException(status_code=500, detail="Internal Server Error while fetching transcript.")
 
 # Endpoint to get transcript
-@youtube_transcripts_router.get("/get-transcript", response_model=TranscriptResponse, summary="Get Transcript for a YouTube Video")
+@youtube_transcripts_router.get("/get-transcript", response_model=TranscriptResponse, summary="Get Transcript")
 async def get_transcript(
-    video_id: str = Query(..., description="YouTube video ID."),
-    languages: Optional[List[str]] = Query(["en"], description="List of language codes in descending priority."),
-    preserve_formatting: bool = Query(False, description="Preserve HTML formatting in transcripts."),
+    # === REQUIRED ===
+    video_id: str = Query(..., description="YouTube video ID", example="dQw4w9WgXcQ"),
+    # === OPTIONS ===
+    languages: Optional[List[str]] = Query(["en"], description="Language codes by priority", example=["en", "es"]),
+    preserve_formatting: bool = Query(False, description="Preserve HTML formatting"),
+    # === AUTH ===
     api_key: str = Depends(get_api_key),
     rate_limit: None = Depends(rate_limit)
 ):
-    """
-    Retrieves the transcript for the specified YouTube video.
-    """
+    """Get transcript for a YouTube video."""
     # Generate cache key
     cache_key = generate_cache_key(
         "youtube_transcript",
@@ -77,8 +95,8 @@ async def get_transcript(
         # Optional formatting can be added here if needed
         transcript_items = [TranscriptItem(**item) for item in transcript_data]
 
-        # Fetch transcript metadata
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        # Fetch transcript metadata using v1.x API
+        transcript_list = _youtube_api.list(video_id)
         try:
             transcript_obj = transcript_list.find_transcript(languages)
         except Exception as e:
@@ -91,7 +109,8 @@ async def get_transcript(
             language_code=transcript_obj.language_code,
             is_generated=transcript_obj.is_generated,
             is_translatable=transcript_obj.is_translatable,
-            translation_languages=[TranslationLanguage(language=lang['language'], language_code=lang['language_code']) for lang in transcript_obj.translation_languages],
+            # v1.x API: translation_languages contains objects with attributes, not dicts
+            translation_languages=[TranslationLanguage(language=lang.language, language_code=lang.language_code) for lang in transcript_obj.translation_languages],
             transcript=transcript_items
         )
 
@@ -101,15 +120,15 @@ async def get_transcript(
     return await get_cached_or_fetch(cache_key, fetch_transcript_data)
 
 # Endpoint to list available transcripts
-@youtube_transcripts_router.get("/list-transcripts", response_model=TranscriptListResponse, summary="List Available Transcripts for a YouTube Video")
+@youtube_transcripts_router.get("/list-transcripts", response_model=TranscriptListResponse, summary="List Transcripts")
 async def list_transcripts(
-    video_id: str = Query(..., description="YouTube video ID."),
+    # === REQUIRED ===
+    video_id: str = Query(..., description="YouTube video ID", example="dQw4w9WgXcQ"),
+    # === AUTH ===
     api_key: str = Depends(get_api_key),
     rate_limit: None = Depends(rate_limit)
 ):
-    """
-    Lists all available transcripts for the specified YouTube video.
-    """
+    """List all available transcripts for a video."""
     # Generate cache key
     cache_key = generate_cache_key(
         "youtube_transcript_list",
@@ -118,7 +137,8 @@ async def list_transcripts(
 
     async def fetch_transcript_list():
         try:
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            # v1.x API: use instance method list() instead of class method list_transcripts()
+            transcript_list = _youtube_api.list(video_id)
             transcripts_info = []
             for transcript in transcript_list:
                 transcripts_info.append({
@@ -144,17 +164,18 @@ async def list_transcripts(
     return await get_cached_or_fetch(cache_key, fetch_transcript_list)
 
 # Endpoint to translate transcript
-@youtube_transcripts_router.get("/translate-transcript", response_model=TranscriptResponse, summary="Translate Transcript for a YouTube Video")
+@youtube_transcripts_router.get("/translate-transcript", response_model=TranscriptResponse, summary="Translate Transcript")
 async def translate_transcript(
-    video_id: str = Query(..., description="YouTube video ID."),
-    target_language: str = Query(..., description="Target language code for translation."),
-    source_languages: Optional[List[str]] = Query(["en"], description="List of source language codes."),
+    # === REQUIRED ===
+    video_id: str = Query(..., description="YouTube video ID", example="dQw4w9WgXcQ"),
+    target_language: str = Query(..., description="Target language code", example="es"),
+    # === OPTIONS ===
+    source_languages: Optional[List[str]] = Query(["en"], description="Source language codes", example=["en"]),
+    # === AUTH ===
     api_key: str = Depends(get_api_key),
     rate_limit: None = Depends(rate_limit)
 ):
-    """
-    Translates the transcript of the specified YouTube video into the target language.
-    """
+    """Translate transcript to target language."""
     # Generate cache key
     cache_key = generate_cache_key(
         "youtube_transcript_translate",
@@ -165,19 +186,24 @@ async def translate_transcript(
 
     async def fetch_translated_transcript():
         try:
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            # v1.x API: use instance method list() instead of class method list_transcripts()
+            transcript_list = _youtube_api.list(video_id)
             transcript_obj = transcript_list.find_transcript(source_languages)
             translated_transcript = transcript_obj.translate(target_language)
-            transcript_data = translated_transcript.fetch()
+            # v1.x API: fetch() returns FetchedTranscript, use to_raw_data() for dict format
+            fetched_transcript = translated_transcript.fetch()
+            transcript_data = fetched_transcript.to_raw_data()
             transcript_items = [TranscriptItem(**item) for item in transcript_data]
 
             response = TranscriptResponse(
-                video_id=translated_transcript.video_id,
-                language=translated_transcript.language,
-                language_code=translated_transcript.language_code,
-                is_generated=translated_transcript.is_generated,
+                video_id=fetched_transcript.video_id,
+                language=fetched_transcript.language,
+                language_code=fetched_transcript.language_code,
+                is_generated=fetched_transcript.is_generated,
+                # v1.x API: FetchedTranscript doesn't have is_translatable, use from original
                 is_translatable=translated_transcript.is_translatable,
-                translation_languages=[TranslationLanguage(language=lang['language'], language_code=lang['language_code']) for lang in translated_transcript.translation_languages],
+                # v1.x API: translation_languages from original transcript, contains objects with attributes
+                translation_languages=[TranslationLanguage(language=lang.language, language_code=lang.language_code) for lang in translated_transcript.translation_languages],
                 transcript=transcript_items
             )
 
@@ -196,17 +222,18 @@ async def translate_transcript(
     return await get_cached_or_fetch(cache_key, fetch_translated_transcript)
 
 # Endpoint to batch fetch transcripts
-@youtube_transcripts_router.post("/batch-get-transcripts", response_model=List[TranscriptResponse], summary="Batch Fetch Transcripts for Multiple YouTube Videos")
+@youtube_transcripts_router.post("/batch-get-transcripts", response_model=List[TranscriptResponse], summary="Batch Get Transcripts")
 async def batch_get_transcripts(
-    video_ids: List[str] = Query(..., description="List of YouTube video IDs."),
-    languages: Optional[List[str]] = Query(["en"], description="List of language codes in descending priority."),
-    preserve_formatting: bool = Query(False, description="Preserve HTML formatting in transcripts."),
+    # === REQUIRED ===
+    video_ids: List[str] = Query(..., description="List of video IDs"),
+    # === OPTIONS ===
+    languages: Optional[List[str]] = Query(["en"], description="Language codes by priority"),
+    preserve_formatting: bool = Query(False, description="Preserve HTML formatting"),
+    # === AUTH ===
     api_key: str = Depends(get_api_key),
     rate_limit: None = Depends(rate_limit)
 ):
-    """
-    Retrieves transcripts for multiple YouTube videos.
-    """
+    """Get transcripts for multiple videos."""
     async def get_cached_transcript(video_id: str):
         # Generate cache key for individual transcript
         cache_key = generate_cache_key(
@@ -236,7 +263,8 @@ async def batch_get_transcripts(
                 language_code=transcript_obj.language_code,
                 is_generated=transcript_obj.is_generated,
                 is_translatable=transcript_obj.is_translatable,
-                translation_languages=[TranslationLanguage(language=lang['language'], language_code=lang['language_code']) for lang in transcript_obj.translation_languages],
+                # v1.x API: translation_languages contains objects with attributes, not dicts
+                translation_languages=[TranslationLanguage(language=lang.language, language_code=lang.language_code) for lang in transcript_obj.translation_languages],
                 transcript=transcript_items
             )
 
@@ -260,17 +288,18 @@ async def batch_get_transcripts(
     return result
 
 # Endpoint to format transcript
-@youtube_transcripts_router.get("/format-transcript", summary="Format Transcript for a YouTube Video")
+@youtube_transcripts_router.get("/format-transcript", summary="Format Transcript")
 async def format_transcript(
-    video_id: str = Query(..., description="YouTube video ID."),
-    format_type: str = Query("json", description="Desired format type (json, txt, vtt, srt, csv)."),
-    languages: Optional[List[str]] = Query(["en"], description="List of language codes in descending priority."),
+    # === REQUIRED ===
+    video_id: str = Query(..., description="YouTube video ID", example="dQw4w9WgXcQ"),
+    # === OPTIONS ===
+    format_type: str = Query("json", description="Output format: json, txt, vtt, srt, csv"),
+    languages: Optional[List[str]] = Query(["en"], description="Language codes by priority"),
+    # === AUTH ===
     api_key: str = Depends(get_api_key),
     rate_limit: None = Depends(rate_limit)
 ):
-    """
-    Formats the transcript of the specified YouTube video into the desired format.
-    """
+    """Get transcript in specified format (JSON, TXT, VTT, SRT, CSV)."""
     # Generate cache key
     cache_key = generate_cache_key(
         "youtube_transcript_format",
@@ -280,35 +309,47 @@ async def format_transcript(
     )
 
     async def fetch_formatted_transcript():
-        transcript = await get_transcript(
-            video_id=video_id,
-            languages=languages,
-            preserve_formatting=False,
-            api_key=api_key
-        )
-
-        formatter_response = ""
+        # For formatting, we need the raw FetchedTranscript for proper formatter compatibility
+        # v1.x formatters expect FetchedTranscript or FetchedTranscriptSnippet objects, not dicts
+        fetched = _youtube_api.fetch(video_id, languages=tuple(languages or ["en"]))
 
         if format_type == "json":
-            formatter_response = TranscriptListResponse.parse_obj({"transcripts": [transcript.dict()]})
-            return formatter_response
+            # Build response from fetched transcript
+            transcript_data = fetched.to_raw_data()
+            transcript_items = [TranscriptItem(**item) for item in transcript_data]
+            # Get metadata
+            transcript_list = _youtube_api.list(video_id)
+            transcript_obj = transcript_list.find_transcript(languages or ["en"])
+            response = TranscriptResponse(
+                video_id=fetched.video_id,
+                language=fetched.language,
+                language_code=fetched.language_code,
+                is_generated=fetched.is_generated,
+                is_translatable=transcript_obj.is_translatable,
+                translation_languages=[TranslationLanguage(language=lang.language, language_code=lang.language_code) for lang in transcript_obj.translation_languages],
+                transcript=transcript_items
+            )
+            return TranscriptListResponse.model_validate({"transcripts": [response.model_dump()]})
         elif format_type == "txt":
-            transcript_text = "\n".join([item.text for item in transcript.transcript])
+            transcript_text = "\n".join([snippet.text for snippet in fetched.snippets])
             return {"formatted_transcript": transcript_text}
         elif format_type == "vtt":
             formatter = WebVTTFormatter()
-            formatted_transcript = formatter.format_transcript([item.dict() for item in transcript.transcript])
+            # v1.x API: pass the FetchedTranscript directly to the formatter
+            formatted_transcript = formatter.format_transcript(fetched)
             return {"formatted_transcript": formatted_transcript}
         elif format_type == "srt":
             formatter = SRTFormatter()
-            formatted_transcript = formatter.format_transcript([item.dict() for item in transcript.transcript])
+            # v1.x API: pass the FetchedTranscript directly to the formatter
+            formatted_transcript = formatter.format_transcript(fetched)
             return {"formatted_transcript": formatted_transcript}
         elif format_type == "csv":
             output = io.StringIO()
             writer = csv.writer(output)
             writer.writerow(['Start', 'Duration', 'Text'])
-            for item in transcript.transcript:
-                writer.writerow([item.start, item.duration, item.text])
+            # v1.x API: use snippets from FetchedTranscript
+            for snippet in fetched.snippets:
+                writer.writerow([snippet.start, snippet.duration, snippet.text])
             formatted_transcript = output.getvalue()
             return {"formatted_transcript": formatted_transcript}
         else:

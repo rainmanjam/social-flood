@@ -1,26 +1,37 @@
+# Social Flood API - Production Dependencies
+# For development dependencies, see requirements-dev.txt
+
+# Core Framework
 fastapi
 uvicorn
-requests
 pydantic>=2.0.0
 pydantic-settings>=2.0.0
-pytest
-pytest-cov
-celery
-redis
-psycopg2-binary  # PostgreSQL adapter
-qdrant-client
-loguru  # Logging
-docker  # For Docker operations
+
+# HTTP & Networking
+requests
+httpx
+
+# Data Processing
+pandas
+nltk
+
+# Google Services Integration
 trendspy
 gnews
+google-auth>=2.0.0
+
+# News & Content Parsing
 newspaper4k
 lxml_html_clean
 selectolax
-nltk
-httpx
-asyncio
-email-validator
+
+# YouTube Integration
 youtube-transcript-api
-google-auth>=2.0.0  # Google authentication library
-pandas  # For data analysis
-matplotlib  # For visualization
+
+# Database & Caching
+redis
+psycopg2-binary
+
+# Utilities
+loguru
+email-validator

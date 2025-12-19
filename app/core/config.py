@@ -154,14 +154,97 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """
     Get the application settings.
-    
-    This function is cached to avoid loading the settings multiple times.
-    
+
+    This function is cached using @lru_cache to avoid loading settings
+    multiple times. The cache ensures that environment variables are only
+    parsed once at startup, improving performance.
+
+    Caching Behavior:
+        - Settings are loaded once on first call
+        - Subsequent calls return the cached instance
+        - Use reload_settings() to force a refresh
+
     Returns:
-        Settings: The application settings
+        Settings: The application settings instance
+
+    Example:
+        >>> from app.core.config import get_settings
+        >>> settings = get_settings()
+        >>> print(settings.ENVIRONMENT)
+        'development'
     """
     return Settings()
 
 
+def reload_settings() -> Settings:
+    """
+    Reload settings by clearing the cache and creating a new instance.
+
+    This function clears the lru_cache and reloads settings from
+    environment variables. Useful for runtime configuration updates
+    or testing scenarios.
+
+    Note:
+        This function also updates the module-level 'settings' variable.
+        Any code holding references to the old settings instance will
+        not see the updated values - they should call get_settings() again.
+
+    Returns:
+        Settings: The newly loaded settings instance
+
+    Example:
+        >>> from app.core.config import reload_settings
+        >>> import os
+        >>> os.environ['DEBUG'] = 'true'
+        >>> settings = reload_settings()
+        >>> assert settings.DEBUG == True
+    """
+    global settings
+    get_settings.cache_clear()
+    settings = get_settings()
+    return settings
+
+
+def is_settings_cached() -> bool:
+    """
+    Check if settings are currently cached.
+
+    Returns:
+        bool: True if settings are cached, False otherwise
+
+    Example:
+        >>> from app.core.config import is_settings_cached, get_settings
+        >>> get_settings.cache_clear()
+        >>> assert is_settings_cached() == False
+        >>> _ = get_settings()
+        >>> assert is_settings_cached() == True
+    """
+    cache_info = get_settings.cache_info()
+    return cache_info.hits > 0 or cache_info.currsize > 0
+
+
+def get_settings_cache_info() -> dict:
+    """
+    Get cache statistics for the settings.
+
+    Returns:
+        dict: Cache info including hits, misses, maxsize, currsize
+
+    Example:
+        >>> from app.core.config import get_settings_cache_info
+        >>> info = get_settings_cache_info()
+        >>> print(f"Cache hits: {info['hits']}")
+    """
+    cache_info = get_settings.cache_info()
+    return {
+        "hits": cache_info.hits,
+        "misses": cache_info.misses,
+        "maxsize": cache_info.maxsize,
+        "currsize": cache_info.currsize
+    }
+
+
 # Global settings instance for direct imports
+# This provides a convenient way to access settings without calling get_settings()
+# Note: Use get_settings() in production code for better testability
 settings = get_settings()
