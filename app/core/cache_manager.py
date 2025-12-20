@@ -82,16 +82,21 @@ class CacheManager:
     def _serialize(self, value: Any) -> str:
         """
         Serialize a value to a string.
-        
+
         Args:
             value: The value to serialize
-            
+
         Returns:
             str: Serialized value
         """
         try:
             return json.dumps(value)
         except (TypeError, ValueError):
+            # Try Pydantic v2 model_dump() first, then v1 dict()
+            if hasattr(value, 'model_dump'):
+                return json.dumps(value.model_dump())
+            elif hasattr(value, 'dict'):
+                return json.dumps(value.dict())
             # If the value can't be JSON serialized, use string representation
             return str(value)
     

@@ -35,3 +35,6 @@ psycopg2-binary
 # Utilities
 loguru
 email-validator
+
+# Google Maps Data (DataForSEO API)
+# Uses httpx for direct API requests (no SDK dependency)

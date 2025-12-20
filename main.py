@@ -35,6 +35,7 @@ from app.api.google_news.google_news_api import gnews_router, setup_nltk
 from app.api.google_autocomplete.google_autocomplete_api import router as google_autocomplete_router
 from app.api.google_trends.google_trends_api import google_trends_router
 from app.api.youtube_transcripts.youtube_transcripts_api import youtube_transcripts_router
+from app.api.google_maps.google_maps_api import google_maps_router
 
 # Configure logging
 logging.basicConfig(
@@ -273,11 +274,18 @@ def create_application() -> FastAPI:
     
     v1_router.include_router(
         youtube_transcripts_router,
-        prefix="/youtube-transcripts", 
+        prefix="/youtube-transcripts",
         tags=["YouTube Transcripts API"],
         dependencies=[Depends(get_api_key)]
     )
-    
+
+    v1_router.include_router(
+        google_maps_router,
+        prefix="/google-maps",
+        tags=["Google Maps API"],
+        dependencies=[Depends(get_api_key)]
+    )
+
     # Include v1 router in app
     app.include_router(v1_router)
     
