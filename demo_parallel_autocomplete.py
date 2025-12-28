@@ -6,7 +6,7 @@ Demo script to test the parallel processing functionality of the autocomplete AP
 import asyncio
 import time
 from app.core.config import get_settings
-from app.api.google_autocomplete.google_autocomplete_api import get_suggestion_keywords_google_optimized_parallel, OutputFormat
+from app.services.google_autocomplete_service import google_autocomplete_service
 import httpx
 
 
@@ -35,15 +35,20 @@ async def demo_parallel_processing():
     # Create HTTP client
     async with httpx.AsyncClient(timeout=httpx.Timeout(settings.AUTOCOMPLETE_REQUEST_TIMEOUT)) as client:
         try:
-            # Call the parallel processing function
-            result = await get_suggestion_keywords_google_optimized_parallel(
+            # Build base params
+            base_params = google_autocomplete_service.build_request_params(
                 query=test_query,
-                country_code="US",
-                output=OutputFormat.CHROME,
+                output="chrome",
+                gl="US",
                 hl="en",
-                ds="",
-                spell=1,
+                spell=1
+            )
+
+            # Call the parallel processing function via service
+            result = await google_autocomplete_service.generate_keyword_variations_parallel(
                 http_client=client,
+                base_query=test_query,
+                params=base_params,
                 max_parallel=settings.AUTOCOMPLETE_MAX_PARALLEL_REQUESTS
             )
 
@@ -51,7 +56,7 @@ async def demo_parallel_processing():
             execution_time = time.time() - start_time
 
             print("Parallel processing completed successfully!")
-            print(".2f")
+            print(f"Execution time: {execution_time:.2f}s")
             print()
 
             # Show some results
@@ -71,7 +76,7 @@ async def demo_parallel_processing():
         except Exception as e:
             print(f"Error during parallel processing: {str(e)}")
             execution_time = time.time() - start_time
-            print(".2f")
+            print(f"Execution time: {execution_time:.2f}s")
 
     print()
     print("Parallel Processing Demo Complete!")

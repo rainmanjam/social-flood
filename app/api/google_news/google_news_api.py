@@ -571,31 +571,47 @@ async def get_news_by_source(
         start_date_tuple = tuple(map(int, start_date.split("-"))) if start_date else None
         end_date_tuple = tuple(map(int, end_date.split("-"))) if end_date else None
 
-        # Create a new GNews instance with start_date and end_date
-        gnews = await get_gnews_instance(
+        # Generate cache key
+        cache_key = generate_cache_key(
+            "gnews:source",
+            source=domain_source,
             language=language,
             country=country,
             max_results=max_results,
-            exclude_duplicates=exclude_duplicates,
-            start_date=start_date_tuple,
-            end_date=end_date_tuple,
+            start_date=start_date,
+            end_date=end_date,
+            exclude_duplicates=exclude_duplicates
         )
 
-        loop = asyncio.get_event_loop()
-        articles = await loop.run_in_executor(None, gnews.get_news, domain_source)
-        if not articles:
-            raise HTTPException(status_code=404, detail="No articles found for the given parameters.")
-
-        # Use the new helper function to decode URLs and filter
-        processed_articles = await decode_and_process_articles(articles, filter_by_domain=domain_source)
-
-        if not processed_articles:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No articles found from source '{domain_source}' with the given date range."
+        async def fetch_source_news():
+            # Create a new GNews instance with start_date and end_date
+            gnews = await get_gnews_instance(
+                language=language,
+                country=country,
+                max_results=max_results,
+                exclude_duplicates=exclude_duplicates,
+                start_date=start_date_tuple,
+                end_date=end_date_tuple,
             )
 
-        return {"articles": processed_articles}
+            loop = asyncio.get_event_loop()
+            articles = await loop.run_in_executor(None, gnews.get_news, domain_source)
+            if not articles:
+                raise HTTPException(status_code=404, detail="No articles found for the given parameters.")
+
+            # Use the new helper function to decode URLs and filter
+            processed_articles = await decode_and_process_articles(articles, filter_by_domain=domain_source)
+
+            if not processed_articles:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No articles found from source '{domain_source}' with the given date range."
+                )
+
+            return {"articles": processed_articles}
+
+        # Get cached result or fetch and cache (10 minute TTL for source news)
+        return await get_cached_or_fetch(cache_key, fetch_source_news, ttl=600)
 
     except ValidationError as ve:
         logger.error(f"Validation error for source '{source}': {ve}")
@@ -693,26 +709,38 @@ async def get_top_google_news(
 ):
     """Get top news articles."""
     try:
-        # Create a new GNews instance
-        gnews = await get_gnews_instance(
+        # Generate cache key
+        cache_key = generate_cache_key(
+            "gnews:top",
             language=language,
             country=country,
-            max_results=max_results,
+            max_results=max_results
         )
 
-        loop = asyncio.get_event_loop()
-        top_news = await loop.run_in_executor(None, gnews.get_top_news)
+        async def fetch_top_news():
+            # Create a new GNews instance
+            gnews = await get_gnews_instance(
+                language=language,
+                country=country,
+                max_results=max_results,
+            )
 
-        if not top_news:
-            raise HTTPException(status_code=404, detail="No top news found.")
+            loop = asyncio.get_event_loop()
+            top_news = await loop.run_in_executor(None, gnews.get_top_news)
 
-        # Use the new helper function to decode URLs
-        processed_articles = await decode_and_process_articles(top_news)
+            if not top_news:
+                raise HTTPException(status_code=404, detail="No top news found.")
 
-        if not processed_articles: # Similar check as in /search
-            raise HTTPException(status_code=404, detail="No processable top news found after URL decoding.")
-            
-        return {"articles": processed_articles}
+            # Use the new helper function to decode URLs
+            processed_articles = await decode_and_process_articles(top_news)
+
+            if not processed_articles:
+                raise HTTPException(status_code=404, detail="No processable top news found after URL decoding.")
+
+            return {"articles": processed_articles}
+
+        # Get cached result or fetch and cache (use shorter TTL for top news - 5 minutes)
+        return await get_cached_or_fetch(cache_key, fetch_top_news, ttl=300)
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
@@ -737,27 +765,41 @@ async def get_news_by_topic(
             content={"detail": "Invalid topic provided.", "available_topics": AVAILABLE_TOPICS}
         )
     try:
-        # Create a new GNews instance without start_date and end_date
-        gnews = await get_gnews_instance(
+        # Generate cache key
+        cache_key = generate_cache_key(
+            "gnews:topic",
+            topic=topic.upper(),
             language=language,
             country=country,
             max_results=max_results,
-            exclude_duplicates=exclude_duplicates,
+            exclude_duplicates=exclude_duplicates
         )
 
-        loop = asyncio.get_event_loop()
-        news = await loop.run_in_executor(None, gnews.get_news_by_topic, topic)
+        async def fetch_topic_news():
+            # Create a new GNews instance without start_date and end_date
+            gnews = await get_gnews_instance(
+                language=language,
+                country=country,
+                max_results=max_results,
+                exclude_duplicates=exclude_duplicates,
+            )
 
-        if not news:
-            raise HTTPException(status_code=404, detail="No news found for the given topic.")
+            loop = asyncio.get_event_loop()
+            news = await loop.run_in_executor(None, gnews.get_news_by_topic, topic)
 
-        # Use the new helper function to decode URLs
-        processed_articles = await decode_and_process_articles(news)
+            if not news:
+                raise HTTPException(status_code=404, detail="No news found for the given topic.")
 
-        if not processed_articles: # Similar check
-            raise HTTPException(status_code=404, detail="No processable news found for the topic after URL decoding.")
+            # Use the new helper function to decode URLs
+            processed_articles = await decode_and_process_articles(news)
 
-        return {"articles": processed_articles}
+            if not processed_articles:
+                raise HTTPException(status_code=404, detail="No processable news found for the topic after URL decoding.")
+
+            return {"articles": processed_articles}
+
+        # Get cached result or fetch and cache (10 minute TTL for topic news)
+        return await get_cached_or_fetch(cache_key, fetch_topic_news, ttl=600)
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
@@ -784,29 +826,47 @@ async def get_news_by_location(
         start_date_tuple = tuple(map(int, start_date.split("-"))) if start_date else None
         end_date_tuple = tuple(map(int, end_date.split("-"))) if end_date else None
 
-        # Create a new GNews instance
-        gnews = await get_gnews_instance(
+        # Generate cache key
+        cache_key = generate_cache_key(
+            "gnews:location",
+            location=location.lower(),
             language=language,
             country=country,
             max_results=max_results,
-            exclude_duplicates=exclude_duplicates,
-            start_date=start_date_tuple,
-            end_date=end_date_tuple,
+            start_date=start_date,
+            end_date=end_date,
+            exclude_duplicates=exclude_duplicates
         )
 
-        loop = asyncio.get_event_loop()
-        news_by_location = await loop.run_in_executor(None, gnews.get_news_by_location, location)
+        async def fetch_location_news():
+            # Create a new GNews instance
+            gnews = await get_gnews_instance(
+                language=language,
+                country=country,
+                max_results=max_results,
+                exclude_duplicates=exclude_duplicates,
+                start_date=start_date_tuple,
+                end_date=end_date_tuple,
+            )
 
-        if not news_by_location:
-            raise HTTPException(status_code=404, detail=f"No news found for the location '{location}'.")
+            loop = asyncio.get_event_loop()
+            # URL-encode location to handle spaces and special characters (GNews library bug)
+            encoded_location = quote(location)
+            news_by_location = await loop.run_in_executor(None, gnews.get_news_by_location, encoded_location)
 
-        # Use the new helper function to decode URLs
-        processed_articles = await decode_and_process_articles(news_by_location)
+            if not news_by_location:
+                raise HTTPException(status_code=404, detail=f"No news found for the location '{location}'.")
 
-        if not processed_articles: # Similar check
-            raise HTTPException(status_code=404, detail=f"No processable news found for the location '{location}' after URL decoding.")
-            
-        return {"articles": processed_articles}
+            # Use the new helper function to decode URLs
+            processed_articles = await decode_and_process_articles(news_by_location)
+
+            if not processed_articles:
+                raise HTTPException(status_code=404, detail=f"No processable news found for the location '{location}' after URL decoding.")
+
+            return {"articles": processed_articles}
+
+        # Get cached result or fetch and cache (10 minute TTL for location news)
+        return await get_cached_or_fetch(cache_key, fetch_location_news, ttl=600)
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
@@ -827,26 +887,41 @@ async def get_google_news_articles(
 ):
     """Get bulk news articles over a time period."""
     try:
-        # Create a new GNews instance
-        gnews = await get_gnews_instance(
+        # Generate cache key
+        cache_key = generate_cache_key(
+            "gnews:articles",
+            query=query,
             language=language,
             country=country,
             max_results=max_results,
-            exclude_duplicates=False,
+            period=period
         )
 
-        loop = asyncio.get_event_loop()
-        articles = await loop.run_in_executor(None, gnews.get_news, query)
-        if not articles:
-            raise HTTPException(status_code=404, detail="No articles found for the given parameters.")
+        async def fetch_articles():
+            # Create a new GNews instance
+            gnews = await get_gnews_instance(
+                language=language,
+                country=country,
+                max_results=max_results,
+                exclude_duplicates=False,
+                period=period,
+            )
 
-        # Use the new helper function to decode URLs
-        processed_articles = await decode_and_process_articles(articles)
-        
-        if not processed_articles: # Similar check
-            raise HTTPException(status_code=404, detail="No processable articles found for the given parameters after URL decoding.")
+            loop = asyncio.get_event_loop()
+            articles = await loop.run_in_executor(None, gnews.get_news, query)
+            if not articles:
+                raise HTTPException(status_code=404, detail="No articles found for the given parameters.")
 
-        return {"articles": processed_articles}
+            # Use the new helper function to decode URLs
+            processed_articles = await decode_and_process_articles(articles)
+
+            if not processed_articles:
+                raise HTTPException(status_code=404, detail="No processable articles found for the given parameters after URL decoding.")
+
+            return {"articles": processed_articles}
+
+        # Get cached result or fetch and cache (10 minute TTL for bulk articles)
+        return await get_cached_or_fetch(cache_key, fetch_articles, ttl=600)
 
     except HTTPException as http_exc:
         raise http_exc
@@ -862,65 +937,78 @@ async def get_article_details(
     """Get detailed article information (title, text, summary, keywords)."""
     logger.info(f"Received request to get article details for URL: {url}")
     try:
-        # Ensure NLTK is set up (only runs once)
-        await ensure_nltk_setup()
-        
-        proxy_url = await get_proxy()  # Adjust if needed
+        # Generate cache key based on URL (use MD5 hash for long URLs)
+        import hashlib
+        url_hash = hashlib.md5(url.encode()).hexdigest()
+        cache_key = generate_cache_key("gnews:article_details", url_hash=url_hash)
 
-        config = Config()
-        config.request_timeout = settings.HTTP_READ_TIMEOUT  # Use configured timeout
-        config.thread_timeout = settings.HTTP_READ_TIMEOUT
-        if proxy_url:
-            logger.debug(f"Using proxy settings for requests: {proxy_url}")
-            config.proxies = {
-                "http": proxy_url,
-                "https": proxy_url
+        async def fetch_article_details():
+            # Ensure NLTK is set up (only runs once)
+            await ensure_nltk_setup()
+
+            proxy_url = await get_proxy()  # Adjust if needed
+
+            config = Config()
+            config.request_timeout = settings.HTTP_READ_TIMEOUT  # Use configured timeout
+            config.thread_timeout = settings.HTTP_READ_TIMEOUT
+            if proxy_url:
+                logger.debug(f"Using proxy settings for requests: {proxy_url}")
+                config.proxies = {
+                    "http": proxy_url,
+                    "https": proxy_url
+                }
+            else:
+                logger.debug("No proxy is being used.")
+
+            # Use asyncio to run newspaper operations
+            loop = asyncio.get_event_loop()
+
+            # Download article
+            article = Article(url, config=config)
+            await loop.run_in_executor(None, article.download)
+
+            # Parse article
+            await loop.run_in_executor(None, article.parse)
+
+            # Try NLP processing
+            nlp_success = True
+            try:
+                await loop.run_in_executor(None, article.nlp)
+            except LookupError as le:  # Specific exception for NLTK resource not found
+                logger.warning(f"NLTK resource not found for URL '{url}': {str(le)}")
+                nlp_success = False
+
+            # Build response (convert publish_date to string for JSON serialization)
+            publish_date_str = None
+            if article.publish_date:
+                publish_date_str = article.publish_date.isoformat() if hasattr(article.publish_date, 'isoformat') else str(article.publish_date)
+
+            response_data = {
+                "title": article.title,
+                "authors": article.authors,
+                "publish_date": publish_date_str,
+                "text": article.text,
+                "top_image": article.top_image,
+                "images": list(article.images),
+                "videos": article.movies,
+                "meta_data": article.meta_data,
+                "meta_description": article.meta_description,
+                "meta_keywords": article.meta_keywords
             }
-        else:
-            logger.debug("No proxy is being used.")
 
-        # Use asyncio to run newspaper operations
-        loop = asyncio.get_event_loop()
-        
-        # Download article
-        article = Article(url, config=config)
-        await loop.run_in_executor(None, article.download)
-        
-        # Parse article
-        await loop.run_in_executor(None, article.parse)
+            if nlp_success:
+                response_data.update({
+                    "summary": article.summary,
+                    "keywords": article.keywords
+                })
+            else:
+                response_data["error"] = "Unable to perform NLP analysis due to missing NLTK resource."
 
-        # Try NLP processing
-        nlp_success = True
-        try:
-            await loop.run_in_executor(None, article.nlp)
-        except LookupError as le: # Specific exception for NLTK resource not found
-            logger.warning(f"NLTK resource not found for URL '{url}': {str(le)}")
-            nlp_success = False
+            return response_data
 
-        # Build response
-        response_data = {
-            "title": article.title,
-            "authors": article.authors,
-            "publish_date": article.publish_date,
-            "text": article.text,
-            "top_image": article.top_image,
-            "images": list(article.images),
-            "videos": article.movies,
-            "meta_data": article.meta_data,
-            "meta_description": article.meta_description,
-            "meta_keywords": article.meta_keywords
-        }
-        
-        if nlp_success:
-            response_data.update({
-                "summary": article.summary,
-                "keywords": article.keywords
-            })
-        else:
-            response_data["error"] = "Unable to perform NLP analysis due to missing NLTK resource."
+        # Get cached result or fetch and cache (1 hour TTL - article content doesn't change)
+        return await get_cached_or_fetch(cache_key, fetch_article_details, ttl=3600)
 
-        return response_data
-        
     except ArticleException as ae:
         logger.error(f"Newspaper library error for URL '{url}': {str(ae)}")
         raise HTTPException(status_code=503, detail=f"Service unavailable: Could not process article from URL. Error: {str(ae)}")

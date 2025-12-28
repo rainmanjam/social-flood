@@ -331,10 +331,105 @@ async def unhandled_exception_handler(
 def configure_exception_handlers(app):
     """
     Configure exception handlers for a FastAPI application.
-    
+
     Args:
         app: The FastAPI application
     """
     app.add_exception_handler(SocialFloodException, social_flood_exception_handler)
     app.add_exception_handler(HTTPException, http_exception_handler)
     app.add_exception_handler(Exception, unhandled_exception_handler)
+
+
+# =============================================================================
+# Convenience Exception Factories
+# =============================================================================
+
+class ProxyConnectionError(ExternalServiceError):
+    """Exception for proxy connection failures."""
+    status_code = 502
+    detail = "Proxy connection failed"
+    error_type = "proxy_error"
+    title = "Bad Gateway"
+
+
+class IPBlockedError(ServiceUnavailableError):
+    """Exception for IP blocking by external services."""
+    detail = "Service is temporarily blocking requests"
+    error_type = "ip_blocked"
+
+
+def raise_not_found(resource: str, identifier: Any = None) -> None:
+    """Raise a NotFoundError with formatted message."""
+    detail = f"{resource} not found"
+    if identifier:
+        detail = f"{resource} '{identifier}' not found"
+    raise NotFoundError(detail=detail)
+
+
+def raise_validation_error(message: str, field: Optional[str] = None) -> None:
+    """Raise a ValidationError with optional field information."""
+    extra = {"field": field} if field else {}
+    raise ValidationError(detail=message, **extra)
+
+
+def raise_service_unavailable(
+    service: str,
+    reason: str = "temporarily unavailable"
+) -> None:
+    """Raise a ServiceUnavailableError for external service issues."""
+    raise ServiceUnavailableError(
+        detail=f"{service} is {reason}. Please try again later."
+    )
+
+
+def raise_proxy_error(service: str = "Service") -> None:
+    """Raise a ProxyConnectionError."""
+    raise ProxyConnectionError(
+        detail=f"{service} proxy connection failed. Please check configuration."
+    )
+
+
+def raise_ip_blocked(service: str = "Service") -> None:
+    """Raise an IPBlockedError."""
+    raise IPBlockedError(
+        detail=f"{service} is temporarily blocking requests. Please try again later."
+    )
+
+
+def handle_external_service_error(
+    exception: Exception,
+    service_name: str,
+    operation: str
+) -> None:
+    """
+    Handle common external service exceptions and convert to appropriate errors.
+
+    Args:
+        exception: The caught exception
+        service_name: Name of the external service (e.g., "YouTube", "Google")
+        operation: Description of the operation being performed
+
+    Raises:
+        Appropriate SocialFloodException subclass
+    """
+    from requests.exceptions import (
+        ProxyError as RequestsProxyError,
+        ConnectionError as RequestsConnectionError,
+        Timeout as RequestsTimeout,
+    )
+
+    if isinstance(exception, RequestsProxyError):
+        raise_proxy_error(service_name)
+    elif isinstance(exception, RequestsConnectionError):
+        raise ExternalServiceError(
+            detail=f"{service_name} connection failed during {operation}."
+        )
+    elif isinstance(exception, RequestsTimeout):
+        raise ServiceUnavailableError(
+            detail=f"{service_name} request timed out during {operation}."
+        )
+    else:
+        logger.error(f"Error during {operation} for {service_name}: {exception}")
+        raise ServerError(
+            detail=f"Internal Server Error while {operation}."
+        )

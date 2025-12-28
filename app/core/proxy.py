@@ -64,3 +64,22 @@ def get_proxy_sync():
             logger.warning("Proxying is enabled, but no valid proxy URLs were found in PROXY_URLS or the list is empty.")
             return None
     return None
+
+
+def rotate_proxy():
+    """
+    Rotate to the next proxy in the list.
+    Returns the next proxy URL string, or None if proxying is disabled or no valid URLs exist.
+
+    This is a synchronous function used to get a different proxy when the current one fails.
+    """
+    if ENABLE_PROXY:
+        if _proxy_iter is not None and PROXY_LIST:
+            # Advance to next proxy in the cycle
+            proxy_url = next(_proxy_iter)
+            logger.debug(f"Rotated to proxy: {proxy_url}")
+            return proxy_url
+        else:
+            logger.warning("Proxying is enabled, but no valid proxy URLs were found in PROXY_URLS or the list is empty.")
+            return None
+    return None

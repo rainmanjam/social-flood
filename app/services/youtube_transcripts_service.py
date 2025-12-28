@@ -4,36 +4,194 @@ YouTube Transcripts Service.
 This module handles all business logic for fetching and processing
 YouTube video transcripts, keeping the API router thin.
 
-Updated for youtube-transcript-api v1.x API compatibility.
+Features:
+- Proxy rotation with automatic retry on IP blocks
+- Async-first design using asyncio.to_thread()
+- Centralized exception handling
+- Updated for youtube-transcript-api v1.x API compatibility
 """
 import logging
 import asyncio
 import csv
 import io
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Callable, TypeVar
+from functools import wraps
 
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
     NoTranscriptFound,
     TranscriptsDisabled,
-    VideoUnavailable
+    VideoUnavailable,
+    IpBlocked,
+    RequestBlocked,
 )
+from youtube_transcript_api.proxies import GenericProxyConfig
 from youtube_transcript_api.formatters import WebVTTFormatter, SRTFormatter
+from requests.exceptions import ProxyError, ConnectionError as RequestsConnectionError
 from fastapi import HTTPException
+
+from app.core.proxy import get_proxy_sync, rotate_proxy, ENABLE_PROXY
 
 logger = logging.getLogger(__name__)
 
-# Module-level API instance for reuse (v1.x uses instance methods)
-_youtube_api = YouTubeTranscriptApi()
+T = TypeVar('T')
+
+# Maximum retry attempts when IP is blocked
+MAX_RETRY_ATTEMPTS = 3
 
 
 class YouTubeTranscriptsService:
-    """Service class for YouTube transcript operations."""
+    """Service class for YouTube transcript operations with proxy support."""
 
-    @staticmethod
-    def fetch_transcript(video_id: str, languages: List[str] = None) -> List[Dict[str, Any]]:
+    def __init__(self):
+        """Initialize the service."""
+        self._api_cache: Dict[str, YouTubeTranscriptApi] = {}
+
+    def _get_youtube_api(self, proxy_url: Optional[str] = None) -> YouTubeTranscriptApi:
         """
-        Fetch transcript for a YouTube video.
+        Get or create a YouTubeTranscriptApi instance with the given proxy.
+
+        Args:
+            proxy_url: Optional proxy URL to use
+
+        Returns:
+            YouTubeTranscriptApi instance
+        """
+        cache_key = proxy_url or "no_proxy"
+
+        if cache_key not in self._api_cache:
+            if proxy_url:
+                logger.debug(f"Creating YouTube API with proxy: {proxy_url[:50]}...")
+                proxy_config = GenericProxyConfig(
+                    http_url=proxy_url,
+                    https_url=proxy_url
+                )
+                self._api_cache[cache_key] = YouTubeTranscriptApi(proxy_config=proxy_config)
+            else:
+                logger.debug("Creating YouTube API without proxy")
+                self._api_cache[cache_key] = YouTubeTranscriptApi()
+
+        return self._api_cache[cache_key]
+
+    def _get_current_api(self) -> YouTubeTranscriptApi:
+        """
+        Get YouTubeTranscriptApi with current proxy configuration.
+
+        Returns:
+            YouTubeTranscriptApi instance with current proxy
+        """
+        proxy_url = None
+        if ENABLE_PROXY:
+            proxy_url = get_proxy_sync()
+        return self._get_youtube_api(proxy_url)
+
+    def _handle_youtube_exception(self, e: Exception, video_id: str, operation: str) -> None:
+        """
+        Handle YouTube API exceptions consistently.
+
+        Args:
+            e: The exception to handle
+            video_id: The video ID being processed
+            operation: Description of the operation that failed
+
+        Raises:
+            HTTPException: Always raises an appropriate HTTP exception
+        """
+        if isinstance(e, NoTranscriptFound):
+            raise HTTPException(
+                status_code=404,
+                detail="No transcript found for the given video ID."
+            )
+        elif isinstance(e, TranscriptsDisabled):
+            raise HTTPException(
+                status_code=403,
+                detail="Transcripts are disabled for this video."
+            )
+        elif isinstance(e, VideoUnavailable):
+            raise HTTPException(
+                status_code=404,
+                detail="The specified video is unavailable."
+            )
+        elif isinstance(e, (IpBlocked, RequestBlocked)):
+            logger.error(f"IP blocked while {operation} for video_id {video_id}: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail="YouTube is temporarily blocking requests. Please try again later."
+            )
+        elif isinstance(e, (ProxyError, RequestsConnectionError)):
+            logger.error(f"Proxy error while {operation} for video_id {video_id}: {e}")
+            raise HTTPException(
+                status_code=502,
+                detail="Proxy connection failed. Please check proxy configuration."
+            )
+        elif isinstance(e, HTTPException):
+            raise e
+        else:
+            logger.error(f"Error {operation} for video_id {video_id}: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Internal Server Error while {operation}."
+            )
+
+    def _execute_with_retry(
+        self,
+        func: Callable[..., T],
+        video_id: str,
+        operation: str,
+        *args,
+        **kwargs
+    ) -> T:
+        """
+        Execute a function with retry logic and proxy rotation.
+
+        Args:
+            func: Function to execute (receives api as first arg)
+            video_id: Video ID for logging
+            operation: Operation description for logging
+            *args: Additional args for func
+            **kwargs: Additional kwargs for func
+
+        Returns:
+            Result from the function
+
+        Raises:
+            HTTPException: If all retries fail
+        """
+        last_exception = None
+
+        for attempt in range(MAX_RETRY_ATTEMPTS):
+            try:
+                api = self._get_current_api()
+                return func(api, *args, **kwargs)
+            except (IpBlocked, RequestBlocked, ProxyError, RequestsConnectionError) as e:
+                last_exception = e
+                logger.warning(
+                    f"Attempt {attempt + 1}/{MAX_RETRY_ATTEMPTS} failed for {operation} "
+                    f"(video_id={video_id}): {type(e).__name__}"
+                )
+
+                if ENABLE_PROXY and attempt < MAX_RETRY_ATTEMPTS - 1:
+                    # Rotate to a new proxy
+                    new_proxy = rotate_proxy()
+                    if new_proxy:
+                        logger.info(f"Rotating to new proxy: {new_proxy[:50]}...")
+                        # Clear cache to force new API instance
+                        self._api_cache.clear()
+                    else:
+                        logger.warning("No alternative proxy available")
+            except Exception as e:
+                self._handle_youtube_exception(e, video_id, operation)
+
+        # All retries failed
+        self._handle_youtube_exception(last_exception, video_id, operation)
+
+    def fetch_transcript(
+        self,
+        video_id: str,
+        languages: List[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch transcript for a YouTube video with retry support.
 
         Args:
             video_id: YouTube video ID
@@ -48,35 +206,14 @@ class YouTubeTranscriptsService:
         if languages is None:
             languages = ["en"]
 
-        try:
-            # v1.x API: use instance method fetch() instead of class method get_transcript()
-            fetched = _youtube_api.fetch(video_id, languages=tuple(languages))
-            # Return raw data format for compatibility
+        def _fetch(api: YouTubeTranscriptApi) -> List[Dict[str, Any]]:
+            fetched = api.fetch(video_id, languages=tuple(languages))
             return fetched.to_raw_data()
-        except NoTranscriptFound:
-            raise HTTPException(
-                status_code=404,
-                detail="No transcript found for the given video ID."
-            )
-        except TranscriptsDisabled:
-            raise HTTPException(
-                status_code=403,
-                detail="Transcripts are disabled for this video."
-            )
-        except VideoUnavailable:
-            raise HTTPException(
-                status_code=404,
-                detail="The specified video is unavailable."
-            )
-        except Exception as e:
-            logger.error(f"Error fetching transcript for video_id {video_id}: {e}")
-            raise HTTPException(
-                status_code=500,
-                detail="Internal Server Error while fetching transcript."
-            )
 
-    @staticmethod
+        return self._execute_with_retry(_fetch, video_id, "fetching transcript")
+
     async def fetch_transcript_async(
+        self,
         video_id: str,
         languages: List[str] = None
     ) -> List[Dict[str, Any]]:
@@ -90,17 +227,15 @@ class YouTubeTranscriptsService:
         Returns:
             List of transcript items
         """
-        return await asyncio.get_event_loop().run_in_executor(
-            None,
-            YouTubeTranscriptsService.fetch_transcript,
+        return await asyncio.to_thread(
+            self.fetch_transcript,
             video_id,
             languages
         )
 
-    @staticmethod
-    def list_available_transcripts(video_id: str) -> List[Dict[str, Any]]:
+    def list_available_transcripts(self, video_id: str) -> List[Dict[str, Any]]:
         """
-        List all available transcripts for a video.
+        List all available transcripts for a video with retry support.
 
         Args:
             video_id: YouTube video ID
@@ -111,12 +246,10 @@ class YouTubeTranscriptsService:
         Raises:
             HTTPException: If transcripts cannot be listed
         """
-        try:
-            # v1.x API: use instance method list() instead of class method list_transcripts()
-            transcript_list = _youtube_api.list(video_id)
+        def _list(api: YouTubeTranscriptApi) -> List[Dict[str, Any]]:
+            transcript_list = api.list(video_id)
             transcripts_info = []
             for transcript in transcript_list:
-                # v1.x API: translation_languages contains objects with attributes
                 translation_langs = [
                     {"language": lang.language, "language_code": lang.language_code}
                     for lang in transcript.translation_languages
@@ -130,30 +263,32 @@ class YouTubeTranscriptsService:
                     "translation_languages": translation_langs
                 })
             return transcripts_info
-        except NoTranscriptFound:
-            raise HTTPException(
-                status_code=404,
-                detail="No transcripts found for the given video ID."
-            )
-        except TranscriptsDisabled:
-            raise HTTPException(
-                status_code=403,
-                detail="Transcripts are disabled for this video."
-            )
-        except VideoUnavailable:
-            raise HTTPException(
-                status_code=404,
-                detail="The specified video is unavailable."
-            )
-        except Exception as e:
-            logger.error(f"Error listing transcripts for video_id {video_id}: {e}")
-            raise HTTPException(
-                status_code=500,
-                detail="Internal Server Error while listing transcripts."
-            )
 
-    @staticmethod
-    def get_transcript_metadata(video_id: str, languages: List[str] = None):
+        return self._execute_with_retry(_list, video_id, "listing transcripts")
+
+    async def list_available_transcripts_async(
+        self,
+        video_id: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Asynchronously list all available transcripts.
+
+        Args:
+            video_id: YouTube video ID
+
+        Returns:
+            List of transcript metadata dictionaries
+        """
+        return await asyncio.to_thread(
+            self.list_available_transcripts,
+            video_id
+        )
+
+    def get_transcript_metadata(
+        self,
+        video_id: str,
+        languages: List[str] = None
+    ):
         """
         Get transcript metadata for a video.
 
@@ -170,25 +305,20 @@ class YouTubeTranscriptsService:
         if languages is None:
             languages = ["en"]
 
-        try:
-            # v1.x API: use instance method list()
-            transcript_list = _youtube_api.list(video_id)
+        def _get_metadata(api: YouTubeTranscriptApi):
+            transcript_list = api.list(video_id)
             return transcript_list.find_transcript(languages)
-        except Exception as e:
-            logger.error(f"Error finding transcript for video_id {video_id}: {e}")
-            raise HTTPException(
-                status_code=500,
-                detail="Internal Server Error while processing transcript."
-            )
 
-    @staticmethod
+        return self._execute_with_retry(_get_metadata, video_id, "getting metadata")
+
     def translate_transcript(
+        self,
         video_id: str,
         target_language: str,
         source_languages: List[str] = None
     ) -> Dict[str, Any]:
         """
-        Translate a transcript to the target language.
+        Translate a transcript to the target language with retry support.
 
         Args:
             video_id: YouTube video ID
@@ -204,16 +334,13 @@ class YouTubeTranscriptsService:
         if source_languages is None:
             source_languages = ["en"]
 
-        try:
-            # v1.x API: use instance method list()
-            transcript_list = _youtube_api.list(video_id)
+        def _translate(api: YouTubeTranscriptApi) -> Dict[str, Any]:
+            transcript_list = api.list(video_id)
             transcript_obj = transcript_list.find_transcript(source_languages)
             translated_transcript = transcript_obj.translate(target_language)
-            # v1.x API: fetch() returns FetchedTranscript, use to_raw_data() for dict format
             fetched = translated_transcript.fetch()
             transcript_data = fetched.to_raw_data()
 
-            # v1.x API: translation_languages contains objects with attributes
             translation_langs = [
                 {"language": lang.language, "language_code": lang.language_code}
                 for lang in translated_transcript.translation_languages
@@ -228,86 +355,41 @@ class YouTubeTranscriptsService:
                 "translation_languages": translation_langs,
                 "transcript_data": transcript_data
             }
-        except NoTranscriptFound:
-            raise HTTPException(
-                status_code=404,
-                detail="No transcript found for the given video ID."
-            )
-        except TranscriptsDisabled:
-            raise HTTPException(
-                status_code=403,
-                detail="Transcripts are disabled for this video."
-            )
-        except VideoUnavailable:
-            raise HTTPException(
-                status_code=404,
-                detail="The specified video is unavailable."
-            )
-        except Exception as e:
-            logger.error(f"Error translating transcript for video_id {video_id}: {e}")
-            raise HTTPException(
-                status_code=500,
-                detail="Internal Server Error while translating transcript."
-            )
 
-    @staticmethod
-    def format_transcript_from_raw(
-        transcript_items: List[Dict[str, Any]],
-        format_type: str
-    ) -> str:
+        return self._execute_with_retry(_translate, video_id, "translating transcript")
+
+    async def translate_transcript_async(
+        self,
+        video_id: str,
+        target_language: str,
+        source_languages: List[str] = None
+    ) -> Dict[str, Any]:
         """
-        Format transcript items from raw data into the specified format.
-
-        Note: This method works with raw dict data. For better formatting
-        with v1.x API, use format_transcript_from_fetched() with
-        FetchedTranscript objects.
+        Asynchronously translate a transcript.
 
         Args:
-            transcript_items: List of transcript items (text, start, duration)
-            format_type: Desired format (txt, csv)
+            video_id: YouTube video ID
+            target_language: Target language code
+            source_languages: List of source language codes
 
         Returns:
-            Formatted transcript string
-
-        Raises:
-            HTTPException: If format type is invalid or unsupported
+            Dictionary with translated transcript data and metadata
         """
-        if format_type == "txt":
-            return "\n".join([item["text"] for item in transcript_items])
+        return await asyncio.to_thread(
+            self.translate_transcript,
+            video_id,
+            target_language,
+            source_languages
+        )
 
-        elif format_type == "csv":
-            output = io.StringIO()
-            writer = csv.writer(output)
-            writer.writerow(['Start', 'Duration', 'Text'])
-            for item in transcript_items:
-                writer.writerow([item["start"], item["duration"], item["text"]])
-            return output.getvalue()
-
-        elif format_type in ("vtt", "srt"):
-            # For vtt/srt, we recommend using format_transcript_from_video()
-            # which fetches the transcript in the proper format for formatters
-            raise HTTPException(
-                status_code=400,
-                detail=f"Use format_transcript_from_video() for {format_type} format"
-            )
-
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid format type specified. Use: txt, csv, vtt, or srt"
-            )
-
-    @staticmethod
-    def format_transcript_from_video(
+    def format_transcript(
+        self,
         video_id: str,
         format_type: str,
         languages: List[str] = None
     ) -> str:
         """
-        Fetch and format transcript directly from a video.
-
-        This method is preferred for vtt/srt formats as it uses the
-        v1.x FetchedTranscript objects that formatters expect.
+        Fetch and format transcript directly from a video with retry support.
 
         Args:
             video_id: YouTube video ID
@@ -323,21 +405,18 @@ class YouTubeTranscriptsService:
         if languages is None:
             languages = ["en"]
 
-        try:
-            # v1.x API: fetch returns FetchedTranscript
-            fetched = _youtube_api.fetch(video_id, languages=tuple(languages))
+        def _format(api: YouTubeTranscriptApi) -> str:
+            fetched = api.fetch(video_id, languages=tuple(languages))
 
             if format_type == "txt":
                 return "\n".join([snippet.text for snippet in fetched.snippets])
 
             elif format_type == "vtt":
                 formatter = WebVTTFormatter()
-                # v1.x formatters work with FetchedTranscript directly
                 return formatter.format_transcript(fetched)
 
             elif format_type == "srt":
                 formatter = SRTFormatter()
-                # v1.x formatters work with FetchedTranscript directly
                 return formatter.format_transcript(fetched)
 
             elif format_type == "csv":
@@ -354,29 +433,31 @@ class YouTubeTranscriptsService:
                     detail="Invalid format type specified. Use: txt, vtt, srt, or csv"
                 )
 
-        except NoTranscriptFound:
-            raise HTTPException(
-                status_code=404,
-                detail="No transcript found for the given video ID."
-            )
-        except TranscriptsDisabled:
-            raise HTTPException(
-                status_code=403,
-                detail="Transcripts are disabled for this video."
-            )
-        except VideoUnavailable:
-            raise HTTPException(
-                status_code=404,
-                detail="The specified video is unavailable."
-            )
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Error formatting transcript for video_id {video_id}: {e}")
-            raise HTTPException(
-                status_code=500,
-                detail="Internal Server Error while formatting transcript."
-            )
+        return self._execute_with_retry(_format, video_id, "formatting transcript")
+
+    async def format_transcript_async(
+        self,
+        video_id: str,
+        format_type: str,
+        languages: List[str] = None
+    ) -> str:
+        """
+        Asynchronously format a transcript.
+
+        Args:
+            video_id: YouTube video ID
+            format_type: Desired format (txt, vtt, srt, csv)
+            languages: List of language codes in descending priority
+
+        Returns:
+            Formatted transcript string
+        """
+        return await asyncio.to_thread(
+            self.format_transcript,
+            video_id,
+            format_type,
+            languages
+        )
 
 
 # Singleton instance for convenience

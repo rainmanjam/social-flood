@@ -3,6 +3,8 @@ Caching utilities for the Social Flood application.
 
 This module provides caching functionality to improve performance
 by storing frequently accessed data in memory or Redis.
+
+Uses the shared async Redis manager for Redis operations.
 """
 from typing import Any, Dict, Optional, Union, Callable, TypeVar, Generic, List, Tuple
 import time
@@ -14,6 +16,7 @@ import hashlib
 from datetime import datetime, timedelta
 
 from app.core.config import get_settings, Settings
+from app.core.redis_manager import RedisManager
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -31,53 +34,37 @@ _cache_lock: asyncio.Lock = asyncio.Lock()
 # Cleanup task reference to prevent garbage collection
 _cleanup_task: Optional[asyncio.Task] = None
 
+# Shared Redis manager instance (initialized lazily)
+_redis_manager: Optional[RedisManager] = None
+
+
+async def _get_redis_manager() -> Optional[RedisManager]:
+    """Get the shared Redis manager instance."""
+    global _redis_manager
+    if _redis_manager is None:
+        _redis_manager = await RedisManager.get_instance()
+    return _redis_manager
+
 
 class CacheManager:
     """
     Cache manager for storing and retrieving data.
-    
+
     This class provides a simple interface for caching data in memory
-    or Redis, with automatic expiration.
+    or Redis, with automatic expiration. Uses async Redis operations
+    for better performance.
     """
-    
+
     def __init__(self, settings: Optional[Settings] = None):
         """
         Initialize the cache manager.
-        
+
         Args:
             settings: Optional settings instance
         """
         self.settings = settings or get_settings()
         self.enabled = self.settings.ENABLE_CACHE if hasattr(self.settings, "ENABLE_CACHE") else True
         self.ttl = self.settings.CACHE_TTL if hasattr(self.settings, "CACHE_TTL") else 3600  # seconds
-        self.redis_url = self.settings.REDIS_URL if hasattr(self.settings, "REDIS_URL") else None
-        self.redis_client = None
-        
-        # Initialize Redis client if URL is provided
-        if self.redis_url and self.enabled:
-            self._init_redis()
-    
-    def _init_redis(self):
-        """Initialize the Redis client."""
-        try:
-            import redis
-            self.redis_client = redis.from_url(str(self.redis_url))
-            logger.info("Redis cache initialized")
-        except ImportError:
-            logger.warning("Redis package not installed. Falling back to in-memory cache.")
-        except Exception as e:
-            logger.error(f"Failed to initialize Redis: {str(e)}")
-    
-    def _get_redis_client(self):
-        """
-        Get the Redis client, initializing it if necessary.
-        
-        Returns:
-            Optional[redis.Redis]: Redis client or None
-        """
-        if not self.redis_client and self.redis_url and self.enabled:
-            self._init_redis()
-        return self.redis_client
     
     def _serialize(self, value: Any) -> str:
         """
@@ -134,31 +121,31 @@ class CacheManager:
     ) -> Any:
         """
         Get a value from the cache.
-        
+
         Args:
             key: The cache key
             namespace: Optional namespace
             default: Default value if key not found
-            
+
         Returns:
             Any: The cached value or default
         """
         if not self.enabled:
             return default
-        
+
         full_key = self._generate_key(key, namespace)
-        
-        # Try Redis first if available
-        redis_client = self._get_redis_client()
-        if redis_client:
+
+        # Try Redis first if available (async)
+        redis_manager = await _get_redis_manager()
+        if redis_manager and redis_manager.is_available:
             try:
-                value = redis_client.get(full_key)
+                value = await redis_manager.get(full_key)
                 if value is not None:
                     logger.debug(f"Cache hit (Redis): {full_key}")
-                    return self._deserialize(value.decode('utf-8'))
+                    return self._deserialize(value)
             except Exception as e:
                 logger.error(f"Redis error in get: {str(e)}")
-        
+
         # Fall back to in-memory cache with thread-safe access
         async with _cache_lock:
             if full_key in _cache_store:
@@ -184,33 +171,34 @@ class CacheManager:
     ) -> bool:
         """
         Set a value in the cache.
-        
+
         Args:
             key: The cache key
             value: The value to cache
             ttl: Time to live in seconds (None for default)
             namespace: Optional namespace
-            
+
         Returns:
             bool: True if successful, False otherwise
         """
         if not self.enabled:
             return False
-        
+
         ttl = ttl if ttl is not None else self.ttl
         full_key = self._generate_key(key, namespace)
-        
-        # Try Redis first if available
-        redis_client = self._get_redis_client()
-        if redis_client:
+
+        # Try Redis first if available (async)
+        redis_manager = await _get_redis_manager()
+        if redis_manager and redis_manager.is_available:
             try:
                 serialized = self._serialize(value)
-                redis_client.setex(full_key, ttl, serialized)
-                logger.debug(f"Cache set (Redis): {full_key}, TTL: {ttl}s")
-                return True
+                success = await redis_manager.set(full_key, serialized, ttl)
+                if success:
+                    logger.debug(f"Cache set (Redis): {full_key}, TTL: {ttl}s")
+                    return True
             except Exception as e:
                 logger.error(f"Redis error in set: {str(e)}")
-        
+
         # Fall back to in-memory cache with thread-safe access
         async with _cache_lock:
             expiry = time.time() + ttl
@@ -225,69 +213,69 @@ class CacheManager:
     ) -> bool:
         """
         Delete a value from the cache.
-        
+
         Args:
             key: The cache key
             namespace: Optional namespace
-            
+
         Returns:
             bool: True if successful, False otherwise
         """
         if not self.enabled:
             return False
-        
+
         full_key = self._generate_key(key, namespace)
-        
-        # Try Redis first if available
-        redis_client = self._get_redis_client()
-        if redis_client:
+        deleted = False
+
+        # Try Redis first if available (async)
+        redis_manager = await _get_redis_manager()
+        if redis_manager and redis_manager.is_available:
             try:
-                redis_client.delete(full_key)
-                logger.debug(f"Cache delete (Redis): {full_key}")
+                count = await redis_manager.delete(full_key)
+                if count > 0:
+                    logger.debug(f"Cache delete (Redis): {full_key}")
+                    deleted = True
             except Exception as e:
                 logger.error(f"Redis error in delete: {str(e)}")
-        
+
         # Also delete from in-memory cache with thread-safe access
         async with _cache_lock:
             if full_key in _cache_store:
                 del _cache_store[full_key]
                 logger.debug(f"Cache delete (memory): {full_key}")
-                return True
+                deleted = True
 
-        return False
+        return deleted
     
     async def clear(self, namespace: Optional[str] = None) -> bool:
         """
         Clear all values from the cache or a specific namespace.
-        
+
         Args:
             namespace: Optional namespace to clear
-            
+
         Returns:
             bool: True if successful, False otherwise
         """
         if not self.enabled:
             return False
-        
-        # Clear Redis cache if available
-        redis_client = self._get_redis_client()
-        if redis_client:
+
+        # Clear Redis cache if available (async)
+        redis_manager = await _get_redis_manager()
+        if redis_manager and redis_manager.is_available:
             try:
                 if namespace:
                     pattern = f"cache:{namespace}:*"
-                    keys = redis_client.keys(pattern)
-                    if keys:
-                        redis_client.delete(*keys)
-                        logger.debug(f"Cache clear (Redis) for namespace: {namespace}, {len(keys)} keys")
                 else:
                     pattern = "cache:*"
-                    keys = redis_client.keys(pattern)
-                    if keys:
-                        redis_client.delete(*keys)
-                        logger.debug(f"Cache clear (Redis): {len(keys)} keys")
+
+                keys = await redis_manager.keys(pattern)
+                if keys:
+                    await redis_manager.delete(*keys)
+                    logger.debug(f"Cache clear (Redis): {len(keys)} keys")
             except Exception as e:
                 logger.error(f"Redis error in clear: {str(e)}")
-        
+
         # Clear in-memory cache with thread-safe access
         async with _cache_lock:
             if namespace:

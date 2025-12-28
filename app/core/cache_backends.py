@@ -4,13 +4,18 @@ Cache backend implementations using the Strategy pattern.
 This module provides pluggable cache backends for the CacheManager.
 Each backend implements the CacheBackend abstract base class,
 allowing easy switching between different caching strategies.
+
+Uses the shared async RedisManager for Redis operations.
 """
 import asyncio
 import json
 import logging
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.core.redis_manager import RedisManager
 
 logger = logging.getLogger(__name__)
 
@@ -238,41 +243,31 @@ class RedisCacheBackend(CacheBackend):
     """
     Redis cache backend for distributed caching.
 
+    Uses the shared async RedisManager for all Redis operations.
     Suitable for multi-instance deployments where cache needs to be shared.
     Falls back gracefully if Redis is unavailable.
     """
 
-    def __init__(self, redis_url: str):
+    def __init__(self, redis_url: str = None):
         """
         Initialize the Redis cache backend.
 
         Args:
-            redis_url: Redis connection URL (e.g., "redis://localhost:6379")
+            redis_url: Redis connection URL (unused, kept for compatibility)
+                      Uses shared RedisManager instead
         """
-        self._redis_url = redis_url
-        self._client = None
-        self._connected = False
+        self._manager: Optional["RedisManager"] = None
         self._hits = 0
         self._misses = 0
         self._sets = 0
         self._deletes = 0
 
-    def _get_client(self):
-        """Get or create the Redis client."""
-        if self._client is None:
-            try:
-                import redis
-                self._client = redis.from_url(self._redis_url)
-                self._client.ping()  # Test connection
-                self._connected = True
-                logger.info("Redis cache backend connected")
-            except ImportError:
-                logger.warning("Redis package not installed")
-                self._connected = False
-            except Exception as e:
-                logger.error(f"Failed to connect to Redis: {e}")
-                self._connected = False
-        return self._client
+    async def _get_manager(self) -> Optional["RedisManager"]:
+        """Get the shared Redis manager."""
+        if self._manager is None:
+            from app.core.redis_manager import RedisManager
+            self._manager = await RedisManager.get_instance()
+        return self._manager
 
     def _serialize(self, value: Any) -> str:
         """Serialize a value to JSON string."""
@@ -281,21 +276,21 @@ class RedisCacheBackend(CacheBackend):
         except (TypeError, ValueError):
             return str(value)
 
-    def _deserialize(self, value: bytes) -> Any:
+    def _deserialize(self, value: str) -> Any:
         """Deserialize a JSON string to value."""
         try:
-            return json.loads(value.decode("utf-8"))
+            return json.loads(value)
         except (json.JSONDecodeError, TypeError, AttributeError):
             return value
 
     async def get(self, key: str) -> Optional[Any]:
         """Get a value from Redis."""
-        client = self._get_client()
-        if not client or not self._connected:
+        manager = await self._get_manager()
+        if not manager or not manager.is_available:
             return None
 
         try:
-            value = client.get(key)
+            value = await manager.get(key)
             if value is not None:
                 self._hits += 1
                 logger.debug(f"Redis cache hit: {key}")
@@ -309,29 +304,30 @@ class RedisCacheBackend(CacheBackend):
 
     async def set(self, key: str, value: Any, ttl: int) -> bool:
         """Set a value in Redis."""
-        client = self._get_client()
-        if not client or not self._connected:
+        manager = await self._get_manager()
+        if not manager or not manager.is_available:
             return False
 
         try:
             serialized = self._serialize(value)
-            client.setex(key, ttl, serialized)
-            self._sets += 1
-            logger.debug(f"Redis cache set: {key}, TTL: {ttl}s")
-            return True
+            success = await manager.set(key, serialized, ttl)
+            if success:
+                self._sets += 1
+                logger.debug(f"Redis cache set: {key}, TTL: {ttl}s")
+            return success
         except Exception as e:
             logger.error(f"Redis set error: {e}")
             return False
 
     async def delete(self, key: str) -> bool:
         """Delete a value from Redis."""
-        client = self._get_client()
-        if not client or not self._connected:
+        manager = await self._get_manager()
+        if not manager or not manager.is_available:
             return False
 
         try:
-            result = client.delete(key)
-            if result > 0:
+            count = await manager.delete(key)
+            if count > 0:
                 self._deletes += 1
                 logger.debug(f"Redis cache delete: {key}")
                 return True
@@ -342,18 +338,16 @@ class RedisCacheBackend(CacheBackend):
 
     async def clear(self, pattern: Optional[str] = None) -> int:
         """Clear values from Redis."""
-        client = self._get_client()
-        if not client or not self._connected:
+        manager = await self._get_manager()
+        if not manager or not manager.is_available:
             return 0
 
         try:
-            if pattern:
-                keys = client.keys(pattern)
-            else:
-                keys = client.keys("cache:*")
+            search_pattern = pattern if pattern else "cache:*"
+            keys = await manager.keys(search_pattern)
 
             if keys:
-                count = client.delete(*keys)
+                count = await manager.delete(*keys)
                 logger.debug(f"Redis cache clear: {count} keys deleted")
                 return count
             return 0
@@ -363,25 +357,26 @@ class RedisCacheBackend(CacheBackend):
 
     async def exists(self, key: str) -> bool:
         """Check if a key exists in Redis."""
-        client = self._get_client()
-        if not client or not self._connected:
+        manager = await self._get_manager()
+        if not manager or not manager.is_available:
             return False
 
         try:
-            return bool(client.exists(key))
+            count = await manager.exists(key)
+            return count > 0
         except Exception as e:
             logger.error(f"Redis exists error: {e}")
             return False
 
     async def get_stats(self) -> Dict[str, Any]:
         """Get cache statistics."""
-        client = self._get_client()
+        manager = await self._get_manager()
         total = self._hits + self._misses
         hit_rate = (self._hits / total * 100) if total > 0 else 0.0
 
         stats = {
             "backend": "redis",
-            "connected": self._connected,
+            "connected": manager.is_available if manager else False,
             "hits": self._hits,
             "misses": self._misses,
             "sets": self._sets,
@@ -389,28 +384,20 @@ class RedisCacheBackend(CacheBackend):
             "hit_rate": f"{hit_rate:.2f}%"
         }
 
-        if client and self._connected:
-            try:
-                info = client.info("memory")
-                stats["used_memory"] = info.get("used_memory_human", "unknown")
-                stats["keys"] = client.dbsize()
-            except Exception:
-                pass
+        if manager and manager.is_available:
+            health = await manager.health_check()
+            stats["latency_ms"] = health.get("latency_ms")
 
         return stats
 
     async def health_check(self) -> bool:
         """Check if Redis is healthy."""
-        client = self._get_client()
-        if not client:
+        manager = await self._get_manager()
+        if not manager:
             return False
 
-        try:
-            client.ping()
-            return True
-        except Exception:
-            self._connected = False
-            return False
+        health = await manager.health_check()
+        return health.get("status") == "healthy"
 
 
 class TieredCacheBackend(CacheBackend):

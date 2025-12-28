@@ -1,5 +1,9 @@
-# google_trends_api.py
+"""
+Google Trends API Router.
 
+Provides endpoints for Google Trends data including trending topics,
+interest over time, and related queries.
+"""
 from fastapi import APIRouter, Query, HTTPException, Depends
 from pydantic import BaseModel, Field
 from datetime import date
@@ -7,7 +11,6 @@ import logging
 import asyncio
 import pandas as pd
 import numpy as np
-from enum import IntEnum, Enum
 from typing import List, Optional, Union
 from trendspy import Trends, BatchPeriod
 from app.core.proxy import get_proxy
@@ -15,37 +18,14 @@ from app.core.cache_manager import generate_cache_key, get_cached_or_fetch
 from app.core.rate_limiter import rate_limit
 from app.core.http_client import get_http_client_manager
 from app.core.constants import USER_AGENT_LIST, REFERER_LIST
+from app.schemas.enums import (
+    TimeframeEnum,
+    HumanFriendlyBatchPeriod,
+    StandardTimeframe,
+    CustomIntervalTimeframe,
+)
 import random
 import json
-
-# Add TimeframeEnum
-class TimeframeEnum(IntEnum):
-    TWO = 2
-    THREE = 3
-    FOUR = 4
-    FIVE = 5
-
-# Add HumanFriendlyBatchPeriod Enum
-class HumanFriendlyBatchPeriod(str, Enum):
-    past_4h = "past_4h"
-    past_24h = "past_24h"
-    past_48h = "past_48h"
-    past_7d = "past_7d"
-
-# Define Enums for each time format
-class StandardTimeframe(str, Enum):
-    NOW_1H = "now 1-H"
-    NOW_4H = "now 4-H"
-    TODAY_1M = "today 1-m"
-    TODAY_3M = "today 3-m"
-    TODAY_12M = "today 12-m"
-
-class CustomIntervalTimeframe(str, Enum):
-    NOW_123H = "now 123-H"
-    NOW_72H = "now 72-H"
-    TODAY_45D = "today 45-d"
-    TODAY_90D = "today 90-d"
-    TODAY_18M = "today 18-m"
 
 # Pydantic model for date range
 class DateRangeTimeframeModel(BaseModel):

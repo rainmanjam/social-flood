@@ -10,49 +10,17 @@ from typing import Optional, List, Dict, Any, Union
 import pandas as pd
 import numpy as np
 from trendspy import Trends, BatchPeriod
-from enum import IntEnum, Enum
 
 from app.core.proxy import get_proxy
 from app.core.constants import USER_AGENT_LIST, REFERER_LIST
+from app.schemas.enums import (
+    TimeframeEnum,
+    HumanFriendlyBatchPeriod,
+    StandardTimeframe,
+    CustomIntervalTimeframe,
+)
 
 logger = logging.getLogger(__name__)
-
-
-# -------------------------------------------------------------------------
-# Enums for Timeframe Configuration
-# -------------------------------------------------------------------------
-class TimeframeEnum(IntEnum):
-    """Timeframe enumeration for batch periods."""
-    TWO = 2
-    THREE = 3
-    FOUR = 4
-    FIVE = 5
-
-
-class HumanFriendlyBatchPeriod(str, Enum):
-    """Human-friendly batch period options."""
-    past_4h = "past_4h"
-    past_24h = "past_24h"
-    past_48h = "past_48h"
-    past_7d = "past_7d"
-
-
-class StandardTimeframe(str, Enum):
-    """Standard timeframe options for Google Trends."""
-    NOW_1H = "now 1-H"
-    NOW_4H = "now 4-H"
-    TODAY_1M = "today 1-m"
-    TODAY_3M = "today 3-m"
-    TODAY_12M = "today 12-m"
-
-
-class CustomIntervalTimeframe(str, Enum):
-    """Custom interval timeframe options."""
-    NOW_123H = "now 123-H"
-    NOW_72H = "now 72-H"
-    TODAY_45D = "today 45-d"
-    TODAY_90D = "today 90-d"
-    TODAY_18M = "today 18-m"
 
 
 # -------------------------------------------------------------------------

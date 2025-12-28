@@ -8,6 +8,7 @@ Storage Backends:
 -----------------
 1. Redis (Recommended for production): When REDIS_URL is configured, rate limits
    are stored in Redis, enabling accurate rate limiting across multiple instances.
+   Uses the shared async RedisManager for consistent connection handling.
 
 2. In-Memory (Fallback): When Redis is unavailable, falls back to thread-safe
    in-memory storage. Note: In-memory storage is NOT shared across instances.
@@ -16,7 +17,7 @@ For production multi-instance deployments:
 - Set REDIS_URL environment variable (e.g., redis://localhost:6379/0)
 - Rate limits will automatically use Redis for shared state
 
-See also: app/core/cache_manager.py for Redis configuration details.
+See also: app/core/redis_manager.py for Redis configuration details.
 """
 from fastapi import Request, Response, Depends
 from fastapi.responses import JSONResponse
@@ -31,6 +32,7 @@ from datetime import datetime
 from app.core.config import get_settings, Settings
 from app.core.exceptions import RateLimitExceededError
 from app.core.auth import get_current_api_key
+from app.core.redis_manager import RedisManager
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -45,44 +47,21 @@ _rate_limit_lock: asyncio.Lock = asyncio.Lock()
 # Global cleanup task reference to prevent garbage collection
 _cleanup_task: Optional[asyncio.Task] = None
 
-# Redis client instance (initialized lazily)
-_redis_client: Optional[Any] = None
-_redis_initialized: bool = False
+# Shared Redis manager instance (initialized lazily)
+_redis_manager: Optional[RedisManager] = None
 
 
-def _get_redis_client():
+async def _get_redis_manager() -> Optional[RedisManager]:
     """
-    Get or initialize the Redis client for rate limiting.
+    Get the shared Redis manager for rate limiting.
 
     Returns:
-        Optional[redis.Redis]: Redis client or None if unavailable
+        Optional[RedisManager]: Redis manager or None if unavailable
     """
-    global _redis_client, _redis_initialized
-
-    if _redis_initialized:
-        return _redis_client
-
-    _redis_initialized = True
-    settings = get_settings()
-    redis_url = getattr(settings, 'REDIS_URL', None)
-
-    if not redis_url:
-        logger.debug("Redis URL not configured, using in-memory rate limiting")
-        return None
-
-    try:
-        import redis
-        _redis_client = redis.from_url(str(redis_url))
-        # Test connection
-        _redis_client.ping()
-        logger.info("Redis rate limiter initialized successfully")
-        return _redis_client
-    except ImportError:
-        logger.warning("Redis package not installed. Using in-memory rate limiting.")
-        return None
-    except Exception as e:
-        logger.warning(f"Failed to connect to Redis for rate limiting: {e}. Using in-memory fallback.")
-        return None
+    global _redis_manager
+    if _redis_manager is None:
+        _redis_manager = await RedisManager.get_instance()
+    return _redis_manager
 
 
 class RateLimiter:
@@ -168,10 +147,10 @@ class RateLimiter:
         # Get the rate limit key
         key = await self._get_rate_limit_key(request)
 
-        # Try Redis first if available
-        redis_client = _get_redis_client()
-        if redis_client:
-            return await self._check_rate_limit_redis(key, redis_client)
+        # Try Redis first if available (async)
+        redis_manager = await _get_redis_manager()
+        if redis_manager and redis_manager.is_available:
+            return await self._check_rate_limit_redis(key, redis_manager)
 
         # Fall back to thread-safe in-memory storage
         return await self._check_rate_limit_memory(key)
@@ -179,42 +158,28 @@ class RateLimiter:
     async def _check_rate_limit_redis(
         self,
         key: str,
-        redis_client: Any
+        redis_manager: RedisManager
     ) -> Tuple[bool, Dict[str, Any]]:
         """
         Check rate limit using Redis storage.
 
-        Uses Redis INCR with EXPIRE for atomic rate limiting.
+        Uses the shared RedisManager for atomic rate limiting operations.
 
         Args:
             key: The rate limit key
-            redis_client: Redis client instance
+            redis_manager: RedisManager instance
 
         Returns:
             Tuple[bool, Dict[str, Any]]: (is_limited, rate_limit_info)
         """
         try:
-            # Use Redis pipeline for atomic operations
-            pipe = redis_client.pipeline()
-
-            # Get current count and TTL
-            pipe.incr(key)
-            pipe.ttl(key)
-            results = pipe.execute()
-
-            current_count = results[0]
-            ttl = results[1]
-
-            # If this is the first request (TTL is -1), set expiration
-            if ttl == -1:
-                redis_client.expire(key, self.timeframe)
-                ttl = self.timeframe
-
-            # Calculate reset time
-            reset = max(0, ttl)
+            # Use the atomic rate_limit_check method from RedisManager
+            allowed, current_count, reset = await redis_manager.rate_limit_check(
+                key, self.requests, self.timeframe
+            )
 
             # Check if rate limited
-            is_limited = current_count > self.requests
+            is_limited = not allowed
 
             return is_limited, self._get_rate_limit_headers(
                 current_count, self.requests, self.timeframe, time.time() - (self.timeframe - reset)
