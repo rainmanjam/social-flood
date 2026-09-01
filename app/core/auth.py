@@ -13,6 +13,7 @@ authenticated request failed. Read keys from ``get_settings()`` only.
 """
 from fastapi import Security, HTTPException, status, Depends, Request
 from fastapi.security.api_key import APIKeyHeader
+import threading
 from typing import Dict, FrozenSet, NamedTuple, Optional, Set
 
 from app.core.config import Settings, get_settings
@@ -44,6 +45,10 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 # The single source of truth for auth decisions. Replaced wholesale, never
 # mutated in place.
 _auth_state = _AuthState(settings=None, keys=frozenset(), metadata={})
+
+# Serialises rebuilds so a slow thread cannot publish a snapshot it derived
+# from settings that have since been replaced.
+_refresh_lock = threading.Lock()
 
 
 def initialize_api_keys(settings: Optional[Settings] = None) -> Set[str]:
@@ -100,15 +105,26 @@ def _auth_snapshot() -> _AuthState:
     ``reload_settings()`` (or any ``get_settings.cache_clear()``) takes effect
     immediately rather than only on the next authenticated request.
 
+    The rebuild is serialised and re-checked under ``_refresh_lock``. Without
+    that, a thread descheduled between reading ``get_settings()`` and
+    publishing could overwrite a newer snapshot with the keys it read earlier
+    -- reinstating credentials that a rotation had just removed.
+
     Returns:
         _AuthState: A consistent (settings, keys, metadata) triple.
     """
     settings = get_settings()
     state = _auth_state
-    if state.settings is not settings:
-        initialize_api_keys(settings)
-        state = _auth_state
-    return state
+    if state.settings is settings:
+        return state
+
+    with _refresh_lock:
+        # Re-read inside the lock: another thread may have rebuilt already,
+        # and get_settings() may have moved on since the check above.
+        settings = get_settings()
+        if _auth_state.settings is not settings:
+            initialize_api_keys(settings)
+        return _auth_state
 
 
 # Initialize API keys on module import.

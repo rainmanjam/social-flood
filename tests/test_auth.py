@@ -272,6 +272,75 @@ class TestGlobalState:
             get_settings.cache_clear()
             initialize_api_keys(get_settings())
 
+    def test_stale_rebuild_cannot_reinstate_rotated_keys(self, monkeypatch):
+        """
+        A slow refresh must not overwrite a newer snapshot.
+
+        Deterministic interleaving: a thread enters _auth_snapshot() with the
+        OLD settings, is held at the lock while the main thread rotates the
+        keys and publishes a new snapshot, then proceeds. It must observe the
+        rotation rather than republishing the credentials it read first --
+        otherwise a rotated-out key would authenticate again.
+        """
+        import threading
+
+        monkeypatch.setenv("API_KEYS", "old-key")
+        get_settings.cache_clear()
+        try:
+            initialize_api_keys(get_settings())
+            assert validate_api_key("old-key") is True
+
+            entered = threading.Event()
+            may_proceed = threading.Event()
+            result = {}
+
+            real_lock = app.core.auth._refresh_lock
+
+            class _GatedLock:
+                """Signals on entry, then blocks until the test releases it."""
+
+                def __enter__(self):
+                    entered.set()
+                    may_proceed.wait(timeout=5)
+                    return real_lock.__enter__()
+
+                def __exit__(self, *exc):
+                    return real_lock.__exit__(*exc)
+
+            def _slow_refresh():
+                monkeypatch.setattr(
+                    app.core.auth, "_refresh_lock", _GatedLock(), raising=False
+                )
+                result["keys"] = app.core.auth._auth_snapshot().keys
+
+            # Force the snapshot to look stale so _auth_snapshot() takes the
+            # rebuild path.
+            app.core.auth._auth_state = app.core.auth._auth_state._replace(
+                settings=None
+            )
+
+            worker = threading.Thread(target=_slow_refresh)
+            worker.start()
+            assert entered.wait(timeout=5), "refresh thread never reached the lock"
+
+            # Rotate while the refresh thread is parked.
+            monkeypatch.setenv("API_KEYS", "new-key")
+            get_settings.cache_clear()
+            initialize_api_keys(get_settings())
+
+            may_proceed.set()
+            worker.join(timeout=5)
+            assert not worker.is_alive()
+
+            # The parked thread must not have republished "old-key".
+            assert "old-key" not in result["keys"]
+            assert "new-key" in result["keys"]
+            assert validate_api_key("old-key") is False
+            assert validate_api_key("new-key") is True
+        finally:
+            get_settings.cache_clear()
+            initialize_api_keys(get_settings())
+
     def test_settings_reload_refreshes_key_set(self, monkeypatch):
         """
         Reloading settings must refresh the accepted keys.

@@ -198,6 +198,22 @@ class TestPlaceholderCredentialGuard:
         finally:
             get_settings.cache_clear()
 
+    def test_placeholder_single_api_key_rejected_outside_development(self, monkeypatch):
+        """The API_KEY alias must be guarded exactly like API_KEYS."""
+        from app.core.config import SettingsError, get_settings
+
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("API_KEYS", "")
+        monkeypatch.setenv("API_KEY", EXAMPLE_API_KEY)
+        monkeypatch.setenv("SECRET_KEY", "a-real-generated-production-secret")
+        get_settings.cache_clear()
+        try:
+            with pytest.raises(SettingsError) as exc_info:
+                get_settings()
+            assert "API_KEY" in str(exc_info.value)
+        finally:
+            get_settings.cache_clear()
+
     def test_placeholder_secret_rejected_outside_development(self, monkeypatch):
         """ENVIRONMENT=production with the example SECRET_KEY must refuse."""
         from app.core.config import SettingsError, get_settings
