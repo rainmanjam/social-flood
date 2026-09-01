@@ -283,7 +283,9 @@ class TestMainApplication:
             for parameter in signature.parameters.values()
         ), "Instrumentator.expose no longer forwards **kwargs to the route"
 
-    @patch('main.stop_rate_limit_cleanup_task')
+    @patch('main.stop_monitor_scheduler', new_callable=AsyncMock)
+    @patch('main.start_monitor_scheduler')
+    @patch('main.shutdown_rate_limiting', new_callable=AsyncMock)
     @patch('main.start_rate_limit_cleanup_task')
     @patch('main.shutdown_http_client_manager', new_callable=AsyncMock)
     @patch('main.setup_nltk', new_callable=AsyncMock)
@@ -294,7 +296,9 @@ class TestMainApplication:
         mock_setup_nltk,
         mock_shutdown_http,
         mock_start_cleanup,
-        mock_stop_cleanup,
+        mock_shutdown_rate_limiting,
+        mock_start_monitor_scheduler,
+        mock_stop_monitor_scheduler,
         mock_settings,
     ):
         """
@@ -319,10 +323,13 @@ class TestMainApplication:
             # Startup ran
             mock_setup_nltk.assert_called_once()
             mock_start_cleanup.assert_called_once()
-            mock_stop_cleanup.assert_not_called()
+            mock_start_monitor_scheduler.assert_called_once()
+            mock_shutdown_rate_limiting.assert_not_awaited()
 
-        # Shutdown ran
-        mock_stop_cleanup.assert_called_once()
+        # Shutdown ran. shutdown_rate_limiting cancels AND awaits the janitor,
+        # unlike stop_cleanup_task which only requests cancellation.
+        mock_shutdown_rate_limiting.assert_awaited_once()
+        mock_stop_monitor_scheduler.assert_awaited_once()
         mock_shutdown_http.assert_awaited_once()
 
     def test_rate_limit_cleanup_task_is_wired_into_lifespan(self):
@@ -336,7 +343,22 @@ class TestMainApplication:
         from app.core import rate_limiter
 
         assert main.start_rate_limit_cleanup_task is rate_limiter.start_cleanup_task
-        assert main.stop_rate_limit_cleanup_task is rate_limiter.stop_cleanup_task
+        # Shutdown awaits the janitor rather than only cancelling it, so the
+        # loop does not close with a pending task.
+        assert main.shutdown_rate_limiting is rate_limiter.shutdown_rate_limiting
+
+    def test_monitor_scheduler_is_wired_into_lifespan(self):
+        """Maps monitors never fire unless the scheduler is started.
+
+        create_monitor persists a record and reports status "active"; without
+        a running scheduler nothing ever re-scrapes the place or delivers a
+        webhook, so the monitor is active in name only.
+        """
+        import main
+        from app.services import google_maps_monitors
+
+        assert main.start_monitor_scheduler is google_maps_monitors.start_monitor_scheduler
+        assert main.stop_monitor_scheduler is google_maps_monitors.stop_monitor_scheduler
 
     @patch('main.settings')
     def test_health_check_endpoints(self, mock_settings_patch, mock_settings):
