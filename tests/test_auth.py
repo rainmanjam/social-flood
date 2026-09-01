@@ -3,52 +3,91 @@ Test suite for auth.py module.
 
 This module contains comprehensive tests for API key authentication,
 validation, and FastAPI dependency injection functionality.
+
+Note: the ``AuthSettings`` class these tests used to exercise has been
+deleted. It was a second, divergent settings source that declared no
+``API_KEY`` field at all, so the documented single-key variable was never
+loaded and every authenticated request returned 500. Authentication now reads
+``app.core.config.Settings`` -- the same object the rest of the app uses --
+so these tests exercise that instead.
 """
 
-import pytest
 import os
+import pytest
 from unittest.mock import patch
 
+import app.core.auth
 from app.core.auth import (
-    # Classes
-    AuthSettings,
+    # Objects
     api_key_header,
 
     # Functions
     validate_api_key,
     get_api_key_metadata,
+    initialize_api_keys,
     authenticate_api_key,
     get_current_api_key,
 
     # Global variables
-    auth_settings,
     _api_keys_set,
     _api_key_metadata,
 )
+from app.core.config import Settings, get_settings
 
 
-class TestAuthSettings:
-    """Test AuthSettings configuration class."""
+class TestAuthSettingsSource:
+    """Authentication configuration comes from Settings, and only Settings."""
 
-    def test_auth_settings_defaults(self):
-        """Test AuthSettings with default values."""
-        settings = AuthSettings()
+    def test_settings_auth_defaults(self):
+        """Settings supplies the auth defaults auth.py relies on."""
+        settings = Settings(_env_file=None)
         assert settings.API_KEYS == []
+        assert settings.API_KEY is None
         assert settings.ENABLE_API_KEY_AUTH is True
 
     @patch.dict(os.environ, {"API_KEYS": '["key1","key2","key3"]'})
-    def test_auth_settings_from_env_list(self):
-        """Test AuthSettings loading API keys from environment."""
-        settings = AuthSettings()
-        assert "key1" in settings.API_KEYS
-        assert "key2" in settings.API_KEYS
-        assert "key3" in settings.API_KEYS
+    def test_settings_api_keys_json_form(self):
+        """API keys load from the JSON list form."""
+        settings = Settings(_env_file=None)
+        assert settings.API_KEYS == ["key1", "key2", "key3"]
+
+    @patch.dict(os.environ, {"API_KEYS": "key1,key2,key3"})
+    def test_settings_api_keys_comma_form(self):
+        """API keys load from the comma-separated form the README documents."""
+        settings = Settings(_env_file=None)
+        assert settings.API_KEYS == ["key1", "key2", "key3"]
 
     @patch.dict(os.environ, {"ENABLE_API_KEY_AUTH": "false"})
-    def test_auth_settings_disable_auth(self):
-        """Test disabling API key authentication."""
-        settings = AuthSettings()
+    def test_settings_disable_auth(self):
+        """Authentication can be turned off via Settings."""
+        settings = Settings(_env_file=None)
         assert settings.ENABLE_API_KEY_AUTH is False
+
+    def test_no_separate_auth_settings_class(self):
+        """
+        There must be exactly one settings source.
+
+        A second class here is how API_KEY silently stopped being loaded.
+        """
+        assert not hasattr(app.core.auth, "AuthSettings")
+
+    @patch.dict(os.environ, {"API_KEY": "single-documented-key"})
+    def test_single_api_key_variable_is_loaded(self):
+        """
+        The documented API_KEY variable must reach the accepted key set.
+
+        This is the regression that made every authenticated request 500:
+        auth.py read it with os.getenv, which never sees values that
+        pydantic-settings read out of a .env file.
+        """
+        get_settings.cache_clear()
+        try:
+            keys = initialize_api_keys(get_settings())
+            assert "single-documented-key" in keys
+            assert validate_api_key("single-documented-key") is True
+        finally:
+            get_settings.cache_clear()
+            initialize_api_keys(get_settings())
 
 
 class TestAPIKeyValidation:
@@ -56,22 +95,17 @@ class TestAPIKeyValidation:
 
     def setup_method(self):
         """Reset global state before each test."""
-        # Store original state
-        self.original_keys = _api_keys_set.copy()
-        self.original_metadata = _api_key_metadata.copy()
+        self.original_keys = app.core.auth._api_keys_set.copy()
+        self.original_metadata = app.core.auth._api_key_metadata.copy()
 
-        # Set test state by modifying module-level variables
-        import app.core.auth
         app.core.auth._api_keys_set = {"valid_key1", "valid_key2"}
         app.core.auth._api_key_metadata = {
-            "valid_key1": {"source": "environment"},
-            "valid_key2": {"source": "environment"}
+            "valid_key1": {"source": "settings"},
+            "valid_key2": {"source": "settings"}
         }
 
     def teardown_method(self):
         """Restore global state after each test."""
-        # Restore original state
-        import app.core.auth
         app.core.auth._api_keys_set = self.original_keys
         app.core.auth._api_key_metadata = self.original_metadata
 
@@ -84,13 +118,14 @@ class TestAPIKeyValidation:
         """Test validating an invalid API key."""
         assert validate_api_key("invalid_key") is False
         assert validate_api_key("") is False
+        assert validate_api_key(None) is False
         assert validate_api_key("VALID_KEY1") is False  # Case sensitive
 
     def test_get_api_key_metadata_valid(self):
         """Test getting metadata for a valid API key."""
         metadata = get_api_key_metadata("valid_key1")
         assert metadata is not None
-        assert metadata["source"] == "environment"
+        assert metadata["source"] == "settings"
 
     def test_get_api_key_metadata_invalid(self):
         """Test getting metadata for an invalid API key."""
@@ -103,51 +138,78 @@ class TestAuthenticationDependencies:
 
     def setup_method(self):
         """Reset global state before each test."""
-        # Store original state
-        self.original_keys = _api_keys_set.copy()
-
-        # Set test state by modifying module-level variables
-        import app.core.auth
+        # Drop any Settings another test cached while env vars were patched;
+        # monkeypatch restores os.environ after the test body, so a cache
+        # refilled inside that body would otherwise leak stale values here.
+        get_settings.cache_clear()
+        self.original_keys = app.core.auth._api_keys_set.copy()
+        self.original_loaded_from = app.core.auth._keys_loaded_from
         app.core.auth._api_keys_set = {"test_key"}
+        # Pin the "loaded from" marker to the live settings object so
+        # _current_settings() does not rebuild (and discard) the set above.
+        app.core.auth._keys_loaded_from = get_settings()
 
     def teardown_method(self):
         """Restore global state after each test."""
-        # Restore original state
-        import app.core.auth
+        get_settings.cache_clear()
         app.core.auth._api_keys_set = self.original_keys
+        app.core.auth._keys_loaded_from = self.original_loaded_from
 
-    @patch('app.core.auth.auth_settings')
     @pytest.mark.asyncio
-    async def test_authenticate_api_key_valid(self, mock_settings):
+    async def test_authenticate_api_key_valid(self):
         """Test successful API key authentication."""
-        mock_settings.ENABLE_API_KEY_AUTH = True
-        # pylint: disable=global-statement
-        global _api_keys_set
-        _api_keys_set = {"test_key"}
-
         result = await authenticate_api_key("test_key")
         assert result == "test_key"
 
-    @patch('app.core.auth.auth_settings')
     @pytest.mark.asyncio
-    async def test_authenticate_api_key_invalid(self, mock_settings):
+    async def test_authenticate_api_key_invalid(self):
         """Test authentication with invalid API key."""
-        mock_settings.ENABLE_API_KEY_AUTH = True
+        from fastapi import HTTPException
 
-        with pytest.raises(Exception) as exc_info:  # Will be HTTPException in real usage
+        with pytest.raises(HTTPException) as exc_info:
             await authenticate_api_key("invalid_key")
 
-        # The exception details will depend on the actual implementation
-        assert "Invalid" in str(exc_info.value) or "401" in str(exc_info.value)
+        assert exc_info.value.status_code == 401
+        assert "Invalid" in exc_info.value.detail
 
-    @patch('app.core.auth.auth_settings')
     @pytest.mark.asyncio
-    async def test_authenticate_api_key_disabled(self, mock_settings):
-        """Test authentication when disabled."""
-        mock_settings.ENABLE_API_KEY_AUTH = False
+    async def test_authenticate_api_key_missing_header(self):
+        """
+        A request with no X-API-Key header must be 401, not 500 and not 200.
 
-        result = await authenticate_api_key("any_key")
-        assert result == "authentication-disabled"
+        Previously APIKeyHeader(auto_error=True) made this unreachable: the
+        header-less request was rejected inside FastAPI before this function
+        ran at all.
+        """
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as exc_info:
+            await authenticate_api_key(None)
+
+        assert exc_info.value.status_code == 401
+        assert "Missing" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_authenticate_api_key_disabled(self, monkeypatch):
+        """Test authentication when disabled -- including with no header."""
+        monkeypatch.setenv("ENABLE_API_KEY_AUTH", "false")
+        get_settings.cache_clear()
+        try:
+            assert await authenticate_api_key("any_key") == "authentication-disabled"
+            assert await authenticate_api_key(None) == "authentication-disabled"
+        finally:
+            get_settings.cache_clear()
+            initialize_api_keys(get_settings())
+
+    @pytest.mark.asyncio
+    async def test_authenticate_fails_closed_with_no_keys(self):
+        """Auth enabled but no keys configured must still reject."""
+        from fastapi import HTTPException
+
+        app.core.auth._api_keys_set = set()
+        with pytest.raises(HTTPException) as exc_info:
+            await authenticate_api_key("anything")
+        assert exc_info.value.status_code == 500
 
     def test_get_current_api_key(self):
         """Test get_current_api_key dependency."""
@@ -161,8 +223,17 @@ class TestAPIKeyHeader:
     def test_api_key_header_configuration(self):
         """Test that API key header is properly configured."""
         assert api_key_header is not None
-        # The exact type depends on FastAPI implementation
         assert hasattr(api_key_header, 'scheme_name') or hasattr(api_key_header, 'model')
+
+    def test_api_key_header_does_not_auto_error(self):
+        """
+        auto_error must be False.
+
+        With auto_error=True FastAPI rejects a header-less request before
+        auth.py runs, so ENABLE_API_KEY_AUTH=false could never take effect --
+        disabling auth inverted it.
+        """
+        assert api_key_header.auto_error is False
 
 
 class TestGlobalState:
@@ -172,41 +243,54 @@ class TestGlobalState:
         """Test that global variables are properly initialized."""
         assert isinstance(_api_keys_set, set)
         assert isinstance(_api_key_metadata, dict)
-        assert isinstance(auth_settings, AuthSettings)
 
-    def test_auth_settings_singleton(self):
-        """Test that auth_settings is a singleton."""
-        # Use the already imported auth_settings
-        settings1 = auth_settings
-        settings2 = auth_settings
-        assert settings1 is settings2
+    def test_initialize_api_keys_reads_settings(self, monkeypatch):
+        """initialize_api_keys() merges API_KEYS and API_KEY from Settings."""
+        monkeypatch.setenv("API_KEYS", "list-key-a,list-key-b")
+        monkeypatch.setenv("API_KEY", "single-key")
+        get_settings.cache_clear()
+        try:
+            keys = initialize_api_keys(get_settings())
+            assert keys == {"list-key-a", "list-key-b", "single-key"}
+        finally:
+            get_settings.cache_clear()
+            initialize_api_keys(get_settings())
+
+    def test_settings_reload_refreshes_key_set(self, monkeypatch):
+        """
+        Reloading settings must refresh the accepted keys.
+
+        The old code snapshotted keys once at import time, so a test (or a
+        runtime reload) that changed configuration was silently ignored.
+        """
+        monkeypatch.setenv("API_KEYS", "rotated-key")
+        get_settings.cache_clear()
+        try:
+            settings = app.core.auth._current_settings()
+            assert settings.API_KEYS == ["rotated-key"]
+            assert validate_api_key("rotated-key") is True
+        finally:
+            get_settings.cache_clear()
+            initialize_api_keys(get_settings())
 
 
 class TestBasicFunctionality:
     """Test basic authentication functionality."""
 
-    def test_validate_api_key_basic(self):
-        """Test basic API key validation."""
-        # Test with empty set
-        # pylint: disable=global-statement
-        global _api_keys_set
-        original_keys = _api_keys_set.copy()
-        _api_keys_set = set()
+    def test_validate_api_key_with_empty_set(self):
+        """Validation against an empty key set rejects everything."""
+        original_keys = app.core.auth._api_keys_set.copy()
+        app.core.auth._api_keys_set = set()
+        try:
+            assert validate_api_key("any_key") is False
+        finally:
+            app.core.auth._api_keys_set = original_keys
 
-        assert validate_api_key("any_key") is False
-
-        # Restore original state
-        _api_keys_set = original_keys
-
-    def test_get_api_key_metadata_basic(self):
-        """Test basic metadata retrieval."""
-        # Test with empty metadata
-        # pylint: disable=global-statement
-        global _api_key_metadata
-        original_metadata = _api_key_metadata.copy()
-        _api_key_metadata = {}
-
-        assert get_api_key_metadata("any_key") is None
-
-        # Restore original state
-        _api_key_metadata = original_metadata
+    def test_get_api_key_metadata_with_empty_mapping(self):
+        """Metadata lookup against an empty mapping returns None."""
+        original_metadata = app.core.auth._api_key_metadata.copy()
+        app.core.auth._api_key_metadata = {}
+        try:
+            assert get_api_key_metadata("any_key") is None
+        finally:
+            app.core.auth._api_key_metadata = original_metadata

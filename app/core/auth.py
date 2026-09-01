@@ -3,144 +3,191 @@ Authentication utilities for API key validation.
 
 This module provides functions and dependencies for validating API keys
 in incoming requests.
+
+Configuration comes from a single source: ``app.core.config.Settings``.
+There used to be a second ``AuthSettings`` class here plus a raw
+``os.getenv("API_KEY")`` lookup; between them the documented ``API_KEY``
+variable was never actually loaded from ``.env`` (pydantic-settings reads the
+file itself and does not export values into ``os.environ``), so every
+authenticated request failed. Read keys from ``get_settings()`` only.
 """
 from fastapi import Security, HTTPException, status, Depends, Request
 from fastapi.security.api_key import APIKeyHeader
-from typing import List, Optional, Dict, Set
-import os
-from pydantic_settings import BaseSettings
+from typing import Optional, Dict, Set
 
-# Create API Key header schema
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
+from app.core.config import Settings, get_settings
 
-class AuthSettings(BaseSettings):
-    """Settings for authentication."""
-    API_KEYS: List[str] = []
-    ENABLE_API_KEY_AUTH: bool = True
-    
-    model_config = {
-        "env_file": ".env",
-        "case_sensitive": False,
-        "extra": "ignore"
-    }
+# Create API Key header schema.
+#
+# auto_error MUST be False. With auto_error=True FastAPI rejects a request that
+# carries no X-API-Key header before this module's code runs at all -- which
+# means the ENABLE_API_KEY_AUTH=false branch below could never be reached, and
+# "auth disabled" inverted into "auth required, and any non-empty key passes".
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-# Global settings instance
-auth_settings = AuthSettings()
-
-# Convert API_KEYS list to a set for faster lookups
+# Set of accepted API keys, derived from Settings. A set for O(1) lookups.
 _api_keys_set: Set[str] = set()
 
 # API key to metadata mapping (for future use)
 _api_key_metadata: Dict[str, Dict] = {}
 
-def initialize_api_keys():
-    """
-    Initialize the API keys from environment variables.
-    
-    This function reads API keys from:
-    1. The API_KEYS environment variable (comma-separated list)
-    2. The API_KEY environment variable (single key, for backward compatibility)
-    
-    It populates the _api_keys_set for fast validation.
-    """
-    global _api_keys_set, _api_key_metadata
-    
-    # Clear existing keys
-    _api_keys_set = set()
-    _api_key_metadata = {}
-    
-    # Get API keys from environment
-    api_keys = auth_settings.API_KEYS
-    
-    # For backward compatibility, also check for API_KEY
-    single_api_key = os.getenv("API_KEY")
-    if single_api_key and single_api_key not in api_keys:
-        api_keys.append(single_api_key)
-    
-    # Add keys to the set
-    for key in api_keys:
-        if key and key.strip():
-            _api_keys_set.add(key.strip())
-            _api_key_metadata[key.strip()] = {"source": "environment"}
-    
-    # If no keys are configured, add a warning
-    if not _api_keys_set and auth_settings.ENABLE_API_KEY_AUTH:
-        print("WARNING: No API keys configured. API key authentication is enabled but will reject all requests.")
+# The Settings instance _api_keys_set was last derived from. Used to detect
+# that settings were reloaded (get_settings.cache_clear()) so the key set is
+# refreshed instead of serving a stale snapshot taken at import time.
+_keys_loaded_from: Optional[Settings] = None
 
-# Initialize API keys on module import
+
+def initialize_api_keys(settings: Optional[Settings] = None) -> Set[str]:
+    """
+    (Re)build the set of accepted API keys from application settings.
+
+    Keys are read from:
+    1. ``API_KEYS`` -- comma-separated or JSON list.
+    2. ``API_KEY`` -- a single key, the form documented in the README.
+
+    Args:
+        settings: Settings to read from. Defaults to ``get_settings()``.
+
+    Returns:
+        Set[str]: The set of accepted API keys.
+    """
+    global _api_keys_set, _api_key_metadata, _keys_loaded_from
+
+    settings = settings if settings is not None else get_settings()
+
+    keys: Set[str] = set()
+    metadata: Dict[str, Dict] = {}
+
+    candidates = list(settings.API_KEYS or [])
+    if settings.API_KEY:
+        candidates.append(settings.API_KEY)
+
+    for key in candidates:
+        if key and str(key).strip():
+            stripped = str(key).strip()
+            keys.add(stripped)
+            metadata[stripped] = {"source": "settings"}
+
+    _api_keys_set = keys
+    _api_key_metadata = metadata
+    _keys_loaded_from = settings
+
+    if not _api_keys_set and settings.ENABLE_API_KEY_AUTH:
+        print(
+            "WARNING: No API keys configured. API key authentication is "
+            "enabled but will reject all requests."
+        )
+
+    return _api_keys_set
+
+
+def _current_settings() -> Settings:
+    """
+    Return the active settings, refreshing the key set if they were reloaded.
+
+    Returns:
+        Settings: The current application settings.
+    """
+    settings = get_settings()
+    if _keys_loaded_from is not settings:
+        initialize_api_keys(settings)
+    return settings
+
+
+# Initialize API keys on module import.
 initialize_api_keys()
 
-def validate_api_key(api_key: str) -> bool:
+
+def validate_api_key(api_key: Optional[str]) -> bool:
     """
     Validate if the provided API key is valid.
-    
+
     Args:
         api_key: The API key to validate
-        
+
     Returns:
         bool: True if the API key is valid, False otherwise
     """
+    if not api_key:
+        return False
     return api_key in _api_keys_set
+
 
 def get_api_key_metadata(api_key: str) -> Optional[Dict]:
     """
     Get metadata for an API key.
-    
+
     Args:
         api_key: The API key to get metadata for
-        
+
     Returns:
         Optional[Dict]: Metadata for the API key, or None if the key is invalid
     """
     return _api_key_metadata.get(api_key)
 
-async def get_api_key(api_key_header: str = Security(api_key_header)) -> str:
+
+async def get_api_key(api_key_header: Optional[str] = Security(api_key_header)) -> str:
     """
     Validate API key from request header.
-    
+
     This function is kept for backward compatibility.
-    
+
     Args:
-        api_key_header: The API key from the request header
-        
+        api_key_header: The API key from the request header, or None if absent
+
     Returns:
         str: The validated API key
-        
+
     Raises:
-        HTTPException: If the API key is invalid or authentication is not configured
+        HTTPException: If the API key is missing, invalid, or unconfigured
     """
     return await authenticate_api_key(api_key_header)
 
+
 async def authenticate_api_key(
-    api_key_header: str = Security(api_key_header),
+    api_key_header: Optional[str] = Security(api_key_header),
     request: Optional[Request] = None
 ) -> str:
     """
     Validate API key from request header.
-    
+
     This function can be used as a dependency in FastAPI routes.
-    
+
     Args:
-        api_key_header: The API key from the request header
+        api_key_header: The API key from the request header, or None if the
+            header was not sent
         request: Optional request object for future use (e.g., rate limiting)
-        
+
     Returns:
         str: The validated API key
-        
+
     Raises:
-        HTTPException: If the API key is invalid or authentication is not configured
+        HTTPException: 401 if the key is missing or invalid; 500 if key
+            authentication is enabled but no keys are configured.
     """
-    # Skip validation if API key authentication is disabled
-    if not auth_settings.ENABLE_API_KEY_AUTH:
+    settings = _current_settings()
+
+    # Authentication explicitly disabled: allow the request through with no
+    # header at all. Reachable only because api_key_header uses
+    # auto_error=False.
+    if not settings.ENABLE_API_KEY_AUTH:
         return "authentication-disabled"
-    
-    # Check if any API keys are configured
+
+    # No header sent (or sent empty) -> unauthenticated, not a server error.
+    if not api_key_header:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing API key. Provide it in the X-API-Key header.",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+
+    # Fail closed: auth is on but nothing was configured to accept.
     if not _api_keys_set:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="API key authentication is enabled but no API keys are configured."
         )
-    
+
     # Validate the API key
     if not validate_api_key(api_key_header):
         raise HTTPException(
@@ -148,21 +195,22 @@ async def authenticate_api_key(
             detail="Invalid API key provided.",
             headers={"WWW-Authenticate": "ApiKey"},
         )
-    
+
     return api_key_header
+
 
 def get_current_api_key(
     api_key: str = Depends(authenticate_api_key)
 ) -> str:
     """
     Get the current API key.
-    
+
     This is a convenience dependency that can be used in routes
     that need access to the current API key.
-    
+
     Args:
         api_key: The API key from authenticate_api_key
-        
+
     Returns:
         str: The current API key
     """
