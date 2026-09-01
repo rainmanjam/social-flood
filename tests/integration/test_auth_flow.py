@@ -83,16 +83,34 @@ class TestApiKeyAuthentication:
     """Integration tests for API key authentication."""
 
     def test_public_endpoints_without_auth(self, auth_client):
-        """Test that public endpoints don't require authentication."""
-        # Health endpoints should be public
+        """Liveness probes stay public; nothing else does.
+
+        /health and /ping exist for load balancers and container health
+        checks, which cannot present a key. /health is liveness ONLY -- it
+        used to return version and environment, which is why /status below is
+        no longer in this list.
+        """
         response = auth_client.get("/health")
         assert response.status_code == 200
 
         response = auth_client.get("/ping")
         assert response.status_code == 200
 
+    def test_status_requires_auth(self, auth_client):
+        """/status discloses the running version and environment.
+
+        This test previously asserted /status was public. That was the bug,
+        not the contract: an unauthenticated caller could read the deployed
+        version and environment, which is a free reconnaissance step toward
+        matching a deployment against known CVEs. It is now key-gated.
+        """
         response = auth_client.get("/status")
-        assert response.status_code == 200
+        assert response.status_code == 401
+
+        response = auth_client.get(
+            "/status", headers={"X-API-Key": "valid-test-key-123"}
+        )
+        assert response.status_code == 200, response.text
 
     def test_docs_endpoints_without_auth(self, auth_client):
         """Test that documentation endpoints don't require authentication."""
