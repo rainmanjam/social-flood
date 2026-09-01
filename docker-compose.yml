@@ -11,6 +11,14 @@ services:
     build: .
     container_name: social_flood_app
     env_file: .env
+    environment:
+      # `environment:` overrides `env_file:`, so container-only hostnames live
+      # HERE rather than in .env.example. Putting `redis:6379` in the example
+      # file made `cp .env.example .env && uvicorn main:app` return 503 on
+      # every request: the hostname only resolves inside this compose network,
+      # and the rate limiter correctly fails closed when its backend is
+      # unreachable. The example file now stays runnable standalone.
+      REDIS_URL: "redis://:${REDIS_PASSWORD:-changeme}@redis:6379"
     ports:
       - "8000:8000"
     depends_on:
