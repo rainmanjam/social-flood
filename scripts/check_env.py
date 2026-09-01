@@ -57,7 +57,7 @@ def check_env_variables():
         "REDIS_URL",
         "DATABASE_URL",
         "ENABLE_PROXY",
-        "PROXY_URL",
+        "PROXY_URLS",
         "CORS_ORIGINS",
         "SECRET_KEY",
     ]
@@ -95,8 +95,8 @@ def check_env_variables():
             print_success(f"API variable {var} is set")
     
     # Check proxy configuration
-    if os.environ.get("ENABLE_PROXY") == "True" and not os.environ.get("PROXY_URL"):
-        print_error("Proxy is enabled but PROXY_URL is not set")
+    if os.environ.get("ENABLE_PROXY", "").lower() == "true" and not os.environ.get("PROXY_URLS"):
+        print_error("Proxy is enabled but PROXY_URLS is not set")
     
     return {
         "missing_required": missing_required,
@@ -141,8 +141,8 @@ def check_network():
         print_error("Internet connection is not available")
     
     # Check proxy if enabled
-    if os.environ.get("ENABLE_PROXY") == "True" and os.environ.get("PROXY_URL"):
-        proxy_url = os.environ.get("PROXY_URL")
+    if os.environ.get("ENABLE_PROXY", "").lower() == "true" and os.environ.get("PROXY_URLS"):
+        proxy_url = os.environ.get("PROXY_URLS", "").split(",")[0].strip()
         try:
             # Parse proxy URL
             parsed = urlparse(proxy_url)

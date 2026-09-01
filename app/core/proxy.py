@@ -1,85 +1,205 @@
 # app/core/proxy.py
+"""
+Outbound proxy selection.
 
-import os
-import re
-import itertools
+This module previously read its configuration with ``os.getenv`` at import
+time:
+
+    PROXY_URLS = os.getenv('PROXY_URLS', '')
+    ENABLE_PROXY = os.getenv('ENABLE_PROXY', 'false').lower() == 'true'
+
+pydantic-settings loads ``.env`` into the ``Settings`` object; it does **not**
+export those values into ``os.environ``. So for a bare ``uvicorn main:app``
+run -- the documented local workflow -- both names were always empty and
+proxying was silently off. It appeared to work only under Docker and
+docker-compose, which put the variables into the real environment.
+
+That is the same defect as the API-key bug (auth read keys via ``os.getenv``
+and never saw them), and it fails the same way: quietly, with every request
+going out un-proxied while the configuration says otherwise.
+
+Configuration is now read from ``Settings`` and re-read on each call, so a
+settings reload takes effect. ``Settings`` declares both ``PROXY_URLS``
+(comma-separated, what this module has always parsed) and a legacy singular
+``PROXY_URL``; both are accepted and merged, since the README documented the
+singular form for a long time.
+"""
+
 import asyncio
+import itertools
 import logging
+import re
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger("uvicorn")
 
-PROXY_URLS = os.getenv('PROXY_URLS', '')
-ENABLE_PROXY = os.getenv('ENABLE_PROXY', 'false').lower() == 'true'
+__all__ = [
+    "get_proxy",
+    "get_proxy_sync",
+    "rotate_proxy",
+    "is_proxy_enabled",
+    "get_available_proxies",
+]
 
-def is_valid_url(url):
-    return re.match(r'^(http|https):\/\/[^\s\/$.?#].[^\s]*$', url) is not None
-
-# Parse the PROXY_URLS into a list
-PROXY_LIST = [url.strip() for url in PROXY_URLS.split(',') if is_valid_url(url.strip())]
-
-# Use an asyncio.Lock for async thread safety
 _proxy_lock = asyncio.Lock()
 
-def get_available_proxies():
-    return PROXY_LIST
+# Round-robin cursor, rebuilt whenever the resolved proxy list changes so that
+# a settings reload does not keep cycling a stale list.
+_proxy_iter: Optional[itertools.cycle] = None
+_proxy_iter_source: Tuple[str, ...] = ()
 
-AVAILABLE_PROXIES = get_available_proxies()
 
-_proxy_iter = itertools.cycle(AVAILABLE_PROXIES) if AVAILABLE_PROXIES else None
+def is_valid_url(url: str) -> bool:
+    return re.match(r'^(http|https):\/\/[^\s\/$.?#].[^\s]*$', url) is not None
 
-async def get_proxy():
+
+def _load_proxy_config() -> Tuple[bool, List[str]]:
+    """Read proxy configuration from Settings.
+
+    Returns:
+        ``(enabled, proxy_urls)``. On any settings failure this returns
+        ``(False, [])`` -- proxying off -- rather than raising, so a
+        configuration problem degrades to direct connections instead of
+        breaking every request path that imports this module.
     """
-    Returns a single proxy URL string, or None if proxying is disabled or no valid URLs exist.
-    Example return: 'http://localhost:8030'
-    """
-    if ENABLE_PROXY:
-        if _proxy_iter is not None:
-            async with _proxy_lock:
-                # Since _proxy_iter is not None, PROXY_LIST was not empty, so next() is safe.
-                proxy_url = next(_proxy_iter)
-            logger.debug(f"Selected proxy: {proxy_url}")
-            return proxy_url
+    try:
+        from app.core.config import get_settings
+
+        settings = get_settings()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Could not load settings for proxy configuration: %s", exc)
+        return False, []
+
+    enabled = bool(getattr(settings, "ENABLE_PROXY", False))
+
+    raw_values: List[str] = []
+    for attr in ("PROXY_URLS", "PROXY_URL"):
+        value = getattr(settings, attr, None)
+        if not value:
+            continue
+        if isinstance(value, (list, tuple)):
+            raw_values.extend(str(v) for v in value)
         else:
-            # ENABLE_PROXY is true, but _proxy_iter is None (meaning PROXY_LIST was empty)
-            logger.warning("Proxying is enabled, but no valid proxy URLs were found in PROXY_URLS or the list is empty.")
-            return None
-    return None
+            raw_values.extend(str(value).split(","))
+
+    urls: List[str] = []
+    for candidate in raw_values:
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        if not is_valid_url(candidate):
+            logger.warning("Ignoring malformed proxy URL: %r", candidate)
+            continue
+        if candidate not in urls:  # preserve order, drop duplicates
+            urls.append(candidate)
+
+    return enabled, urls
 
 
-def get_proxy_sync():
+def _next_proxy(urls: List[str]) -> Optional[str]:
+    """Advance the round-robin cursor, rebuilding it if the list changed."""
+    global _proxy_iter, _proxy_iter_source
+
+    key = tuple(urls)
+    if not key:
+        _proxy_iter, _proxy_iter_source = None, ()
+        return None
+
+    if _proxy_iter is None or _proxy_iter_source != key:
+        _proxy_iter = itertools.cycle(urls)
+        _proxy_iter_source = key
+
+    return next(_proxy_iter)
+
+
+def is_proxy_enabled() -> bool:
+    """True when proxying is enabled AND at least one valid proxy is configured.
+
+    Prefer this over the legacy ``ENABLE_PROXY`` module attribute: callers that
+    do ``from app.core.proxy import ENABLE_PROXY`` capture a snapshot taken at
+    their own import time, which cannot reflect a later settings reload.
     """
-    Synchronous version of get_proxy.
-    Returns a single proxy URL string, or None if proxying is disabled or no valid URLs exist.
+    enabled, urls = _load_proxy_config()
+    return enabled and bool(urls)
 
-    Note: This version does not use locking and should only be used in synchronous contexts
-    where thread-safety is handled externally or not required.
+
+def get_available_proxies() -> List[str]:
+    """Return the currently configured, valid proxy URLs."""
+    return _load_proxy_config()[1]
+
+
+def _warn_enabled_but_empty() -> None:
+    logger.warning(
+        "Proxying is enabled but no valid proxy URLs are configured "
+        "(check PROXY_URLS). Requests will go out un-proxied."
+    )
+
+
+async def get_proxy() -> Optional[str]:
+    """Return the next proxy URL, or None if proxying is off or unconfigured.
+
+    Example return: ``'http://localhost:8030'``
     """
-    if ENABLE_PROXY:
-        if PROXY_LIST:
-            # Return first proxy for sync contexts (no round-robin to avoid race conditions)
-            proxy_url = PROXY_LIST[0]
-            logger.debug(f"Selected proxy (sync): {proxy_url}")
-            return proxy_url
-        else:
-            logger.warning("Proxying is enabled, but no valid proxy URLs were found in PROXY_URLS or the list is empty.")
-            return None
-    return None
+    enabled, urls = _load_proxy_config()
+    if not enabled:
+        return None
+    if not urls:
+        _warn_enabled_but_empty()
+        return None
+
+    async with _proxy_lock:
+        proxy_url = _next_proxy(urls)
+    logger.debug("Selected proxy: %s", proxy_url)
+    return proxy_url
 
 
-def rotate_proxy():
+def get_proxy_sync() -> Optional[str]:
+    """Synchronous variant of :func:`get_proxy`.
+
+    Returns the first configured proxy rather than advancing the shared
+    round-robin cursor, because this is called from synchronous contexts
+    without the async lock held.
     """
-    Rotate to the next proxy in the list.
-    Returns the next proxy URL string, or None if proxying is disabled or no valid URLs exist.
+    enabled, urls = _load_proxy_config()
+    if not enabled:
+        return None
+    if not urls:
+        _warn_enabled_but_empty()
+        return None
 
-    This is a synchronous function used to get a different proxy when the current one fails.
+    logger.debug("Selected proxy (sync): %s", urls[0])
+    return urls[0]
+
+
+def rotate_proxy() -> Optional[str]:
+    """Advance to the next proxy, for use when the current one fails."""
+    enabled, urls = _load_proxy_config()
+    if not enabled:
+        return None
+    if not urls:
+        _warn_enabled_but_empty()
+        return None
+
+    proxy_url = _next_proxy(urls)
+    logger.debug("Rotated to proxy: %s", proxy_url)
+    return proxy_url
+
+
+def __getattr__(name: str):
+    """Resolve legacy module-level constants from Settings on access (PEP 562).
+
+    Several modules do ``from app.core.proxy import ENABLE_PROXY``. Defining
+    these lazily rather than as import-time literals means such an import at
+    least reads the real configuration, instead of the ``os.getenv`` default
+    that was always empty under a bare uvicorn run.
+
+    The value is still a snapshot at the importer's import time, so new code
+    should call :func:`is_proxy_enabled` or :func:`get_available_proxies`.
     """
-    if ENABLE_PROXY:
-        if _proxy_iter is not None and PROXY_LIST:
-            # Advance to next proxy in the cycle
-            proxy_url = next(_proxy_iter)
-            logger.debug(f"Rotated to proxy: {proxy_url}")
-            return proxy_url
-        else:
-            logger.warning("Proxying is enabled, but no valid proxy URLs were found in PROXY_URLS or the list is empty.")
-            return None
-    return None
+    if name == "ENABLE_PROXY":
+        return _load_proxy_config()[0]
+    if name in ("PROXY_LIST", "AVAILABLE_PROXIES"):
+        return _load_proxy_config()[1]
+    if name == "PROXY_URLS":
+        return ",".join(_load_proxy_config()[1])
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
