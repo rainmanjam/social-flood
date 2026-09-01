@@ -30,7 +30,6 @@ Extended Features:
 - Place Monitoring: Track changes over time
 - Webhooks: Job completion notifications
 - Directions: Route planning between locations
-- Street View: Street-level imagery URLs
 - Menu Extraction: Structured menu data
 - Batch Geocoding: Address to coordinates
 """
@@ -38,23 +37,156 @@ import logging
 import csv
 import io
 import json
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any, Union, Callable
 from datetime import datetime
 from enum import Enum
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Path, BackgroundTasks, Response
-from fastapi.responses import StreamingResponse
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    Path,
+    BackgroundTasks,
+    Request,
+    Response,
+)
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field, validator
 
 from app.core.auth import get_api_key
 from app.core.rate_limiter import rate_limit
 from app.core.cache_manager import generate_cache_key, get_cached_or_fetch
+from app.core.url_guard import MAPS_ALLOWED_HOSTS, UrlNotAllowed, validate_outbound_url
 from app.services.google_maps_service import google_maps_service
+from app.services.record_store import owner_id_for_api_key
 
 logger = logging.getLogger(__name__)
 
+
+# ============================================================================
+# Error responses
+# ============================================================================
+#
+# Two rules govern everything this router puts in an error body:
+#
+# 1. A caller-supplied URL that fails validation always produces the SAME
+#    bytes, whatever the cause. "host not allowed", "scheme not permitted",
+#    "resolves to a private address" and "DNS failed" are all
+#    ``URL_REJECTED_DETAIL``. Distinguishable rejections turn this endpoint
+#    into an internal port scanner: the attacker learns which hosts exist and
+#    which ports answer purely from which error comes back. That is exactly
+#    how the sibling News endpoint behaved before it was fixed.
+#
+# 2. An unexpected server-side exception never has ``str(exc)`` returned to the
+#    caller. Playwright, Redis and DNS exception strings carry internal host
+#    names, file paths and container addresses. The detail is logged; the
+#    caller gets a fixed sentence.
+
+URL_REJECTED_DETAIL = "The supplied URL is not permitted."
+
+# Private sentinel. The Pydantic validator cannot itself choose the HTTP
+# response, so it raises a ValueError carrying this marker and
+# ``SafeUrlValidationRoute`` below converts the resulting 422 into the fixed
+# 400. The marker never reaches a caller.
+_URL_REJECTED_MARKER = "__google_maps_url_rejected__"
+
+INTERNAL_ERROR_DETAIL = "The request could not be completed."
+
+
+def places_from_result(result: Dict[str, Any], context: str) -> List[Dict[str, Any]]:
+    """Extract the place list from a service result, or fail loudly.
+
+    The previous code did ``places = [] if not isinstance(raw, list)``, which
+    turned a malformed or partially-failed upstream payload into a 200 with
+    ``"success": true`` and zero results -- indistinguishable, to the caller,
+    from a search that genuinely found nothing. A shape we do not recognise is
+    a bug or an upstream failure, so it is logged and returned as a 500.
+
+    Args:
+        result: The raw service response.
+        context: Short description used in the log line.
+
+    Returns:
+        Processed place dictionaries.
+
+    Raises:
+        HTTPException: 500, if the payload is not a list.
+    """
+    raw_places = result.get("results") or result.get("data") or result.get("places") or []
+    if not isinstance(raw_places, list):
+        logger.error(
+            "%s: expected a list of places, got %s", context, type(raw_places).__name__
+        )
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
+    return google_maps_service.process_place_data(raw_places)
+
+
+def validate_maps_url(value: Optional[str]) -> Optional[str]:
+    """Return ``value`` normalised, or raise if it is not a fetchable Maps URL.
+
+    Shared by every request model with a caller-supplied URL that ends up in
+    Playwright's ``page.goto()``. Only the generic marker is raised:
+    ``UrlNotAllowed.reason`` names the host and the precise cause and goes to
+    the log alone, because returning it would tell the caller whether an
+    internal name resolves and whether a port answers.
+
+    Args:
+        value: The untrusted URL, or None.
+
+    Returns:
+        The normalised URL, or ``value`` unchanged when it is empty.
+
+    Raises:
+        ValueError: carrying ``_URL_REJECTED_MARKER`` and nothing else.
+    """
+    if value is None or not str(value).strip():
+        return value
+    try:
+        validated = validate_outbound_url(value, allowed_hosts=MAPS_ALLOWED_HOSTS)
+    except UrlNotAllowed as exc:
+        logger.warning("Rejected caller-supplied Maps URL: %s", exc.reason)
+        raise ValueError(_URL_REJECTED_MARKER) from None
+    return validated.url
+
+
+class SafeUrlValidationRoute(APIRoute):
+    """Collapse caller-supplied-URL rejections into one fixed response.
+
+    FastAPI's default 422 body echoes the offending ``input`` back and varies
+    its ``msg`` per failure. Both are unacceptable for a URL the caller chose:
+    the echo repeats the target host and the varying message is an oracle.
+    This route class intercepts only validation errors that carry
+    ``_URL_REJECTED_MARKER`` and answers them with a constant 400. Every other
+    validation error is re-raised untouched, so ordinary request validation
+    keeps its normal, useful 422.
+    """
+
+    def get_route_handler(self) -> Callable:
+        original_route_handler = super().get_route_handler()
+
+        async def safe_route_handler(request: Request) -> Response:
+            try:
+                return await original_route_handler(request)
+            except RequestValidationError as exc:
+                if any(
+                    _URL_REJECTED_MARKER in str(error.get("msg", ""))
+                    for error in exc.errors()
+                ):
+                    return JSONResponse(
+                        status_code=400, content={"detail": URL_REJECTED_DETAIL}
+                    )
+                raise
+
+        return safe_route_handler
+
+
 # Create router
-google_maps_router = APIRouter(tags=["Google Maps API"])
+google_maps_router = APIRouter(
+    tags=["Google Maps API"], route_class=SafeUrlValidationRoute
+)
 
 
 # Pydantic models for request/response
@@ -300,15 +432,21 @@ class NearbySearchRequest(BaseModel):
 
 
 class PlaceLookupRequest(BaseModel):
-    """Request model for place lookup by URL or ID."""
+    """Request model for place lookup by URL or ID.
+
+    ``url`` is fed to Playwright's ``page.goto()`` inside the container
+    network and the resulting DOM is returned to the caller, so an
+    unconstrained string here is a server-side request forgery primitive.
+    It is validated against the Google Maps host allow-list before the model
+    will construct.
+    """
     url: Optional[str] = Field(None, description="Google Maps URL", examples=["https://www.google.com/maps/place/..."])
     place_id: Optional[str] = Field(None, description="Google Place ID (CID)", examples=["0x89c259af18b60947:0x8c5e3c1d36e36e0a"])
 
-    @validator('url', 'place_id')
-    def at_least_one_required(cls, v, values):
-        if not v and not values.get('url') and not values.get('place_id'):
-            pass  # Validation will happen at endpoint level
-        return v
+    @validator('url')
+    def url_must_be_an_allowed_google_maps_url(cls, v):
+        """Reject any URL that is not a Google Maps URL we may fetch."""
+        return validate_maps_url(v)
 
 
 class BulkSearchRequest(BaseModel):
@@ -367,6 +505,17 @@ class MonitorRequest(BaseModel):
         ["rating", "review_count", "hours"],
         description="Fields to track for changes"
     )
+
+    @validator('url')
+    def url_must_be_an_allowed_google_maps_url(cls, v):
+        """Same sink as ``PlaceLookupRequest.url``.
+
+        A monitor re-fetches this URL on a schedule, so an unguarded value is a
+        *repeating* SSRF. ``webhook_url`` is deliberately not validated here --
+        it is an outbound callback to a customer-chosen host and needs its own
+        policy, not the Maps allow-list.
+        """
+        return validate_maps_url(v)
 
 
 class WebhookRequest(BaseModel):
@@ -541,9 +690,13 @@ class WebhookStatus(BaseModel):
     summary="Check Google Maps scraper health",
     response_description="Health status of the Google Maps scraper service"
 )
-async def check_health():
+async def check_health(rate_limit_check: None = Depends(rate_limit)):
     """
     Check if the Google Maps scraper service is healthy and responding.
+
+    Rate limited like every other route: this call reaches into the scraper
+    service, so an unmetered health probe is a free way to keep a browser
+    busy.
 
     Uses native Playwright browser automation for scraping.
     Returns the health status, mode (native-playwright), and any error information.
@@ -623,11 +776,15 @@ async def search_places(
             detail="Google Maps scraper service is unavailable"
         )
 
+    # Stamped on the job so that only this caller can later read or delete it.
+    owner = owner_id_for_api_key(api_key)
+
     try:
         if wait_for_results:
             # Synchronous search - wait for results
             result = await google_maps_service.search_and_wait(
                 query=request.query,
+                owner=owner,
                 language=request.language,
                 max_results=request.max_results,
                 depth=request.depth,
@@ -644,11 +801,7 @@ async def search_places(
                 )
 
             # Process the results
-            raw_places = result.get("results") or result.get("data") or result.get("places") or []
-            if isinstance(raw_places, list):
-                places = google_maps_service.process_place_data(raw_places)
-            else:
-                places = []
+            places = places_from_result(result, "search")
 
             return {
                 "success": True,
@@ -662,6 +815,7 @@ async def search_places(
             # Async search - return job ID immediately
             job_result = await google_maps_service.create_search_job(
                 query=request.query,
+                owner=owner,
                 language=request.language,
                 max_results=request.max_results,
                 depth=request.depth,
@@ -689,7 +843,7 @@ async def search_places(
         raise
     except Exception as e:
         logger.error(f"Search error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @google_maps_router.get(
@@ -744,6 +898,14 @@ async def search_places_get(
 # ============================================================================
 # Job Management Endpoints
 # ============================================================================
+#
+# Every job route derives an owner id from the caller's API key and passes it
+# to the store, which keys records by ``(namespace, owner, id)``. A caller
+# therefore cannot address another caller's job at all -- a cross-owner get is
+# indistinguishable from a job that does not exist, and comes back 404.
+#
+# 404 is deliberate. A 403 would confirm the id exists, which is enough to
+# enumerate other owners' job ids one guess at a time.
 
 @google_maps_router.get(
     "/jobs",
@@ -757,14 +919,16 @@ async def list_jobs(
     ),
     limit: int = Query(50, ge=1, le=100, description="Maximum jobs to return"),
     offset: int = Query(0, ge=0, description="Pagination offset"),
-    api_key: str = Depends(get_api_key)
+    api_key: str = Depends(get_api_key),
+    rate_limit_check: None = Depends(rate_limit)
 ):
     """
-    List all scraping jobs with optional status filtering.
+    List the calling API key's scraping jobs, with optional status filtering.
 
-    Use this to monitor long-running searches or retrieve past results.
+    Only jobs created by this API key are ever returned.
     """
     result = await google_maps_service.list_jobs(
+        owner=owner_id_for_api_key(api_key),
         status=status,
         limit=limit,
         offset=offset
@@ -797,14 +961,17 @@ async def list_jobs(
 )
 async def get_job_status(
     job_id: str = Path(..., description="Job ID to check"),
-    api_key: str = Depends(get_api_key)
+    api_key: str = Depends(get_api_key),
+    rate_limit_check: None = Depends(rate_limit)
 ):
     """
-    Get the status of a specific scraping job.
+    Get the status of one of this API key's scraping jobs.
 
-    Returns progress information and completion status.
+    A job belonging to another caller is reported as not found.
     """
-    result = await google_maps_service.get_job_status(job_id)
+    result = await google_maps_service.get_job_status(
+        job_id, owner=owner_id_for_api_key(api_key)
+    )
 
     if result.get("error"):
         if result.get("status_code") == 404:
@@ -832,10 +999,13 @@ async def get_job_status(
 async def get_job_results(
     job_id: str = Path(..., description="Job ID to get results for"),
     format: str = Query("json", description="Output format (json, csv)"),
-    api_key: str = Depends(get_api_key)
+    api_key: str = Depends(get_api_key),
+    rate_limit_check: None = Depends(rate_limit)
 ):
     """
-    Get the results of a completed scraping job.
+    Get the results of one of this API key's completed scraping jobs.
+
+    A job belonging to another caller is reported as not found.
 
     Returns comprehensive place data including:
     - Basic info (name, address, phone, website)
@@ -846,8 +1016,10 @@ async def get_job_results(
     - Menu, order, and reservation links
     - Related places ("People also search for")
     """
+    owner = owner_id_for_api_key(api_key)
+
     # First check job status
-    status_result = await google_maps_service.get_job_status(job_id)
+    status_result = await google_maps_service.get_job_status(job_id, owner=owner)
 
     if status_result.get("error"):
         if status_result.get("status_code") == 404:
@@ -876,7 +1048,9 @@ async def get_job_results(
         )
 
     # Get results
-    result = await google_maps_service.get_job_results(job_id, format=format)
+    result = await google_maps_service.get_job_results(
+        job_id, owner=owner, format=format
+    )
 
     if result.get("error"):
         raise HTTPException(
@@ -894,11 +1068,7 @@ async def get_job_results(
         }
 
     # Process JSON results
-    raw_places = result.get("results") or result.get("data") or result.get("places") or []
-    if isinstance(raw_places, list):
-        places = google_maps_service.process_place_data(raw_places)
-    else:
-        places = []
+    places = places_from_result(result, f"job {job_id} results")
 
     return {
         "success": True,
@@ -917,14 +1087,18 @@ async def get_job_results(
 )
 async def delete_job(
     job_id: str = Path(..., description="Job ID to delete"),
-    api_key: str = Depends(get_api_key)
+    api_key: str = Depends(get_api_key),
+    rate_limit_check: None = Depends(rate_limit)
 ):
     """
-    Delete a job and its results.
+    Delete one of this API key's jobs and its results.
 
-    Use this to clean up completed or failed jobs.
+    A job belonging to another caller is reported as not found and is not
+    deleted.
     """
-    result = await google_maps_service.delete_job(job_id)
+    result = await google_maps_service.delete_job(
+        job_id, owner=owner_id_for_api_key(api_key)
+    )
 
     if result.get("error"):
         if result.get("status_code") == 404:
@@ -987,7 +1161,7 @@ async def get_place_by_id(
         raise
     except Exception as e:
         logger.error(f"Place lookup error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @google_maps_router.post(
@@ -1037,7 +1211,7 @@ async def lookup_place(
         raise
     except Exception as e:
         logger.error(f"Place lookup error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 # ============================================================================
@@ -1115,7 +1289,7 @@ async def nearby_search(
         raise
     except Exception as e:
         logger.error(f"Nearby search error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @google_maps_router.get(
@@ -1316,7 +1490,7 @@ async def grid_search(
         raise
     except Exception as e:
         logger.error(f"Grid search error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @google_maps_router.post(
@@ -1374,7 +1548,7 @@ async def bounding_box_search(
         raise
     except Exception as e:
         logger.error(f"Bounding box search error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @google_maps_router.post(
@@ -1425,7 +1599,7 @@ async def location_search(
         raise
     except Exception as e:
         logger.error(f"Location search error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @google_maps_router.get(
@@ -1566,7 +1740,7 @@ async def get_place_reviews(
         raise
     except Exception as e:
         logger.error(f"Get reviews error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 # ============================================================================
@@ -1632,7 +1806,7 @@ async def get_place_photos(
         raise
     except Exception as e:
         logger.error(f"Get photos error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 # ============================================================================
@@ -1686,7 +1860,7 @@ async def get_place_qa(
         raise
     except Exception as e:
         logger.error(f"Get Q&A error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 # ============================================================================
@@ -1752,7 +1926,7 @@ async def autocomplete(
         raise
     except Exception as e:
         logger.error(f"Autocomplete error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 # ============================================================================
@@ -1818,7 +1992,7 @@ async def bulk_search(
         raise
     except Exception as e:
         logger.error(f"Bulk search error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 # ============================================================================
@@ -1833,10 +2007,14 @@ async def bulk_search(
 async def export_job_results(
     job_id: str = Path(..., description="Job ID"),
     format: ExportFormat = Query(ExportFormat.JSON, description="Export format"),
-    api_key: str = Depends(get_api_key)
+    api_key: str = Depends(get_api_key),
+    rate_limit_check: None = Depends(rate_limit)
 ):
     """
-    Export job results in various formats.
+    Export one of this API key's job results in various formats.
+
+    A job belonging to another caller is reported as not found: export is a
+    read of job data and is scoped exactly like `/jobs/{job_id}/results`.
 
     **Supported Formats:**
     - `json` - Standard JSON (default)
@@ -1850,7 +2028,9 @@ async def export_job_results(
 
     try:
         # Get job results
-        result = await google_maps_service.get_job_results(job_id)
+        result = await google_maps_service.get_job_results(
+            job_id, owner=owner_id_for_api_key(api_key)
+        )
 
         if result.get("error"):
             if result.get("status_code") == 404:
@@ -1860,11 +2040,7 @@ async def export_job_results(
                 detail=result.get("message", "Failed to get results")
             )
 
-        raw_places = result.get("results") or result.get("data") or result.get("places") or []
-        if isinstance(raw_places, list):
-            places = google_maps_service.process_place_data(raw_places)
-        else:
-            places = []
+        places = places_from_result(result, f"job {job_id} export")
 
         if format == ExportFormat.CSV:
             # Generate CSV
@@ -1928,7 +2104,7 @@ async def export_job_results(
         raise
     except Exception as e:
         logger.error(f"Export error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 # ============================================================================
@@ -1995,7 +2171,7 @@ async def get_review_analytics(
         raise
     except Exception as e:
         logger.error(f"Analytics error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 # ============================================================================
@@ -2067,7 +2243,7 @@ async def analyze_competitors(
         raise
     except Exception as e:
         logger.error(f"Competitor analysis error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 # ============================================================================
@@ -2136,7 +2312,7 @@ async def create_monitor(
         raise
     except Exception as e:
         logger.error(f"Create monitor error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @google_maps_router.get(
@@ -2148,7 +2324,8 @@ async def list_monitors(
     status: Optional[str] = Query(None, description="Filter by status"),
     limit: int = Query(50, ge=1, le=100, description="Maximum monitors"),
     offset: int = Query(0, ge=0, description="Pagination offset"),
-    api_key: str = Depends(get_api_key)
+    api_key: str = Depends(get_api_key),
+    rate_limit_check: None = Depends(rate_limit)
 ):
     """
     List all place monitors.
@@ -2186,7 +2363,7 @@ async def list_monitors(
         raise
     except Exception as e:
         logger.error(f"List monitors error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @google_maps_router.get(
@@ -2197,7 +2374,8 @@ async def list_monitors(
 async def get_monitor(
     monitor_id: str = Path(..., description="Monitor ID"),
     include_history: bool = Query(True, description="Include change history"),
-    api_key: str = Depends(get_api_key)
+    api_key: str = Depends(get_api_key),
+    rate_limit_check: None = Depends(rate_limit)
 ):
     """
     Get details and change history for a specific monitor.
@@ -2227,7 +2405,7 @@ async def get_monitor(
         raise
     except Exception as e:
         logger.error(f"Get monitor error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @google_maps_router.delete(
@@ -2237,7 +2415,8 @@ async def get_monitor(
 )
 async def delete_monitor(
     monitor_id: str = Path(..., description="Monitor ID"),
-    api_key: str = Depends(get_api_key)
+    api_key: str = Depends(get_api_key),
+    rate_limit_check: None = Depends(rate_limit)
 ):
     """
     Delete a place monitor.
@@ -2264,7 +2443,7 @@ async def delete_monitor(
         raise
     except Exception as e:
         logger.error(f"Delete monitor error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 # ============================================================================
@@ -2278,7 +2457,8 @@ async def delete_monitor(
 )
 async def register_webhook(
     request: WebhookRequest,
-    api_key: str = Depends(get_api_key)
+    api_key: str = Depends(get_api_key),
+    rate_limit_check: None = Depends(rate_limit)
 ):
     """
     Register a webhook to receive notifications.
@@ -2325,7 +2505,7 @@ async def register_webhook(
         raise
     except Exception as e:
         logger.error(f"Register webhook error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @google_maps_router.get(
@@ -2334,7 +2514,8 @@ async def register_webhook(
     response_description="Registered webhooks"
 )
 async def list_webhooks(
-    api_key: str = Depends(get_api_key)
+    api_key: str = Depends(get_api_key),
+    rate_limit_check: None = Depends(rate_limit)
 ):
     """
     List all registered webhooks.
@@ -2358,7 +2539,7 @@ async def list_webhooks(
         raise
     except Exception as e:
         logger.error(f"List webhooks error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @google_maps_router.delete(
@@ -2368,7 +2549,8 @@ async def list_webhooks(
 )
 async def delete_webhook(
     webhook_id: str = Path(..., description="Webhook ID"),
-    api_key: str = Depends(get_api_key)
+    api_key: str = Depends(get_api_key),
+    rate_limit_check: None = Depends(rate_limit)
 ):
     """
     Delete a registered webhook.
@@ -2395,7 +2577,7 @@ async def delete_webhook(
         raise
     except Exception as e:
         logger.error(f"Delete webhook error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 # ============================================================================
@@ -2466,7 +2648,7 @@ async def get_directions(
         raise
     except Exception as e:
         logger.error(f"Directions error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @google_maps_router.get(
@@ -2496,66 +2678,6 @@ async def get_directions_get(
         alternatives=alternatives
     )
     return await get_directions(request=request, api_key=api_key, rate_limit_check=rate_limit_check)
-
-
-# ============================================================================
-# Street View Endpoint
-# ============================================================================
-
-@google_maps_router.get(
-    "/place/{place_id}/streetview",
-    summary="Get Street View",
-    response_description="Street View image URLs"
-)
-async def get_streetview(
-    place_id: str = Path(..., description="Place ID"),
-    width: int = Query(640, ge=100, le=2048, description="Image width"),
-    height: int = Query(480, ge=100, le=2048, description="Image height"),
-    heading: Optional[int] = Query(None, ge=0, le=360, description="Camera heading"),
-    pitch: Optional[int] = Query(None, ge=-90, le=90, description="Camera pitch"),
-    api_key: str = Depends(get_api_key),
-    rate_limit_check: None = Depends(rate_limit)
-):
-    """
-    Get Street View image URLs for a place.
-
-    **Parameters:**
-    - `width`, `height` - Image dimensions
-    - `heading` - Camera direction (0-360 degrees, 0=North)
-    - `pitch` - Up/down angle (-90 to 90 degrees)
-
-    Returns URLs to Street View images from available angles.
-    """
-    logger.info(f"Get Street View for place: {place_id}")
-
-    try:
-        result = await google_maps_service.get_streetview(
-            place_id=place_id,
-            width=width,
-            height=height,
-            heading=heading,
-            pitch=pitch
-        )
-
-        if result.get("error"):
-            raise HTTPException(
-                status_code=result.get("status_code", 500),
-                detail=result.get("message", "Failed to get Street View")
-            )
-
-        return {
-            "success": True,
-            "place_id": place_id,
-            "available": result.get("available", False),
-            "images": result.get("images", []),
-            "timestamp": datetime.now().isoformat()
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Street View error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ============================================================================
@@ -2616,7 +2738,7 @@ async def extract_menu(
         raise
     except Exception as e:
         logger.error(f"Menu extraction error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 # ============================================================================
@@ -2678,7 +2800,7 @@ async def batch_geocode(
         raise
     except Exception as e:
         logger.error(f"Geocode error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @google_maps_router.get(
@@ -2766,7 +2888,7 @@ async def get_place_attributes(
         raise
     except Exception as e:
         logger.error(f"Get attributes error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 # ============================================================================
@@ -2827,7 +2949,7 @@ async def get_place_history(
         raise
     except Exception as e:
         logger.error(f"Get history error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 # ============================================================================
@@ -2884,4 +3006,4 @@ async def check_availability(
         raise
     except Exception as e:
         logger.error(f"Check availability error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
