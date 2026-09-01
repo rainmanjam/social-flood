@@ -665,6 +665,24 @@ class TestDeploymentValidation:
         monkeypatch.setenv("WEB_CONCURRENCY", "not-a-number")
         assert get_worker_count() == 1
 
+    @pytest.mark.parametrize("argv", [
+        ["uvicorn", "main:app", "--workers", "4"],
+        ["uvicorn", "main:app", "--workers=4"],
+        ["gunicorn", "-w", "4", "main:app"],
+    ])
+    def test_worker_count_reads_the_command_line(self, monkeypatch, argv):
+        """uvicorn/gunicorn --workers sets no environment variable."""
+        monkeypatch.setattr("sys.argv", argv)
+        assert get_worker_count() == 4
+
+    def test_command_line_workers_trigger_the_startup_refusal(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["uvicorn", "main:app", "--workers", "4"])
+        settings = settings_stub(ENVIRONMENT="production", REDIS_URL=None)
+
+        assert requires_shared_store(settings) is True
+        with pytest.raises(RateLimiterConfigurationError):
+            validate_rate_limit_configuration(settings)
+
     def test_production_multi_worker_without_redis_is_refused(self, monkeypatch):
         monkeypatch.setenv("WEB_CONCURRENCY", "4")
         settings = settings_stub(ENVIRONMENT="production", REDIS_URL=None)

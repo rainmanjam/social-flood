@@ -53,6 +53,7 @@ from starlette.types import ASGIApp
 import contextlib
 import hashlib
 import os
+import sys
 import time
 import asyncio
 from typing import Dict, Tuple, Optional, Callable, Any, Union, Set
@@ -131,13 +132,44 @@ def fail_open_enabled() -> bool:
     return _env_flag("RATE_LIMIT_FAIL_OPEN", False)
 
 
+def _worker_count_from_argv(argv: Optional[list] = None) -> int:
+    """
+    Worker count declared on the command line (``--workers N`` / ``-w N``).
+
+    uvicorn and gunicorn both accept the flag directly, in which case no
+    environment variable is set.
+    """
+    argv = list(sys.argv if argv is None else argv)
+    for index, token in enumerate(argv):
+        value = None
+        if token in ("--workers", "-w") and index + 1 < len(argv):
+            value = argv[index + 1]
+        elif token.startswith("--workers="):
+            value = token.split("=", 1)[1]
+        if value is None:
+            continue
+        try:
+            workers = int(value.strip())
+        except (TypeError, ValueError):
+            continue
+        if workers > 0:
+            return workers
+    return 1
+
+
 def get_worker_count() -> int:
     """
     Best-effort worker count for this deployment.
 
     Reads the environment variables uvicorn/gunicorn use to configure worker
-    processes.  Returns 1 when nothing is configured or the value is unusable.
+    processes, and the ``--workers``/``-w`` command line flag.  Returns 1 when
+    nothing is configured or the value is unusable.
+
+    This is best effort: it cannot see horizontal replicas (multiple pods or
+    containers behind a load balancer). Those deployments must configure
+    REDIS_URL; the in-memory store is only ever correct in a single process.
     """
+    counts = [_worker_count_from_argv()]
     for var in WORKER_COUNT_ENV_VARS:
         raw = os.getenv(var)
         if not raw:
@@ -148,8 +180,9 @@ def get_worker_count() -> int:
             logger.warning("Ignoring non-numeric %s=%r when checking worker count", var, raw)
             continue
         if workers > 0:
-            return workers
-    return 1
+            counts.append(workers)
+            break
+    return max(counts)
 
 
 def _is_production(settings: Settings) -> bool:
