@@ -9,12 +9,50 @@ from pydantic import ValidationError
 # Assuming your FastAPI app and router are structured to be importable
 # If gnews_router is in app.api.google_news.google_news_api, and you have a main app instance
 # For simplicity, we might need to create a local app instance for testing the router
-from app.api.google_news.google_news_api import gnews_router, transform_article, decode_google_news_url, NewsArticle
+from app.api.google_news import google_news_api
+from app.api.google_news.google_news_api import (
+    gnews_router,
+    transform_article,
+    decode_and_process_articles,
+    decode_google_news_url,
+    is_google_news_redirect,
+    NewsArticle,
+)
+from app.core import cache_manager as cache_manager_module
 
 # Setup a minimal FastAPI app for testing the router
 app = FastAPI()
 app.include_router(gnews_router, prefix="/news")
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def clear_cache():
+    """Give every test a clean process cache.
+
+    Responses here are cached on the request parameters, so without this a
+    test can silently read a value another test put there rather than
+    exercising its own mock.
+    """
+    cache_manager_module._cache_store.clear()
+    yield
+    cache_manager_module._cache_store.clear()
+
+
+@pytest.fixture
+def allow_example_articles(monkeypatch):
+    """Allow-list example.com for /article-details/ without touching DNS.
+
+    ``validate_outbound_url`` resolves the host and checks every address is
+    globally routable; unit tests must not make network calls, so resolution
+    is switched off here. The scheme, host, port and credential checks -- the
+    ones these tests are about -- still run.
+    """
+    monkeypatch.setattr(
+        google_news_api, "ARTICLE_DETAILS_ALLOWED_HOSTS", ("example.com", ".example.com")
+    )
+    monkeypatch.setattr(google_news_api, "ARTICLE_DETAILS_RESOLVE_DNS", False)
+    monkeypatch.setattr(google_news_api, "ARTICLE_DETAILS_ALLOW_HTTP", False)
 
 
 # 1. Test transform_article
@@ -387,7 +425,7 @@ async def test_get_google_news_articles_success(mock_decode_process, mock_get_gn
 # Test /article-details/ endpoint
 @pytest.mark.asyncio
 @patch('app.api.google_news.google_news_api.Article')
-async def test_get_article_details_success(mock_article_class):
+async def test_get_article_details_success(mock_article_class, allow_example_articles):
     # Create a mock article instance
     mock_article = MagicMock()
     mock_article.title = "Test Article Title"
@@ -411,13 +449,18 @@ async def test_get_article_details_success(mock_article_class):
     # Make the Article constructor return our mock
     mock_article_class.return_value = mock_article
 
-    response = client.get("/news/article-details/", params={"url": "http://example.com/article"})
+    # https, and on the allow-list: the only kind of URL this endpoint fetches.
+    response = client.get(
+        "/news/article-details/", params={"url": "https://example.com/article"}
+    )
 
     assert response.status_code == 200
     data = response.json()
     assert "title" in data
     assert "text" in data
     assert data["title"] == "Test Article Title"
+    # The validated, normalised URL is what gets fetched.
+    assert mock_article_class.call_args[0][0] == "https://example.com/article"
 # Test helper functions
 @pytest.mark.asyncio
 @patch('app.api.google_news.google_news_api.cache_manager')
@@ -543,3 +586,311 @@ def test_sort_by_parameter_validation():
         "sort_by": "invalid_sort"
     })
     assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# CRT-3: /article-details/ was a server-side request forgery sink
+#
+# It fetched any URL the caller supplied, from inside the container network,
+# and the 503 body named the target host and the failure cause -- which made
+# it usable as an internal port scanner. These tests pin both halves of the
+# fix: the request is refused, and every refusal looks identical.
+# ---------------------------------------------------------------------------
+
+BLOCKED_URLS = [
+    pytest.param("http://127.0.0.1:8000/admin", id="loopback"),
+    pytest.param("http://169.254.169.254/latest/meta-data/", id="cloud-metadata"),
+    pytest.param("http://[::1]:6379/", id="ipv6-loopback"),
+    pytest.param("http://10.0.0.5:5432/", id="rfc1918"),
+    pytest.param("https://redis.internal:6379/", id="internal-service-name"),
+    pytest.param("file:///etc/passwd", id="file-scheme"),
+    pytest.param("gopher://127.0.0.1:11211/", id="gopher-scheme"),
+    pytest.param("https://example.com@evil.test/", id="credential-smuggling"),
+    pytest.param("https://example.com.evil.test/", id="suffix-confusion"),
+    pytest.param("https://evil.test/article", id="host-not-allow-listed"),
+    pytest.param("https://example.com:8080/article", id="non-standard-port"),
+    pytest.param("http://example.com/article", id="plaintext-http"),
+    pytest.param("/etc/passwd", id="bare-path"),
+    pytest.param("//example.com/article", id="scheme-relative"),
+]
+
+
+@pytest.mark.parametrize("url", BLOCKED_URLS)
+@patch('app.api.google_news.google_news_api.Article')
+def test_article_details_blocks_ssrf_targets(mock_article_class, allow_example_articles, url):
+    """A blocked URL is refused before anything is fetched."""
+    response = client.get("/news/article-details/", params={"url": url})
+
+    assert response.status_code == 400
+    # Nothing was fetched: validation happens before the download.
+    mock_article_class.assert_not_called()
+
+
+@pytest.mark.parametrize("url", BLOCKED_URLS)
+def test_article_details_refusals_are_indistinguishable(allow_example_articles, url):
+    """Every refusal returns the same status and the same body.
+
+    This is the property that removes the port-scan oracle. If "connection
+    refused" read differently from "not on the allow-list", a caller could map
+    the internal network by diffing responses, so the reason is logged and
+    never returned.
+    """
+    response = client.get("/news/article-details/", params={"url": url})
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "The supplied URL is not permitted."}
+
+
+@patch('app.api.google_news.google_news_api.Article')
+def test_article_details_does_not_leak_upstream_failure(mock_article_class, allow_example_articles):
+    """A fetch failure must not describe itself to the caller.
+
+    The old handler returned 503 with the newspaper exception text, which
+    named the host and said why the connection failed.
+    """
+    from newspaper import ArticleException
+
+    mock_article = MagicMock()
+    mock_article.download.side_effect = ArticleException(
+        "Connection refused to 10.0.0.5:6379"
+    )
+    mock_article_class.return_value = mock_article
+
+    response = client.get(
+        "/news/article-details/", params={"url": "https://example.com/article"}
+    )
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "Could not retrieve the requested article."}
+    assert "10.0.0.5" not in response.text
+    assert "refused" not in response.text.lower()
+
+
+def test_article_details_default_allow_list_is_closed():
+    """With no operator configuration, only Google News is reachable.
+
+    An empty allow-list would make ``validate_outbound_url`` refuse
+    everything, and a wildcard one would restore the vulnerability; the
+    default sits deliberately at "the one host this service already talks to".
+    """
+    assert google_news_api.ARTICLE_DETAILS_ALLOWED_HOSTS == (
+        "news.google.com",
+        ".news.google.com",
+    )
+    assert google_news_api.ARTICLE_DETAILS_ALLOW_HTTP is False
+
+
+# ---------------------------------------------------------------------------
+# CRT-9: every Google News endpoint answered 404
+#
+# gnews >= 0.5 resolves article links itself, so article["url"] is usually the
+# publisher's URL. The pipeline required the news.google.com/rss/articles/...
+# form and threw away everything else, emptying the list on every request.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("https://news.google.com/rss/articles/CBMiK2h0", True),
+        ("https://news.google.com/read/CBMiK2h0", True),
+        ("https://NEWS.GOOGLE.COM/rss/articles/CBMiK2h0", True),
+        ("https://www.cnn.com/2026/01/01/politics/story/index.html", False),
+        ("https://news.google.com.evil.test/rss/articles/x", False),
+        ("", False),
+    ],
+)
+def test_is_google_news_redirect(url, expected):
+    """Only genuine Google News redirects need the decode round-trip."""
+    assert is_google_news_redirect(url) is expected
+
+
+@pytest.mark.asyncio
+async def test_pre_resolved_urls_are_kept():
+    """A publisher URL from gnews is used as-is, not discarded.
+
+    Before the fix this returned an empty list -- every article was rejected
+    for not matching the Google News redirect shape -- and the endpoints
+    turned that into 404 on every single request.
+    """
+    raw_articles = [
+        {
+            "title": "Resolved Article",
+            "description": "desc",
+            "published date": "2026-01-01",
+            "url": "https://www.cnn.com/2026/01/01/story/index.html",
+            "publisher": {"title": "CNN"},
+        }
+    ]
+
+    with patch(
+        'app.api.google_news.google_news_api.decode_google_news_url',
+        new_callable=AsyncMock,
+    ) as mock_decode:
+        result = await decode_and_process_articles(raw_articles)
+
+    assert len(result) == 1
+    assert result[0]["url"] == "https://www.cnn.com/2026/01/01/story/index.html"
+    assert result.failed == 0
+    # No decode round-trip for an already-resolved URL.
+    mock_decode.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_redirect_urls_are_still_decoded():
+    """The old redirect form still goes through the decoder."""
+    raw_articles = [
+        {
+            "title": "Redirect Article",
+            "url": "https://news.google.com/rss/articles/CBMiK2h0",
+            "publisher": {"title": "CNN"},
+        }
+    ]
+
+    with patch(
+        'app.api.google_news.google_news_api.decode_google_news_url',
+        new_callable=AsyncMock,
+    ) as mock_decode:
+        mock_decode.return_value = {
+            "status": True,
+            "decoded_url": "https://www.cnn.com/real/story",
+        }
+        result = await decode_and_process_articles(raw_articles)
+
+    assert [article["url"] for article in result] == ["https://www.cnn.com/real/story"]
+    assert result.failed == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_articles_are_counted_not_silently_dropped():
+    """Articles lost to a decode failure are counted, not quietly forgotten."""
+    raw_articles = [
+        {"title": "Good", "url": "https://www.cnn.com/story"},
+        {"title": "Bad", "url": "https://news.google.com/rss/articles/xyz"},
+        {"title": "No URL"},
+    ]
+
+    with patch(
+        'app.api.google_news.google_news_api.decode_google_news_url',
+        new_callable=AsyncMock,
+    ) as mock_decode:
+        mock_decode.return_value = {"status": False, "message": "boom"}
+        result = await decode_and_process_articles(raw_articles)
+
+    assert len(result) == 1
+    assert result.failed == 2
+    assert result.partial is True
+
+
+@pytest.mark.asyncio
+async def test_domain_filtering_is_not_counted_as_failure():
+    """Filtering an article out on purpose is not a failure."""
+    raw_articles = [
+        {"title": "CNN", "url": "https://www.cnn.com/story"},
+        {"title": "BBC", "url": "https://www.bbc.co.uk/story"},
+    ]
+
+    result = await decode_and_process_articles(raw_articles, filter_by_domain="cnn.com")
+
+    assert len(result) == 1
+    assert result.failed == 0
+    assert result.filtered_out == 1
+    assert result.partial is False
+
+
+def test_partial_results_are_flagged_to_the_caller():
+    """A shortened list must say it is short.
+
+    Silently returning one of two articles looks identical to Google News only
+    having one, which is how a broken parser hides.
+    """
+    from app.api.google_news.google_news_api import ProcessedArticles
+
+    mock_gnews_instance = MagicMock()
+    mock_gnews_instance.get_top_news.return_value = [{"title": "a"}, {"title": "b"}]
+
+    survivors = ProcessedArticles(
+        [
+            NewsArticle(
+                title="Top News 1",
+                url="http://decoded.com/news/1",
+                publisher="Pub1",
+                published_date="date1",
+                description="desc1",
+            ).model_dump()
+        ],
+        total=2,
+        failed=1,
+    )
+
+    with patch('app.api.google_news.google_news_api.get_gnews_instance', new_callable=AsyncMock) as mock_get_gnews, \
+         patch('app.api.google_news.google_news_api.decode_and_process_articles', new_callable=AsyncMock) as mock_decode_process:
+        mock_get_gnews.return_value = mock_gnews_instance
+        mock_decode_process.return_value = survivors
+
+        response = client.get("/news/top/")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["partial"] is True
+    assert body["dropped"] == 1
+    assert len(body["articles"]) == 1
+
+
+def test_total_decode_failure_is_502_not_404():
+    """Losing every article to failures is an upstream problem, not "no news".
+
+    404 tells a client "there is nothing here, stop asking". When the truth is
+    "our resolver broke", that is a 502 the client can retry and monitoring
+    can alert on.
+    """
+    from app.api.google_news.google_news_api import ProcessedArticles
+
+    mock_gnews_instance = MagicMock()
+    mock_gnews_instance.get_top_news.return_value = [{"title": "a"}, {"title": "b"}]
+
+    with patch('app.api.google_news.google_news_api.get_gnews_instance', new_callable=AsyncMock) as mock_get_gnews, \
+         patch('app.api.google_news.google_news_api.decode_and_process_articles', new_callable=AsyncMock) as mock_decode_process:
+        mock_get_gnews.return_value = mock_gnews_instance
+        mock_decode_process.return_value = ProcessedArticles([], total=2, failed=2)
+
+        response = client.get("/news/top/")
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "detail": "Could not resolve articles from Google News. Please retry."
+    }
+
+
+def test_failed_news_response_is_not_cached():
+    """A 502 must not be written to the cache."""
+    from app.api.google_news.google_news_api import ProcessedArticles
+
+    mock_gnews_instance = MagicMock()
+    mock_gnews_instance.get_top_news.return_value = [{"title": "a"}]
+
+    with patch('app.api.google_news.google_news_api.get_gnews_instance', new_callable=AsyncMock) as mock_get_gnews, \
+         patch('app.api.google_news.google_news_api.decode_and_process_articles', new_callable=AsyncMock) as mock_decode_process:
+        mock_get_gnews.return_value = mock_gnews_instance
+        mock_decode_process.return_value = ProcessedArticles([], total=1, failed=1)
+
+        assert client.get("/news/top/").status_code == 502
+        assert cache_manager_module._cache_store == {}
+
+        # Upstream recovers: the next request must not be served the failure.
+        mock_decode_process.return_value = ProcessedArticles(
+            [
+                NewsArticle(
+                    title="Top News 1",
+                    url="http://decoded.com/news/1",
+                    publisher="Pub1",
+                    published_date="date1",
+                    description="desc1",
+                ).model_dump()
+            ],
+            total=1,
+            failed=0,
+        )
+        recovered = client.get("/news/top/")
+
+    assert recovered.status_code == 200
+    assert len(recovered.json()["articles"]) == 1

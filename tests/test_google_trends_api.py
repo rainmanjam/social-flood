@@ -20,14 +20,42 @@ from app.api.google_trends.google_trends_api import (
     df_to_json,
     to_jsonable,
     get_trends_instance,
+    BATCH_PERIOD_BY_TIMEFRAME,
     REFERER_LIST,
     USER_AGENT_LIST,
     HumanFriendlyBatchPeriod
 )
+from app.core import cache_manager as cache_manager_module
+
+
+class Unserializable:
+    """An object no JSON encoder can turn into a document.
+
+    ``__slots__`` with no fields means both ``dict(obj)`` and ``vars(obj)``
+    raise, which is what makes ``jsonable_encoder`` give up. A plain empty
+    class would NOT do: ``vars()`` returns ``{}`` and it encodes happily as an
+    empty object, so a test using one proves nothing about error handling.
+    """
+
+    __slots__ = ()
 
 
 class TestGoogleTrendsAPI:
     """Test class for Google Trends API endpoints."""
+
+    @pytest.fixture(autouse=True)
+    def clear_cache(self):
+        """Start every test with an empty process cache.
+
+        These endpoints cache on (endpoint, query parameters), and several
+        tests below use the same parameters, so without this a later test
+        reads the earlier test's cached answer instead of exercising its own
+        mock. That leakage is the same mechanism as the production bug this
+        module was fixed for, just inside the test session.
+        """
+        cache_manager_module._cache_store.clear()
+        yield
+        cache_manager_module._cache_store.clear()
 
     @pytest.fixture
     def client(self):
@@ -400,18 +428,77 @@ class TestGoogleTrendsAPI:
         assert "data" in data
 
     @patch('app.api.google_trends.google_trends_api.get_trends_instance')
-    def test_api_error_handling(self, mock_get_instance, client):
-        """Test API error handling across endpoints."""
+    def test_upstream_failure_returns_502(self, mock_get_instance, client):
+        """An upstream failure must be reported, not disguised as empty data.
+
+        This test previously asserted 200 with a message, i.e. it encoded the
+        bug: a failed Google Trends call was presented to the caller as a
+        successful empty result. An empty 200 that should have been a 502 is
+        indistinguishable from "there is genuinely no data", so clients cannot
+        retry and monitoring sees a healthy endpoint.
+        """
         mock_instance = MagicMock()
         mock_instance.interest_over_time.side_effect = Exception("API Error")
         mock_get_instance.return_value = mock_instance
 
         response = client.get("/api/v1/google-trends/interest-over-time?keywords=python")
 
-        # The API handles exceptions gracefully and returns a message
+        assert response.status_code == 502
+        assert response.json()["detail"] == (
+            "Upstream Google Trends request failed. Please retry."
+        )
+        # The upstream error text must not reach the caller.
+        assert "API Error" not in response.text
+
+    @patch('app.api.google_trends.google_trends_api.get_trends_instance')
+    def test_upstream_failure_is_not_cached(self, mock_get_instance, client):
+        """A failed call must leave the cache untouched.
+
+        The original code answered ``{"data": []}`` with HTTP 200, which
+        ``get_cached_or_fetch`` then stored for the full hour-long TTL: one
+        upstream blip served empty results to every caller until it expired.
+        The recovery here is that the very next request calls upstream again
+        and sees the recovered data.
+        """
+        mock_instance = MagicMock()
+        mock_instance.interest_over_time.side_effect = Exception("API Error")
+        mock_get_instance.return_value = mock_instance
+
+        first = client.get("/api/v1/google-trends/interest-over-time?keywords=python")
+        assert first.status_code == 502
+        assert cache_manager_module._cache_store == {}
+
+        # Upstream recovers; the next request must reflect that immediately.
+        mock_instance.interest_over_time.side_effect = None
+        mock_instance.interest_over_time.return_value = pd.DataFrame({
+            'date': pd.date_range('2023-01-01', periods=2),
+            'python': [50, 55]
+        })
+
+        second = client.get("/api/v1/google-trends/interest-over-time?keywords=python")
+        assert second.status_code == 200
+        assert len(second.json()["data"]) == 2
+
+    @patch('app.api.google_trends.google_trends_api.get_trends_instance')
+    def test_empty_upstream_result_is_cached_as_success(self, mock_get_instance, client):
+        """An empty answer is a real answer, so it may be cached.
+
+        The counterpart to the test above: "Google Trends has no data for this
+        keyword" is a successful 200 and caching it is correct. Only failures
+        must bypass the cache.
+        """
+        mock_instance = MagicMock()
+        mock_instance.interest_over_time.return_value = pd.DataFrame()
+        mock_get_instance.return_value = mock_instance
+
+        response = client.get("/api/v1/google-trends/interest-over-time?keywords=python")
+
         assert response.status_code == 200
-        data = response.json()
-        assert "message" in data
+        assert response.json() == {
+            "data": [],
+            "message": "No data returned from Google Trends.",
+        }
+        assert cache_manager_module._cache_store != {}
 
     @patch('app.api.google_trends.google_trends_api.get_trends_instance')
     def test_caching_behavior(self, mock_get_instance, client):
@@ -451,11 +538,53 @@ class TestGoogleTrendsAPI:
 
     # Test enum values
     def test_human_friendly_batch_period_enum(self):
-        """Test HumanFriendlyBatchPeriod enum values."""
+        """Every member the router references must exist under that name.
+
+        The timeline endpoint returned 500 on every request for as long as it
+        existed because the router said ``HumanFriendlyBatchPeriod.past_4h``
+        while the enum only defined ``PAST_4H``. A plain attribute-access test
+        like this one catches that class of typo the moment it is written.
+        """
         assert HumanFriendlyBatchPeriod.past_4h.value == "past_4h"
         assert HumanFriendlyBatchPeriod.past_24h.value == "past_24h"
         assert HumanFriendlyBatchPeriod.past_48h.value == "past_48h"
         assert HumanFriendlyBatchPeriod.past_7d.value == "past_7d"
+
+    def test_human_friendly_batch_period_uppercase_aliases(self):
+        """The SCREAMING_CASE spellings resolve to the same members."""
+        assert HumanFriendlyBatchPeriod.PAST_4H is HumanFriendlyBatchPeriod.past_4h
+        assert HumanFriendlyBatchPeriod.PAST_24H is HumanFriendlyBatchPeriod.past_24h
+        assert HumanFriendlyBatchPeriod.PAST_48H is HumanFriendlyBatchPeriod.past_48h
+        assert HumanFriendlyBatchPeriod.PAST_7D is HumanFriendlyBatchPeriod.past_7d
+
+    def test_every_batch_period_is_mapped(self):
+        """No enum member may be missing from the trendspy mapping.
+
+        A member the mapping does not cover means a query string FastAPI
+        accepts but the handler cannot serve. The module raises at import if
+        this ever drifts; the assertion states the invariant here too.
+        """
+        assert set(BATCH_PERIOD_BY_TIMEFRAME) == set(HumanFriendlyBatchPeriod)
+
+    @pytest.mark.parametrize(
+        "timeframe", [member.value for member in HumanFriendlyBatchPeriod]
+    )
+    @patch('app.api.google_trends.google_trends_api.get_trends_instance')
+    def test_timeline_accepts_every_timeframe(self, mock_get_instance, client, timeframe):
+        """Each advertised timeframe must actually reach trendspy."""
+        mock_instance = MagicMock()
+        mock_instance.trending_now_showcase_timeline.return_value = {
+            'python': [{'time': '2023-01-01', 'value': 50}]
+        }
+        mock_get_instance.return_value = mock_instance
+
+        response = client.get(
+            "/api/v1/google-trends/trending-now-showcase-timeline"
+            f"?keywords=python&timeframe={timeframe}"
+        )
+
+        assert response.status_code == 200, response.text
+        assert "data" in response.json()
 
     # Test edge cases
     @patch('app.api.google_trends.google_trends_api.get_trends_instance')
@@ -472,18 +601,24 @@ class TestGoogleTrendsAPI:
         assert data["message"] == "No data returned from Google Trends."
 
     @patch('app.api.google_trends.google_trends_api.get_trends_instance')
-    def test_json_conversion_error_handling(self, mock_get_instance, client):
-        """Test handling of JSON conversion errors."""
-        mock_instance = MagicMock()
-        # Return an object that can't be JSON serialized
-        class NonSerializable:
-            pass
+    def test_unserializable_upstream_response_returns_502(self, mock_get_instance, client):
+        """A response we cannot encode is an upstream problem, not empty data.
 
-        mock_instance.interest_over_time.return_value = NonSerializable()
+        Two things changed from the original version of this test. The fixture
+        is now genuinely unencodable (see :class:`Unserializable`); the old one
+        had an empty ``__dict__`` and encoded fine as ``{}``, so the test never
+        reached the error path it claimed to cover. And the expectation is now
+        502 rather than 200-with-a-message: we did not get a usable answer, so
+        saying so beats caching an empty success for an hour.
+        """
+        mock_instance = MagicMock()
+        mock_instance.interest_over_time.return_value = Unserializable()
         mock_get_instance.return_value = mock_instance
 
         response = client.get("/api/v1/google-trends/interest-over-time?keywords=python")
 
-        assert response.status_code == 200
-        data = response.json()
-        assert "message" in data  # The API handles errors gracefully
+        assert response.status_code == 502
+        assert response.json()["detail"] == (
+            "Upstream Google Trends returned an unusable response."
+        )
+        assert cache_manager_module._cache_store == {}

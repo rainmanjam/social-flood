@@ -16,10 +16,13 @@ import re
 from app.core.proxy import get_proxy  # adjust if needed
 import datetime
 from app.core.rate_limiter import rate_limit
-from app.core.cache_manager import cache_manager, generate_cache_key, get_cached_or_fetch
+from app.core.cache_manager import cache_manager
 from app.core.config import get_settings
 from app.core.http_client import get_http_client_manager
 from app.core.constants import USER_AGENTS
+from app.core.url_guard import NEWS_ALLOWED_HOSTS, UrlNotAllowed, validate_outbound_url
+import hashlib
+from typing import Any, Callable, Iterable, Sequence, Tuple
 
 # Initialize NLTK asynchronously at module level
 async def setup_nltk():
@@ -208,6 +211,63 @@ AVAILABLE_COUNTRIES = {
 # Global cache manager instance
 settings = get_settings()
 
+# -----------------------------------------------------------------------------
+# Cache helpers
+#
+# Google News keys live in their own cache namespace so a key here can never
+# collide with one written by another router.
+# -----------------------------------------------------------------------------
+CACHE_NAMESPACE = "gnews"
+
+
+def generate_cache_key(base_key: str, **params) -> str:
+    """Build a deterministic, namespaced cache key.
+
+    Parameters are sorted so that the same request always produces the same
+    key regardless of keyword order, and ``None`` values are dropped so that
+    an unset optional parameter and an absent one share a key.
+    """
+    parts = [CACHE_NAMESPACE, base_key]
+    for name, value in sorted(params.items()):
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple, set)):
+            value = ",".join(str(item) for item in value)
+        parts.append(f"{name}:{value}")
+
+    key = ":".join(parts)
+    # Redis keys are capped; hash the tail rather than truncating, so two long
+    # keys that share a prefix cannot collide.
+    if len(key) > 250:
+        digest = hashlib.sha256(key.encode()).hexdigest()
+        key = f"{CACHE_NAMESPACE}:{base_key}:{digest}"
+    return key
+
+
+async def get_cached_or_fetch(
+    cache_key: str,
+    fetch_func: Callable[[], Any],
+    ttl: Optional[int] = None,
+) -> Any:
+    """Return the cached value for ``cache_key``, or fetch and store it.
+
+    ``fetch_func`` exceptions -- including the ``HTTPException`` raised when
+    Google News gives us nothing usable -- propagate untouched and nothing is
+    written to the cache. Caching a failure as if it were a result is how one
+    upstream blip becomes an hour of wrong answers.
+    """
+    if not getattr(settings, "ENABLE_CACHE", True):
+        return await fetch_func()
+
+    cached = await cache_manager.get(cache_key, namespace=CACHE_NAMESPACE)
+    if cached is not None:
+        logger.debug("Cache hit for %s", cache_key)
+        return cached
+
+    data = await fetch_func()
+    await cache_manager.set(cache_key, data, ttl=ttl, namespace=CACHE_NAMESPACE)
+    return data
+
 
 # Use centralized HTTP client manager for GNews operations
 async def get_gnews_http_client(proxy_url: Optional[str] = None) -> httpx.AsyncClient:
@@ -226,6 +286,29 @@ async def get_gnews_http_client(proxy_url: Optional[str] = None) -> httpx.AsyncC
 # -----------------------------------------------------------------------------
 # Decoding functions
 # -----------------------------------------------------------------------------
+GOOGLE_NEWS_HOSTS = ("news.google.com",)
+
+
+def is_google_news_redirect(url: str) -> bool:
+    """Return True when ``url`` still points at Google News and needs decoding.
+
+    gnews >= 0.5 resolves article links itself when the optional Playwright
+    extra is installed, so ``article["url"]`` is usually already the
+    publisher's URL. When resolution is unavailable or fails, gnews falls back
+    to the original ``news.google.com/rss/articles/...`` link. Both forms
+    therefore reach us, and only the second one needs the decode round-trip.
+    """
+    if not url:
+        return False
+    try:
+        host = (urlparse(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    return any(
+        host == entry or host.endswith(f".{entry}") for entry in GOOGLE_NEWS_HOSTS
+    )
+
+
 async def get_base64_str(source_url):
     """
     Extracts the base64 string from a Google News URL.
@@ -234,7 +317,7 @@ async def get_base64_str(source_url):
         url = urlparse(source_url)
         path = url.path.split("/")
         if (
-            url.hostname == "news.google.com"
+            is_google_news_redirect(source_url)
             and len(path) > 1
             and path[-2] in ["articles", "read", "rss"]
         ):
@@ -428,78 +511,147 @@ async def get_gnews_instance(
 # -----------------------------------------------------------------------------
 # Helper: Decode and Process Articles (Concurrent Version)
 # -----------------------------------------------------------------------------
+class ProcessedArticles(list):
+    """Processed articles plus a count of the ones that could not be produced.
+
+    A plain list cannot distinguish "Google News had nothing to say" from
+    "every article was thrown away because we failed to resolve it", and the
+    old code returned the same empty list for both. Callers use ``failed`` to
+    answer honestly: a 502 when the pipeline broke, ``partial`` when only some
+    articles survived.
+
+    Subclassing ``list`` keeps the value usable anywhere a list was expected,
+    including in tests that patch this function with a plain list -- callers
+    read the counters with ``getattr(..., "failed", 0)``.
+    """
+
+    def __init__(
+        self,
+        articles: Iterable[dict] = (),
+        *,
+        total: int = 0,
+        failed: int = 0,
+        filtered_out: int = 0,
+    ) -> None:
+        super().__init__(articles)
+        self.total = total
+        self.failed = failed
+        self.filtered_out = filtered_out
+
+    @property
+    def partial(self) -> bool:
+        """True when at least one article was lost to a failure."""
+        return self.failed > 0
+
+
 async def decode_and_process_articles(
     raw_articles: List[dict],
     filter_by_domain: Optional[str] = None,
     max_concurrent: int = 10
-) -> List[dict]:
+) -> ProcessedArticles:
     """
-    Decodes Google News URLs for a list of articles and processes them concurrently.
-    Optionally filters articles by a specified domain.
-    
+    Normalise a batch of gnews articles, decoding Google News redirects.
+
+    gnews returns either a resolved publisher URL or -- when its own
+    resolution is unavailable -- the original ``news.google.com`` redirect.
+    Articles of the first kind are used as they are; only the second kind
+    goes through :func:`decode_google_news_url`. Requiring the redirect form
+    is what made every endpoint answer 404: with gnews >= 0.5 no article
+    matched, so the list always emptied.
+
     Args:
         raw_articles: List of raw article dictionaries
         filter_by_domain: Optional domain to filter by
         max_concurrent: Maximum number of concurrent decoding operations
-        
+
     Returns:
-        List of processed articles
+        A :class:`ProcessedArticles` list. ``failed`` counts articles lost to
+        an error (as opposed to ones deliberately filtered out by
+        ``filter_by_domain``), so callers can report a partial result or an
+        upstream failure instead of silently returning fewer articles.
     """
     if not raw_articles:
-        return []
+        return ProcessedArticles()
 
     # Create semaphore to limit concurrent operations
     semaphore = asyncio.Semaphore(max_concurrent)
-    
-    async def decode_single_article(article_data: dict) -> Optional[dict]:
-        """Decode and process a single article with semaphore control."""
-        async with semaphore:
-            if not article_data.get('url'):
-                return None
-            
-            try:
-                # Decode URL
-                decoded_result = await decode_google_news_url(article_data.get('url'))
-                
-                if decoded_result.get("status"):
-                    article_data['url'] = decoded_result["decoded_url"]
-                    transformed_article = transform_article(article_data)
-                    
-                    # Apply domain filtering if specified
-                    if filter_by_domain:
-                        article_domain = urlparse(transformed_article["url"]).netloc.lower().replace('www.', '').strip()
-                        if filter_by_domain not in article_domain:
-                            logger.debug(f"Skipping article '{transformed_article['title']}' as its domain '{article_domain}' does not match '{filter_by_domain}'")
-                            return None
-                    
-                    return transformed_article
-                else:
-                    logger.warning(
-                        f"Could not decode URL for article '{article_data.get('title', 'N/A')}': "
-                        f"{decoded_result.get('message')}"
-                    )
-                    return None
-            except Exception as e:
-                logger.warning(
-                    f"Exception during URL decoding for article '{article_data.get('title', 'N/A')}': {e}"
-                )
-                return None
 
-    # Process all articles concurrently
+    # Outcome markers: distinguishing "dropped on purpose" from "dropped
+    # because something broke" is the whole point of this pass.
+    FILTERED = "filtered"
+    FAILED = "failed"
+
+    async def decode_single_article(article_data: dict):
+        """Resolve and transform a single article with semaphore control."""
+        async with semaphore:
+            source_url = article_data.get("url")
+            if not source_url:
+                logger.warning(
+                    "Article %r has no URL; dropping it",
+                    article_data.get("title", "N/A"),
+                )
+                return FAILED
+
+            if is_google_news_redirect(source_url):
+                decoded_result = await decode_google_news_url(source_url)
+                if not decoded_result.get("status"):
+                    logger.warning(
+                        "Could not decode Google News URL for article %r: %s",
+                        article_data.get("title", "N/A"),
+                        decoded_result.get("message"),
+                    )
+                    return FAILED
+                article_data["url"] = decoded_result["decoded_url"]
+            else:
+                # gnews already resolved this one to the publisher's URL.
+                logger.debug("Article URL already resolved: %s", source_url)
+
+            transformed_article = transform_article(article_data)
+
+            if filter_by_domain:
+                article_domain = (
+                    urlparse(transformed_article["url"])
+                    .netloc.lower()
+                    .replace("www.", "")
+                    .strip()
+                )
+                if filter_by_domain not in article_domain:
+                    logger.debug(
+                        "Skipping article %r: domain %r does not match %r",
+                        transformed_article["title"], article_domain, filter_by_domain,
+                    )
+                    return FILTERED
+
+            return transformed_article
+
     tasks = [decode_single_article(article) for article in raw_articles]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    # Filter out None results and exceptions
-    processed_articles = []
+
+    processed_articles: List[dict] = []
+    failed = 0
+    filtered_out = 0
     for result in results:
-        if isinstance(result, Exception):
-            logger.error(f"Unexpected error in concurrent processing: {result}")
-            continue
-        if result is not None:
+        if isinstance(result, BaseException):
+            # An unexpected error is still a lost article, never a silent skip.
+            logger.error("Unexpected error processing article: %s", result, exc_info=result)
+            failed += 1
+        elif result is FAILED:
+            failed += 1
+        elif result is FILTERED:
+            filtered_out += 1
+        else:
             processed_articles.append(result)
-    
-    logger.debug(f"Successfully processed {len(processed_articles)} out of {len(raw_articles)} articles")
-    return processed_articles
+
+    logger.info(
+        "Processed %d of %d articles (%d failed, %d filtered out)",
+        len(processed_articles), len(raw_articles), failed, filtered_out,
+    )
+    return ProcessedArticles(
+        processed_articles,
+        total=len(raw_articles),
+        failed=failed,
+        filtered_out=filtered_out,
+    )
 
 # -----------------------------------------------------------------------------
 # Pydantic Models for Responses
@@ -512,10 +664,57 @@ class NewsArticle(BaseModel):
     publisher: Optional[str]
 
 class NewsResponse(BaseModel):
+    """A list of articles, plus a signal when some were lost.
+
+    ``partial`` and ``dropped`` are omitted (via
+    ``response_model_exclude_none``) on a clean response, so a complete result
+    is exactly ``{"articles": [...]}`` as before. When articles were dropped,
+    the caller is told rather than being handed a short list that looks whole.
+    """
+
     articles: List[NewsArticle]
+    partial: Optional[bool] = None
+    dropped: Optional[int] = None
 
 class ErrorResponse(BaseModel):
     detail: str
+
+
+# Identical for every cause: what failed upstream is a log detail, not
+# something to describe to an unauthenticated caller.
+UPSTREAM_NEWS_FAILURE_DETAIL = (
+    "Could not resolve articles from Google News. Please retry."
+)
+
+
+def build_news_response(processed_articles, *, empty_detail: str) -> dict:
+    """Turn processed articles into a response, or raise the honest error.
+
+    Three outcomes, previously collapsed into "404, no articles":
+
+    * nothing survived and everything failed -> 502, the pipeline is broken
+    * nothing survived and nothing failed    -> 404, there genuinely is nothing
+    * some survived, some failed             -> 200 with ``partial: true``
+
+    ``getattr`` is used for the counters so that a plain list still works.
+    """
+    failed = getattr(processed_articles, "failed", 0)
+
+    if not processed_articles:
+        if failed:
+            logger.error(
+                "Dropped all %d articles while resolving Google News URLs",
+                failed,
+            )
+            raise HTTPException(status_code=502, detail=UPSTREAM_NEWS_FAILURE_DETAIL)
+        raise HTTPException(status_code=404, detail=empty_detail)
+
+    response: dict = {"articles": list(processed_articles)}
+    if failed:
+        # Never hand back a silently shortened list.
+        response["partial"] = True
+        response["dropped"] = failed
+    return response
 
 # -----------------------------------------------------------------------------
 # Helper: Transform Article Data
@@ -543,7 +742,7 @@ async def get_available_countries():
     """Get supported countries for Google News."""
     return {"available_countries": AVAILABLE_COUNTRIES}
 
-@gnews_router.get("/source/", summary="News by Source", response_model=NewsResponse)
+@gnews_router.get("/source/", summary="News by Source", response_model=NewsResponse, response_model_exclude_none=True)
 async def get_news_by_source(
     # === REQUIRED ===
     source: str = Query(..., description="Source domain or URL", example="cnn.com"),
@@ -599,16 +798,15 @@ async def get_news_by_source(
             if not articles:
                 raise HTTPException(status_code=404, detail="No articles found for the given parameters.")
 
-            # Use the new helper function to decode URLs and filter
             processed_articles = await decode_and_process_articles(articles, filter_by_domain=domain_source)
 
-            if not processed_articles:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"No articles found from source '{domain_source}' with the given date range."
-                )
-
-            return {"articles": processed_articles}
+            return build_news_response(
+                processed_articles,
+                empty_detail=(
+                    f"No articles found from source '{domain_source}' "
+                    "with the given date range."
+                ),
+            )
 
         # Get cached result or fetch and cache (10 minute TTL for source news)
         return await get_cached_or_fetch(cache_key, fetch_source_news, ttl=600)
@@ -622,7 +820,7 @@ async def get_news_by_source(
         logger.error(f"Unexpected error fetching Google News for source '{source}': {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
-@gnews_router.get("/search/", summary="Search News", response_model=NewsResponse)
+@gnews_router.get("/search/", summary="Search News", response_model=NewsResponse, response_model_exclude_none=True)
 async def search_google_news(
     request: Request,
     # === REQUIRED ===
@@ -680,16 +878,12 @@ async def search_google_news(
             if not news:
                 raise HTTPException(status_code=404, detail="No news found for the given query.")
 
-            # Use the new helper function to decode URLs
             processed_articles = await decode_and_process_articles(news)
-            
-            if not processed_articles: # Check if processing yielded any articles
-                # This condition might be hit if all URLs failed to decode or were filtered out
-                # Depending on desired behavior, could raise 404 or return empty list
-                # For now, let's assume if news was found initially but processing failed for all, it's still a "not found" scenario for valid articles.
-                raise HTTPException(status_code=404, detail="No processable news found after URL decoding.")
 
-            return {"articles": processed_articles}
+            return build_news_response(
+                processed_articles,
+                empty_detail="No processable news found after URL decoding.",
+            )
 
         # Get cached result or fetch and cache
         return await get_cached_or_fetch(cache_key, fetch_search_results)
@@ -700,7 +894,7 @@ async def search_google_news(
         logger.error(f"Error fetching Google News for query '{query}': {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
-@gnews_router.get("/top/", summary="Top News", response_model=NewsResponse)
+@gnews_router.get("/top/", summary="Top News", response_model=NewsResponse, response_model_exclude_none=True)
 async def get_top_google_news(
     # === COMMONLY USED ===
     language: str = Query("en", description="Language code", example="en"),
@@ -731,13 +925,12 @@ async def get_top_google_news(
             if not top_news:
                 raise HTTPException(status_code=404, detail="No top news found.")
 
-            # Use the new helper function to decode URLs
             processed_articles = await decode_and_process_articles(top_news)
 
-            if not processed_articles:
-                raise HTTPException(status_code=404, detail="No processable top news found after URL decoding.")
-
-            return {"articles": processed_articles}
+            return build_news_response(
+                processed_articles,
+                empty_detail="No processable top news found after URL decoding.",
+            )
 
         # Get cached result or fetch and cache (use shorter TTL for top news - 5 minutes)
         return await get_cached_or_fetch(cache_key, fetch_top_news, ttl=300)
@@ -747,7 +940,7 @@ async def get_top_google_news(
         logger.error(f"Error fetching top Google News: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
-@gnews_router.get("/topic/", summary="News by Topic", response_model=NewsResponse)
+@gnews_router.get("/topic/", summary="News by Topic", response_model=NewsResponse, response_model_exclude_none=True)
 async def get_news_by_topic(
     # === REQUIRED ===
     topic: str = Query(..., description="Topic name (WORLD, TECHNOLOGY, SPORTS, etc.)", example="TECHNOLOGY"),
@@ -790,13 +983,12 @@ async def get_news_by_topic(
             if not news:
                 raise HTTPException(status_code=404, detail="No news found for the given topic.")
 
-            # Use the new helper function to decode URLs
             processed_articles = await decode_and_process_articles(news)
 
-            if not processed_articles:
-                raise HTTPException(status_code=404, detail="No processable news found for the topic after URL decoding.")
-
-            return {"articles": processed_articles}
+            return build_news_response(
+                processed_articles,
+                empty_detail="No processable news found for the topic after URL decoding.",
+            )
 
         # Get cached result or fetch and cache (10 minute TTL for topic news)
         return await get_cached_or_fetch(cache_key, fetch_topic_news, ttl=600)
@@ -806,7 +998,7 @@ async def get_news_by_topic(
         logger.error(f"Error fetching Google News for topic '{topic}': {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
-@gnews_router.get("/location/", summary="News by Location", response_model=NewsResponse)
+@gnews_router.get("/location/", summary="News by Location", response_model=NewsResponse, response_model_exclude_none=True)
 async def get_news_by_location(
     # === REQUIRED ===
     location: str = Query(..., description="Location name", example="New York"),
@@ -857,13 +1049,15 @@ async def get_news_by_location(
             if not news_by_location:
                 raise HTTPException(status_code=404, detail=f"No news found for the location '{location}'.")
 
-            # Use the new helper function to decode URLs
             processed_articles = await decode_and_process_articles(news_by_location)
 
-            if not processed_articles:
-                raise HTTPException(status_code=404, detail=f"No processable news found for the location '{location}' after URL decoding.")
-
-            return {"articles": processed_articles}
+            return build_news_response(
+                processed_articles,
+                empty_detail=(
+                    f"No processable news found for the location '{location}' "
+                    "after URL decoding."
+                ),
+            )
 
         # Get cached result or fetch and cache (10 minute TTL for location news)
         return await get_cached_or_fetch(cache_key, fetch_location_news, ttl=600)
@@ -875,7 +1069,7 @@ async def get_news_by_location(
 
 # The `/source/` endpoint definition is already provided above.
 
-@gnews_router.get("/articles/", summary="Bulk Articles", response_model=NewsResponse)
+@gnews_router.get("/articles/", summary="Bulk Articles", response_model=NewsResponse, response_model_exclude_none=True)
 async def get_google_news_articles(
     # === COMMONLY USED ===
     query: str = Query("news", description="Search query", example="technology"),
@@ -912,13 +1106,15 @@ async def get_google_news_articles(
             if not articles:
                 raise HTTPException(status_code=404, detail="No articles found for the given parameters.")
 
-            # Use the new helper function to decode URLs
             processed_articles = await decode_and_process_articles(articles)
 
-            if not processed_articles:
-                raise HTTPException(status_code=404, detail="No processable articles found for the given parameters after URL decoding.")
-
-            return {"articles": processed_articles}
+            return build_news_response(
+                processed_articles,
+                empty_detail=(
+                    "No processable articles found for the given parameters "
+                    "after URL decoding."
+                ),
+            )
 
         # Get cached result or fetch and cache (10 minute TTL for bulk articles)
         return await get_cached_or_fetch(cache_key, fetch_articles, ttl=600)
@@ -929,17 +1125,73 @@ async def get_google_news_articles(
         logger.error(f"Error fetching Google News articles for query '{query}': {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
+# -----------------------------------------------------------------------------
+# Outbound fetch policy for /article-details/
+#
+# This endpoint takes a URL from the caller and fetches it from inside the
+# container network, which is a textbook SSRF sink. Everything it is allowed
+# to reach is listed here, and the list is deliberately empty of wildcards:
+# an allow-list that has to be widened on purpose beats a deny-list that has
+# to enumerate every internal range correctly, forever.
+#
+# Operators extend it with NEWS_ARTICLE_ALLOWED_HOSTS, a comma-separated list
+# of publisher hosts (a leading dot matches subdomains, e.g. ".bbc.co.uk").
+# Until they do, only Google News itself is reachable.
+# -----------------------------------------------------------------------------
+def _configured_article_hosts() -> Tuple[str, ...]:
+    """Read the operator-supplied publisher allow-list from the environment."""
+    raw = os.environ.get("NEWS_ARTICLE_ALLOWED_HOSTS", "")
+    return tuple(entry.strip().lower() for entry in raw.split(",") if entry.strip())
+
+
+ARTICLE_DETAILS_ALLOWED_HOSTS: Tuple[str, ...] = (
+    NEWS_ALLOWED_HOSTS + _configured_article_hosts()
+)
+
+# Plaintext HTTP is off by default: a downgraded fetch is both interceptable
+# and a convenient way to reach internal services that never speak TLS.
+ARTICLE_DETAILS_ALLOW_HTTP: bool = (
+    os.environ.get("NEWS_ARTICLE_ALLOW_HTTP", "").strip().lower() in {"1", "true", "yes"}
+)
+
+# Resolve and check every address the host maps to. Only unit tests that must
+# not touch the network set this to False.
+ARTICLE_DETAILS_RESOLVE_DNS: bool = True
+
+# One message for every rejection. "Connection refused" vs "timed out" vs
+# "not on the allow-list" is exactly what turned this endpoint into an
+# internal port-scan oracle; identical bodies remove that signal.
+BLOCKED_URL_DETAIL = "The supplied URL is not permitted."
+ARTICLE_FETCH_FAILED_DETAIL = "Could not retrieve the requested article."
+
+
 @gnews_router.get("/article-details/", summary="Article Details", response_model=dict)
 async def get_article_details(
     # === REQUIRED ===
     url: str = Query(..., description="Article URL to analyze"),
 ):
     """Get detailed article information (title, text, summary, keywords)."""
-    logger.info(f"Received request to get article details for URL: {url}")
     try:
-        # Generate cache key based on URL (use MD5 hash for long URLs)
-        import hashlib
-        url_hash = hashlib.md5(url.encode()).hexdigest()
+        # Validate BEFORE anything else touches the URL: no fetch, no cache
+        # lookup, no logging of the target at info level.
+        validated = validate_outbound_url(
+            url,
+            allowed_hosts=ARTICLE_DETAILS_ALLOWED_HOSTS,
+            allow_http=ARTICLE_DETAILS_ALLOW_HTTP,
+            resolve_dns=ARTICLE_DETAILS_RESOLVE_DNS,
+        )
+    except UrlNotAllowed as exc:
+        # Detail to the logs, generic message to the caller.
+        logger.warning("Blocked outbound article fetch: %s", exc.reason)
+        raise HTTPException(status_code=400, detail=exc.public_message)
+
+    target_url = validated.url
+    logger.info("Fetching article details for allow-listed host %s", validated.host)
+
+    try:
+        # Key on the validated URL, so two spellings of the same target share
+        # an entry and an unvalidated string can never seed the cache.
+        url_hash = hashlib.sha256(target_url.encode()).hexdigest()
         cache_key = generate_cache_key("gnews:article_details", url_hash=url_hash)
 
         async def fetch_article_details():
@@ -963,8 +1215,9 @@ async def get_article_details(
             # Use asyncio to run newspaper operations
             loop = asyncio.get_event_loop()
 
-            # Download article
-            article = Article(url, config=config)
+            # Fetch the normalised URL that passed validation, never the raw
+            # caller string.
+            article = Article(target_url, config=config)
             await loop.run_in_executor(None, article.download)
 
             # Parse article
@@ -975,7 +1228,7 @@ async def get_article_details(
             try:
                 await loop.run_in_executor(None, article.nlp)
             except LookupError as le:  # Specific exception for NLTK resource not found
-                logger.warning(f"NLTK resource not found for URL '{url}': {str(le)}")
+                logger.warning("NLTK resource not found for %s: %s", validated.host, le)
                 nlp_success = False
 
             # Build response (convert publish_date to string for JSON serialization)
@@ -1009,9 +1262,17 @@ async def get_article_details(
         # Get cached result or fetch and cache (1 hour TTL - article content doesn't change)
         return await get_cached_or_fetch(cache_key, fetch_article_details, ttl=3600)
 
+    except HTTPException:
+        raise
     except ArticleException as ae:
-        logger.error(f"Newspaper library error for URL '{url}': {str(ae)}")
-        raise HTTPException(status_code=503, detail=f"Service unavailable: Could not process article from URL. Error: {str(ae)}")
+        # The old body echoed the target host and the underlying failure, which
+        # let a caller tell "port closed" from "port open but not HTML" and use
+        # the endpoint as an internal port scanner. Cause goes to the logs only.
+        logger.error("Newspaper error fetching %s: %s", validated.host, ae)
+        raise HTTPException(status_code=502, detail=ARTICLE_FETCH_FAILED_DETAIL)
     except Exception as e:
-        logger.error(f"Unexpected error fetching article details for URL '{url}': {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+        logger.error(
+            "Unexpected error fetching article details for %s: %s",
+            validated.host, e, exc_info=True,
+        )
+        raise HTTPException(status_code=502, detail=ARTICLE_FETCH_FAILED_DETAIL)
