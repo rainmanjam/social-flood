@@ -99,4 +99,16 @@ cosign.key
 cosign.pub
 
 # Documentation
-docs/
+# docs/ is tracked: README links into docs/features/ and docs/comparisons/,
+# which 404 for anyone cloning while the whole tree is ignored.
+# These two subtrees stay out -- they are scraped third-party business data
+# and enrichment-tool research notes, not project documentation.
+docs/reports/
+docs/research/
+
+# Committed NLTK corpora are not needed: the Dockerfile downloads its own copy
+# into /opt/nltk_data, and google_news_api.py downloads on demand when absent.
+nltk_data/
+
+# Scratch output
+test_output.txt
