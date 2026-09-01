@@ -164,11 +164,16 @@ jobs:
           cache: 'pip'
           cache-dependency-path: requirements-dev.txt
 
+      # Same single-source-of-truth pin lookup as the blocking `deps-audit` job
+      # in _verify.yml, with the same explicit error if the pin is missing.
       - name: Install pip-audit at the pinned version
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          PIN=$(grep -E '^pip-audit==' requirements-dev.txt)
+          if ! PIN=$(grep -E '^pip-audit==' requirements-dev.txt); then
+            echo "::error file=requirements-dev.txt::No 'pip-audit==<version>' pin found in requirements-dev.txt."
+            exit 1
+          fi
           echo "Installing ${PIN}"
           pip install "${PIN}"
 

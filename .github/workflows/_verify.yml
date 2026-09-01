@@ -145,13 +145,20 @@ jobs:
           cache: 'pip'
           cache-dependency-path: requirements-dev.txt
 
-      # Version comes from requirements-dev.txt so there is one source of truth
-      # for the pin rather than a second copy hardcoded in this workflow.
+      # The version comes from requirements-dev.txt so there is one source of
+      # truth for the pin rather than a second copy hardcoded here. If the pin
+      # is missing, say so in one line instead of failing on a bare `grep`
+      # exit code that reads like an unrelated shell error. Deliberately NOT
+      # falling back to an unpinned `pip install pip-audit`: an audit whose own
+      # version drifts silently is the kind of gate that stops meaning anything.
       - name: Install pip-audit at the pinned version
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          PIN=$(grep -E '^pip-audit==' requirements-dev.txt)
+          if ! PIN=$(grep -E '^pip-audit==' requirements-dev.txt); then
+            echo "::error file=requirements-dev.txt::No 'pip-audit==<version>' pin found in requirements-dev.txt. Add one (the audit gate reads the version from there), or change this step to pin it directly."
+            exit 1
+          fi
           echo "Installing ${PIN}"
           pip install "${PIN}"
 
