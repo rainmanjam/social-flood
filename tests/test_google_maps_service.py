@@ -249,6 +249,29 @@ class TestDirections:
         assert len(one["routes"]) == 1
         assert len(many["routes"]) == 2
 
+    async def test_alternative_routes_do_not_borrow_the_selected_routes_steps(self, service):
+        """Google renders steps for the selected route only.
+
+        Copying them onto every alternative would invent turns for routes we
+        never looked at -- the same fabrication class as the old estimate.
+        """
+        FakeScraper.page = FakePage(
+            {
+                DIRECTIONS_SELECTOR: [
+                    route_card("via I-280 N\n38 min\n27.4 km"),
+                    route_card("via US-101 N\n42 min\n25.1 km"),
+                ],
+                STEP_SELECTOR: [FakeNode("Merge onto I-280 N\n2.0 km")],
+            }
+        )
+
+        result = await service.get_directions(1.0, 2.0, 3.0, 4.0, alternatives=True)
+
+        assert result["routes"][0]["steps_available"] is True
+        assert len(result["routes"][0]["steps"]) == 1
+        assert result["routes"][1]["steps_available"] is False
+        assert result["routes"][1]["steps"] == []
+
     async def test_unknown_travel_mode_is_rejected(self, service):
         result = await service.get_directions(1.0, 2.0, 3.0, 4.0, mode="teleport")
         assert result["error"] is True
@@ -679,3 +702,11 @@ class TestReviewPagination:
         with patch.object(service, "get_place_by_id", AsyncMock(return_value=scraped)):
             result = await service.get_place_reviews("p1")
         assert result["has_more"] is False
+
+    async def test_unknown_review_count_is_none_not_zero(self, service):
+        """'We could not read the total' is not 'this place has no reviews'."""
+        scraped = {"place": {"review_count": None, "reviews": [], "rating": None}}
+        with patch.object(service, "get_place_by_id", AsyncMock(return_value=scraped)):
+            result = await service.get_place_reviews("p1")
+        assert result["total_reviews"] is None
+        assert result["has_more"] is None

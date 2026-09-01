@@ -81,8 +81,10 @@ class FakeAsyncClient:
     async def __aexit__(self, *exc):
         return False
 
-    async def post(self, url, content=None, headers=None):
-        FakeAsyncClient.calls.append({"url": url, "content": content, "headers": headers})
+    async def post(self, url, content=None, headers=None, extensions=None):
+        FakeAsyncClient.calls.append(
+            {"url": url, "content": content, "headers": headers, "extensions": extensions or {}}
+        )
         item = FakeAsyncClient.queue[min(len(FakeAsyncClient.calls) - 1, len(FakeAsyncClient.queue) - 1)]
         if isinstance(item, Exception):
             raise item
@@ -389,7 +391,42 @@ class TestWebhookDelivery:
         assert result["delivered"] is False
         # Exactly one POST: the redirect target was never requested.
         assert len(FakeAsyncClient.calls) == 1
-        assert FakeAsyncClient.calls[0]["url"] == "https://hooks.example.com/hook"
+        # The one request made went to the original, approved target.
+        assert FakeAsyncClient.calls[0]["headers"]["Host"] == "hooks.example.com"
+
+    async def test_request_is_pinned_to_the_validated_address(self, slept):
+        """Closes the DNS-rebinding window between validation and connection.
+
+        The guard resolves the name and approves an address; handing the *name*
+        to httpx would let it resolve again and be answered with 127.0.0.1. So
+        the connection goes to the approved address, with the hostname carried
+        in Host and in the TLS SNI so the certificate is still verified against
+        the real name.
+        """
+        hook = await self._register()
+        await monitors.deliver_webhook(
+            owner=ALICE, webhook_id=hook["webhook_id"], event="monitor.changed",
+            payload={}, sleep=slept,
+        )
+        call = FakeAsyncClient.calls[0]
+        assert "93.184.216.34" in call["url"]
+        assert "hooks.example.com" not in call["url"]
+        assert call["headers"]["Host"] == "hooks.example.com"
+        assert call["extensions"]["sni_hostname"] == "hooks.example.com"
+
+    async def test_relative_redirect_resolves_against_the_hostname(self, slept):
+        FakeAsyncClient.queue = [
+            FakeResponse(307, {"location": "/v2/hook"}),
+            FakeResponse(200),
+        ]
+        hook = await self._register()
+        result = await monitors.deliver_webhook(
+            owner=ALICE, webhook_id=hook["webhook_id"], event="monitor.changed",
+            payload={}, sleep=slept,
+        )
+        assert result["delivered"] is True
+        assert FakeAsyncClient.calls[1]["headers"]["Host"] == "hooks.example.com"
+        assert FakeAsyncClient.calls[1]["url"].endswith("/v2/hook")
 
     async def test_list_webhooks_reports_real_delivery_health(self, slept):
         FakeAsyncClient.queue = [FakeResponse(500)]
@@ -531,6 +568,51 @@ class TestMonitorChecks:
         assert result["checked"] is False
         assert "playwright exploded" in result["error"]
 
+    async def test_a_field_that_vanishes_from_the_scrape_is_not_a_change(self):
+        """A panel that failed to render must not become 'phone changed to null'."""
+        await monitors.register_webhook(
+            owner=ALICE, url="https://hooks.example.com/hook", events=["monitor.changed"]
+        )
+        created = await monitors.create_monitor(owner=ALICE, place_id="p1")
+
+        calls = {"n": 0}
+
+        async def fetch(_monitor):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return place()
+            partial = place()
+            del partial["place"]["phone"]
+            return partial
+
+        await monitors.check_monitor(owner=ALICE, monitor_id=created["monitor_id"], fetch_place=fetch)
+        result = await monitors.check_monitor(
+            owner=ALICE, monitor_id=created["monitor_id"], fetch_place=fetch
+        )
+
+        assert result["changed"] is False
+        assert FakeAsyncClient.calls == []
+
+    async def test_a_field_that_comes_back_unchanged_is_still_not_a_change(self):
+        """The last observed value is carried forward, not re-baselined."""
+        created = await monitors.create_monitor(owner=ALICE, place_id="p1")
+
+        calls = {"n": 0}
+
+        async def fetch(_monitor):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                partial = place()
+                del partial["place"]["phone"]
+                return partial
+            return place()
+
+        for _ in range(3):
+            result = await monitors.check_monitor(
+                owner=ALICE, monitor_id=created["monitor_id"], fetch_place=fetch
+            )
+        assert result["changed"] is False
+
     async def test_webhook_not_subscribed_to_the_event_is_not_fired(self):
         await monitors.register_webhook(
             owner=ALICE, url="https://hooks.example.com/hook", events=["job.completed"]
@@ -601,6 +683,24 @@ class TestScheduler:
 
         await monitors.run_due_checks(now=monitors._now() + 7200, fetch_place=fetch)
         assert sorted(seen) == ["p1", "p2"]
+
+    async def test_a_check_refreshes_the_owner_index(self):
+        """Index entries carry a TTL; without refresh a live monitor goes dark.
+
+        Writing the monitor renews only the monitor's own TTL. If the index
+        entry written at creation were left to expire, the scheduler would stop
+        seeing the owner while their monitor was still very much alive.
+        """
+        created = await monitors.create_monitor(owner=ALICE, place_id="p1")
+        # Simulate the index entry having aged out.
+        await monitors._owner_index_store().delete(monitors._INDEX_OWNER, ALICE)
+        assert await monitors._known_owners() == []
+
+        async def fetch(_monitor):
+            return place()
+
+        await monitors.check_monitor(owner=ALICE, monitor_id=created["monitor_id"], fetch_place=fetch)
+        assert await monitors._known_owners() == [ALICE]
 
     async def test_start_and_stop_are_symmetric(self):
         task = monitors.start_monitor_scheduler(interval_seconds=0.01)

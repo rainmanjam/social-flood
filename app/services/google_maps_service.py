@@ -980,17 +980,23 @@ class GoogleMapsService:
 
             place = place_result.get("place", {})
 
+            # None, not 0, when Google did not render a count: "we could not
+            # read the total" is not "this place has no reviews".
+            total_reviews = place.get("review_count")
+            sample = place.get("reviews") or []
+
             return {
-                "total_reviews": place.get("review_count") or 0,
+                "total_reviews": total_reviews,
                 "average_rating": place.get("rating"),
-                "reviews": place.get("reviews") or [],
+                "reviews": sample,
                 "review_summary": place.get("review_summary"),
                 "review_topics": place.get("review_topics"),
                 # Honest: the place panel renders only a sample of reviews, so
                 # "has_more" is whether the sample is smaller than the count
                 # Google reports -- not a flat False that claims we returned
-                # every review.
-                "has_more": len(place.get("reviews") or []) < (place.get("review_count") or 0),
+                # every review. None where the count is unknown, because then
+                # we genuinely cannot tell.
+                "has_more": None if total_reviews is None else len(sample) < total_reviews,
                 "message": (
                     "Reviews are the sample rendered on the place panel; pagination "
                     "beyond that sample is not implemented."
@@ -1847,10 +1853,18 @@ class GoogleMapsService:
                         ),
                     }
 
+                # Google renders the step list for the *selected* route only.
+                # Attaching it to every alternative would be inventing turns for
+                # routes we never looked at, so alternatives carry no steps and
+                # say so.
                 steps = await self._extract_direction_steps(page)
-                for route in routes:
-                    route["steps"] = steps or []
-                    route["steps_available"] = steps is not None
+                for index, route in enumerate(routes):
+                    if index == 0:
+                        route["steps"] = steps or []
+                        route["steps_available"] = steps is not None
+                    else:
+                        route["steps"] = []
+                        route["steps_available"] = False
 
                 return {
                     "routes": routes,

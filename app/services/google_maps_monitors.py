@@ -633,6 +633,31 @@ async def deliver_webhook(
     }
 
 
+def _pinned_request(validated) -> tuple[str, dict[str, str], dict[str, str]]:
+    """Rewrite a validated URL to connect to the address it resolved to.
+
+    Validating a hostname and then handing the hostname to the HTTP client
+    leaves a DNS-rebinding window: the client resolves the name a second time,
+    and an attacker who controls the zone can answer ``127.0.0.1`` on that
+    second lookup. Connecting to the address the guard already checked closes
+    it. The original hostname is carried in the ``Host`` header and in httpx's
+    ``sni_hostname`` extension, so TLS is still verified against the real
+    hostname's certificate rather than against a bare IP.
+
+    Returns:
+        ``(url, host_header, extensions)`` for the pinned request.
+    """
+    import httpx
+
+    if not validated.ip_addresses:
+        return validated.url, {}, {}
+    address = validated.ip_addresses[0]
+    if ":" in address:  # IPv6 literals need brackets in a URL
+        address = f"[{address}]"
+    pinned = httpx.URL(validated.url).copy_with(host=address, port=validated.port)
+    return str(pinned), {"Host": validated.host}, {"sni_hostname": validated.host}
+
+
 async def _post_with_redirect_guard(url: str, body: bytes, headers: dict[str, str]) -> int:
     """POST ``body`` to ``url``, re-validating the target and any redirect.
 
@@ -652,8 +677,14 @@ async def _post_with_redirect_guard(url: str, body: bytes, headers: dict[str, st
             # Re-validated per hop: a redirect is a fresh caller-influenced URL,
             # and following one blindly re-opens the SSRF hole the allow-list
             # closed.
-            validate_webhook_target(target)
-            response = await client.post(target, content=body, headers=headers)
+            validated = validate_webhook_target(target)
+            pinned_url, host_header, extensions = _pinned_request(validated)
+            response = await client.post(
+                pinned_url,
+                content=body,
+                headers={**headers, **host_header},
+                extensions=extensions,
+            )
             if response.status_code not in (301, 302, 303, 307, 308):
                 return response.status_code
             location = response.headers.get("location")
@@ -662,7 +693,9 @@ async def _post_with_redirect_guard(url: str, body: bytes, headers: dict[str, st
             hops += 1
             if hops > MAX_REDIRECT_HOPS:
                 raise InvalidWebhookTarget(f"webhook redirect chain exceeded {MAX_REDIRECT_HOPS} hops")
-            target = str(httpx.URL(target).join(location))
+            # Join against the *logical* URL, not the pinned one: a relative
+            # Location must resolve against the hostname, not against an IP.
+            target = str(httpx.URL(validated.url).join(location))
 
 
 async def _record_delivery_outcome(
@@ -820,22 +853,32 @@ async def _default_fetch_place(monitor: dict[str, Any]) -> dict[str, Any]:
 
 
 def _snapshot(place: dict[str, Any], track_fields: Iterable[str]) -> dict[str, Any]:
-    """Project the scraped place down to the fields this monitor tracks."""
-    return {field: place.get(field) for field in track_fields}
+    """Project the scraped place down to the tracked fields we actually saw.
+
+    A field the scrape did not return is *omitted*, not recorded as ``None``.
+    Storing it as None would make the next diff report "phone changed to null"
+    the first time a panel failed to render, which is an invented observation
+    of exactly the kind this module exists to remove.
+    """
+    return {field: place[field] for field in track_fields if place.get(field) is not None}
 
 
 def _diff(previous: Optional[dict[str, Any]], current: dict[str, Any]) -> dict[str, Any]:
     """Return ``{field: {"old": ..., "new": ...}}`` for fields that changed.
 
-    A first observation (``previous is None``) is not a change: reporting one
-    would fire a webhook the moment a monitor is created, for a "change" nobody
-    made.
+    Only fields observed in *both* snapshots are compared. A first observation
+    (``previous is None``) is not a change -- reporting one would fire a webhook
+    the moment a monitor is created, for a change nobody made -- and a field
+    that has simply gone unobserved is not a change either, because we did not
+    see it disappear, we just did not see it.
     """
     if previous is None:
         return {}
     changes: dict[str, Any] = {}
     for field, new_value in current.items():
-        old_value = previous.get(field)
+        if field not in previous:
+            continue
+        old_value = previous[field]
         if old_value != new_value:
             changes[field] = {"old": old_value, "new": new_value}
     return changes
@@ -897,23 +940,27 @@ async def check_monitor(
 
     place = result["place"]
     track_fields = data.get("track_fields") or list(DEFAULT_TRACK_FIELDS)
+    previous = data.get("last_snapshot")
     snapshot = _snapshot(place, track_fields)
-    changes = _diff(data.get("last_snapshot"), snapshot)
+    changes = _diff(previous, snapshot)
 
     history = list(data.get("history") or [])
-    if data.get("last_snapshot") is None or changes:
+    if previous is None or changes:
         history.append(
             {
                 "timestamp": _iso(now),
                 "changes": changes,
                 "snapshot": snapshot,
-                "kind": "baseline" if data.get("last_snapshot") is None else "change",
+                "kind": "baseline" if previous is None else "change",
             }
         )
         history = history[-MAX_HISTORY_ENTRIES:]
 
     data["history"] = history
-    data["last_snapshot"] = snapshot
+    # Merged, not replaced: a field this scrape did not return keeps its last
+    # observed value, so the next scrape that does see it compares against
+    # something real instead of silently re-baselining.
+    data["last_snapshot"] = {**(previous or {}), **snapshot}
     data["last_checked"] = now
     data["next_check"] = now + interval_seconds
     data["check_count"] = int(data.get("check_count", 0)) + 1
@@ -921,6 +968,11 @@ async def check_monitor(
     if changes:
         data["change_count"] = int(data.get("change_count", 0)) + 1
     await _monitor_store().put(owner, monitor_id, data)
+    # Refresh the owner index alongside the monitor. Both carry the store's TTL;
+    # writing the monitor renews only its own, so an index entry written once at
+    # creation would expire under a monitor that is still alive, and the
+    # scheduler would stop seeing that owner entirely.
+    await _remember_owner(owner)
 
     deliveries: list[dict[str, Any]] = []
     if changes:
