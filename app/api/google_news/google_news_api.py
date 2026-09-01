@@ -22,7 +22,7 @@ from app.core.http_client import get_http_client_manager
 from app.core.constants import USER_AGENTS
 from app.core.url_guard import NEWS_ALLOWED_HOSTS, UrlNotAllowed, validate_outbound_url
 import hashlib
-from typing import Any, Callable, Iterable, Sequence, Tuple
+from typing import Any, Callable, Iterable, Tuple
 
 # Initialize NLTK asynchronously at module level
 async def setup_nltk():
