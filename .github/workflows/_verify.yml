@@ -22,24 +22,22 @@ on:
           Minimum statement coverage of app/. A ratchet: raise it as coverage
           improves, never lower it to make a red build green.
 
-          The default below is the REAL measured value on this branch, not an
-          aspiration. The brief for this work quoted 53%, but that figure does
-          not reproduce: `pytest --cov=app` reports 44.17% (5459 statements,
-          3048 missed), both with and without the coverage config in
-          pyproject.toml. A floor of 53 would fail every run.
+          The default below is the REAL measured value on the integrated tree,
+          not an aspiration. Note the 2026-09-01 stability review quoted 53%;
+          that figure does not reproduce and was never accurate -- a clean
+          `pytest --cov=app` on the pre-remediation tree reports 44.17% (5459
+          statements, 3048 missed), with and without the coverage config.
 
-          RE-MEASURE AFTER INTEGRATION. Several branches added substantial test
-          files that are not on this branch, so the merged tree will score
-          higher. Whoever performs the integration merge should run
+          Measured on the merged tree after remediation: 65.19% (7202
+          statements, 2507 missed), rounded DOWN to 65. The statement count
+          grew because the Maps modules, url_guard and record_store gained
+          tests where they previously had none.
 
-              pytest --cov=app --cov-report=term | tail -1
-
-          on the merged tree and raise this default to the floor (round DOWN to
-          the nearest whole percent) it actually achieves. The `test` job prints
-          the measured value to the run summary to make that a one-line change.
+          The `test` job prints measured coverage to the run summary, so
+          raising this is a one-line change as coverage improves.
         required: false
         type: number
-        default: 44
+        default: 65
 
 permissions:
   contents: read
