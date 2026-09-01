@@ -400,7 +400,12 @@ async def list_monitors(
     records = await _monitor_store().list_for_owner(
         owner, limit=limit, offset=offset, predicate=predicate
     )
-    total = await _monitor_store().count_for_owner(owner)
+    # The total must count what the filter selected, not everything. A total
+    # that ignores the filter reports monitors the caller was told they do not
+    # have.
+    total = len(
+        await _monitor_store().list_for_owner(owner, limit=10_000, predicate=predicate)
+    )
     monitors = []
     for record in records:
         view = _monitor_view(record, include_history=False)
@@ -845,9 +850,19 @@ async def _deliver_inline(
 
 async def _default_fetch_place(monitor: dict[str, Any]) -> dict[str, Any]:
     """Re-scrape the monitored place. Imported lazily to avoid a cycle."""
+    from app.core.url_guard import MAPS_ALLOWED_HOSTS
     from app.services.google_maps_service import google_maps_service
 
     if monitor.get("url"):
+        # Re-validated on every check, not just at creation. Days can pass
+        # between the two, and an allowed hostname can be repointed at an
+        # internal address in that window -- the URL then goes to Playwright
+        # inside the container network.
+        try:
+            validate_outbound_url(monitor["url"], allowed_hosts=MAPS_ALLOWED_HOSTS)
+        except UrlNotAllowed as exc:
+            logger.warning("Monitor URL no longer permitted: %s", exc.reason)
+            return {"error": True, "message": "The monitored URL is no longer a permitted target."}
         return await google_maps_service.lookup_place(url=monitor["url"])
     return await google_maps_service.get_place_by_id(monitor["place_id"])
 
@@ -929,6 +944,10 @@ async def check_monitor(
         data["check_count"] = int(data.get("check_count", 0)) + 1
         data["last_error"] = result.get("message") or "place lookup failed"
         await _monitor_store().put(owner, monitor_id, data)
+        # Refreshed here too: a monitor that keeps failing is still alive, and
+        # letting its index entry lapse would quietly retire it from the
+        # scheduler at exactly the moment someone needs to see the failures.
+        await _remember_owner(owner)
         return {
             "monitor_id": monitor_id,
             "checked": False,
@@ -1100,8 +1119,11 @@ async def get_place_history(
             "history": [],
             "monitor_ids": [],
             "message": (
-                "No monitor has ever covered this place for this caller, so no history "
-                "exists. Create a monitor to start recording changes."
+                "No monitor of this caller currently holds history for this place, so "
+                "no observations are available. Note this says nothing about the place: "
+                "it means nothing has been watching it (or a monitor that was watching "
+                "it has since been deleted or expired). Create a monitor to start "
+                "recording changes."
             ),
         }
 

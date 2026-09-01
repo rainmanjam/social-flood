@@ -964,10 +964,16 @@ class GoogleMapsService:
         include_owner_responses: bool = True
     ) -> Dict[str, Any]:
         """
-        Get reviews for a place.
+        Get the sample of reviews rendered on the place panel.
 
-        Currently returns reviews from the main place data.
-        Full pagination would require additional scraping.
+        The panel renders a sample, not the full review set, so ``limit``,
+        ``offset`` and ``min_rating`` are applied *to that sample* and
+        ``filters_applied`` says exactly which of the requested parameters
+        actually took effect. ``sort_by`` and ``include_owner_responses``
+        cannot be applied -- the panel's order is Google's and owner responses
+        are not separable from the review text we scrape -- so they are
+        reported as not applied rather than silently ignored, which would let a
+        caller believe they received a sorted, filtered page.
         """
         try:
             await self._ensure_initialized()
@@ -985,10 +991,27 @@ class GoogleMapsService:
             total_reviews = place.get("review_count")
             sample = place.get("reviews") or []
 
+            if min_rating is not None:
+                sample = [
+                    r for r in sample
+                    if isinstance(r, dict) and (r.get("rating") or 0) >= min_rating
+                ]
+            sample_size_before_paging = len(sample)
+            sample = sample[offset : offset + limit]
+
             return {
                 "total_reviews": total_reviews,
                 "average_rating": place.get("rating"),
                 "reviews": sample,
+                "filters_applied": {
+                    "limit": True,
+                    "offset": True,
+                    "min_rating": min_rating is not None,
+                    # Named explicitly so the caller knows these did nothing.
+                    "sort_by": False,
+                    "include_owner_responses": False,
+                },
+                "sample_size": sample_size_before_paging,
                 "review_summary": place.get("review_summary"),
                 "review_topics": place.get("review_topics"),
                 # Honest: the place panel renders only a sample of reviews, so
@@ -996,10 +1019,16 @@ class GoogleMapsService:
                 # Google reports -- not a flat False that claims we returned
                 # every review. None where the count is unknown, because then
                 # we genuinely cannot tell.
-                "has_more": None if total_reviews is None else len(sample) < total_reviews,
+                "has_more": (
+                    None if total_reviews is None
+                    else (offset + len(sample)) < min(total_reviews, sample_size_before_paging)
+                    or sample_size_before_paging < total_reviews
+                ),
                 "message": (
-                    "Reviews are the sample rendered on the place panel; pagination "
-                    "beyond that sample is not implemented."
+                    "Reviews are the sample rendered on the place panel, not the full "
+                    "review set. limit/offset/min_rating were applied to that sample; "
+                    "sort_by and include_owner_responses could not be applied. See "
+                    "filters_applied."
                 ),
             }
 
@@ -1135,8 +1164,9 @@ class GoogleMapsService:
         outcomes are now distinct in ``qa_status``:
 
         - ``scraped`` -- questions were rendered and read.
-        - ``no_questions`` -- a Q&A section was rendered and it is empty. A
-          real "nobody has asked anything" answer.
+        - ``no_questions`` -- a Q&A section was found and no questions were
+          read from it. The nearest thing to a real "nobody has asked
+          anything" this page supports.
         - ``not_rendered`` -- Google rendered no Q&A section for this place, so
           nothing is known either way. Not the same as "no questions".
 
@@ -1181,12 +1211,15 @@ class GoogleMapsService:
 
         if questions is None:
             return {
-                "total_questions": 0,
+                # None, not 0: a count of zero alongside "we could not see the
+                # section" contradicts itself, and 0 is the half a client reads.
+                "total_questions": None,
                 "questions": [],
                 "qa_status": "not_rendered",
                 "message": (
-                    "Google rendered no questions-and-answers section for this place, "
-                    "so it is unknown whether any questions exist."
+                    "No questions-and-answers section was found on this place's page, "
+                    "so it is unknown whether any questions exist. This is not a count "
+                    "of zero."
                 ),
             }
 
@@ -2094,7 +2127,11 @@ class GoogleMapsService:
             "menu_link": None,
             "menu": [],
             "categories": {},
-            "message": "This place publishes no menu on Google Maps.",
+            "message": (
+                "No menu link and no menu section were found on this place's Google "
+                "Maps page. That is the basis for the empty result -- a dedicated "
+                "menu tab was not opened."
+            ),
         }
 
     async def batch_geocode(
@@ -2383,7 +2420,11 @@ class GoogleMapsService:
                 "availability_status": "no_slots",
                 "time_slots": [],
                 "filters_applied": False,
-                "message": "The reservation module rendered no bookable slots.",
+                "message": (
+                    "A reservation module was found on the page and no bookable slots "
+                    "were read from it. The requested date and party size were not "
+                    "applied, so this reflects the provider's default view."
+                ),
             }
 
         if reserve_link:
@@ -2406,7 +2447,11 @@ class GoogleMapsService:
             "availability_status": "no_reservation_integration",
             "time_slots": [],
             "filters_applied": False,
-            "message": "This place takes no online reservations through Google.",
+            "message": (
+                "No reservation link and no reservation module were found on this "
+                "place's Google Maps page, so no online booking through Google was "
+                "detected."
+            ),
         }
 
 

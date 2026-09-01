@@ -40,6 +40,7 @@ from app.services.record_store import RecordStore
 # DNS-rebinding case where a public-looking name resolves to loopback.
 _DNS_MAP = {
     "hooks.example.com": "93.184.216.34",
+    "www.google.com": "142.250.72.238",
     "other.example.com": "93.184.216.35",
     "rebind.example.com": "127.0.0.1",
     "127.0.0.1": "127.0.0.1",
@@ -170,6 +171,20 @@ class TestMonitorPersistence:
         listing = await monitors.list_monitors(owner=ALICE)
         assert [m["monitor_id"] for m in listing["monitors"]] == [created["monitor_id"]]
         assert listing["total"] == 1
+
+    async def test_status_filtered_total_counts_the_filtered_set(self):
+        """A total that ignores the filter reports monitors the caller was told
+        they do not have."""
+        created = await monitors.create_monitor(owner=ALICE, place_id="p1")
+        await monitors.create_monitor(owner=ALICE, place_id="p2")
+
+        store = monitors._monitor_store()
+        record = await store.get(ALICE, created["monitor_id"])
+        await store.put(ALICE, created["monitor_id"], {**record.data, "status": "paused"})
+
+        active = await monitors.list_monitors(owner=ALICE, status="active")
+        assert len(active["monitors"]) == 1
+        assert active["total"] == 1
 
     async def test_unknown_monitor_raises(self):
         with pytest.raises(monitors.MonitorNotFound):
@@ -556,6 +571,38 @@ class TestMonitorChecks:
         assert stored["last_error"] == "browser crashed"
         assert FakeAsyncClient.calls == []
 
+    async def test_a_monitor_url_that_stopped_being_permitted_is_not_scraped(self):
+        """Rebinding guard: the URL is re-validated before every scheduled scrape.
+
+        Days pass between creation and a check, and an allowed hostname can be
+        repointed at an internal address in that window -- the URL then goes to
+        Playwright inside the container network.
+        """
+        created = await monitors.create_monitor(
+            owner=ALICE, url="https://www.google.com/maps/place/x"
+        )
+
+        looked_up = []
+
+        class Spy:
+            async def lookup_place(self, url=None):
+                looked_up.append(url)
+                return place()
+
+            async def get_place_by_id(self, place_id):
+                return place()
+
+        with patch(
+            "app.services.google_maps_service.google_maps_service", Spy()
+        ), patch(
+            "app.core.url_guard.socket.getaddrinfo",
+            lambda host, port, *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))],
+        ):
+            result = await monitors.check_monitor(owner=ALICE, monitor_id=created["monitor_id"])
+
+        assert result["checked"] is False
+        assert looked_up == [], "the scrape ran despite the target being disallowed"
+
     async def test_a_raising_scrape_is_reported_not_swallowed(self):
         created = await monitors.create_monitor(owner=ALICE, place_id="p1")
 
@@ -684,6 +731,17 @@ class TestScheduler:
         await monitors.run_due_checks(now=monitors._now() + 7200, fetch_place=fetch)
         assert sorted(seen) == ["p1", "p2"]
 
+    async def test_a_failing_check_also_refreshes_the_owner_index(self):
+        """A monitor that keeps failing is still alive and must stay scheduled."""
+        created = await monitors.create_monitor(owner=ALICE, place_id="p1")
+        await monitors._owner_index_store().delete(monitors._INDEX_OWNER, ALICE)
+
+        async def fetch(_monitor):
+            return {"error": True, "message": "scrape failed"}
+
+        await monitors.check_monitor(owner=ALICE, monitor_id=created["monitor_id"], fetch_place=fetch)
+        assert await monitors._known_owners() == [ALICE]
+
     async def test_a_check_refreshes_the_owner_index(self):
         """Index entries carry a TTL; without refresh a live monitor goes dark.
 
@@ -762,7 +820,7 @@ class TestPlaceHistory:
         result = await monitors.get_place_history(owner=ALICE, place_id="never-seen")
         assert result["monitored"] is False
         assert result["history"] == []
-        assert "no history" in result["message"].lower()
+        assert "no observations are available" in result["message"].lower()
 
     async def test_monitored_place_returns_real_recorded_entries(self):
         created = await monitors.create_monitor(owner=ALICE, place_id="p1")

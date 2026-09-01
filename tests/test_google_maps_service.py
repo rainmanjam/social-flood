@@ -531,6 +531,9 @@ class TestPlaceQA:
 
         assert result["qa_status"] == "not_rendered"
         assert "unknown" in result["message"].lower()
+        # None, not 0: a count of zero next to "we could not see it" is the
+        # half a client reads, and it is the half that is untrue.
+        assert result["total_questions"] is None
 
     async def test_empty_section_is_a_real_zero(self, service):
         FakeScraper.page = FakePage({QA_SECTION_SELECTOR: [FakeNode("Questions and answers")]})
@@ -702,6 +705,31 @@ class TestReviewPagination:
         with patch.object(service, "get_place_by_id", AsyncMock(return_value=scraped)):
             result = await service.get_place_reviews("p1")
         assert result["has_more"] is False
+
+    async def test_requested_filters_are_applied_or_declared_unapplied(self, service):
+        """Silently ignoring a filter lets a caller believe they got a filtered page."""
+        scraped = {
+            "place": {
+                "review_count": 3,
+                "rating": 4.0,
+                "reviews": [{"rating": 5}, {"rating": 2}, {"rating": 4}],
+            }
+        }
+        with patch.object(service, "get_place_by_id", AsyncMock(return_value=scraped)):
+            result = await service.get_place_reviews("p1", min_rating=4, limit=1, sort_by="newest")
+
+        assert [r["rating"] for r in result["reviews"]] == [5]
+        assert result["filters_applied"]["min_rating"] is True
+        assert result["filters_applied"]["limit"] is True
+        # Declared unapplied rather than quietly dropped.
+        assert result["filters_applied"]["sort_by"] is False
+        assert result["filters_applied"]["include_owner_responses"] is False
+
+    async def test_offset_pages_within_the_sample(self, service):
+        scraped = {"place": {"review_count": 3, "rating": 4.0, "reviews": [{"rating": 5}, {"rating": 3}]}}
+        with patch.object(service, "get_place_by_id", AsyncMock(return_value=scraped)):
+            result = await service.get_place_reviews("p1", offset=1)
+        assert [r["rating"] for r in result["reviews"]] == [3]
 
     async def test_unknown_review_count_is_none_not_zero(self, service):
         """'We could not read the total' is not 'this place has no reviews'."""
