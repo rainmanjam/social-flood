@@ -184,8 +184,6 @@ class TestMainApplication:
         with patch('main.settings', mock_settings), \
              patch('main.configure_exception_handlers') as mock_configure_handlers, \
              patch('main.setup_middleware') as mock_setup_middleware, \
-             patch('main.limiter', None), \
-             patch('main.RATE_LIMITING_AVAILABLE', False), \
              patch('main.METRICS_AVAILABLE', False):
 
             from main import create_application
@@ -201,21 +199,41 @@ class TestMainApplication:
             mock_setup_middleware.assert_called_once()
             mock_configure_handlers.assert_called_once_with(app)
 
-    def test_create_application_with_rate_limiting(self, mock_settings):
-        """Test application creation with rate limiting enabled."""
+    def test_create_application_installs_rate_limit_middleware(self, mock_settings):
+        """The real rate limiter must be installed as middleware.
+
+        This previously asserted `app.state.limiter`, which was slowapi's.
+        slowapi was in no requirements file, so that attribute proved only
+        that a dead import had been attempted -- and slowapi keys by IP, the
+        very defect app.core.rate_limiter exists to fix. The meaningful
+        assertion is that RateLimitMiddleware is actually in the stack:
+        Depends(rate_limit) covers only routes that declare it, so without
+        the middleware /api-config, /status and /health count nothing.
+        """
+        from app.core.rate_limiter import RateLimitMiddleware
+
         with patch('main.settings', mock_settings), \
              patch('main.configure_exception_handlers'), \
-             patch('main.setup_middleware'), \
-             patch('main.limiter'), \
-             patch('main.RATE_LIMITING_AVAILABLE', True), \
-             patch('main.METRICS_AVAILABLE', False), \
-             patch('main.RateLimitExceeded', create=True):
+             patch('main.METRICS_AVAILABLE', False):
 
             from main import create_application
             app = create_application()
 
-            # Verify rate limiter was set
-            assert hasattr(app.state, 'limiter')
+            installed = [m.cls for m in app.user_middleware]
+            assert RateLimitMiddleware in installed, (
+                f"RateLimitMiddleware not installed; stack was {installed}"
+            )
+
+    def test_no_slowapi_limiter_remains(self):
+        """The dead slowapi path must not come back.
+
+        Re-adding it would install a second limiter keyed by remote address,
+        reintroducing CRT-8 alongside the fixed limiter.
+        """
+        import main
+
+        assert not hasattr(main, "limiter")
+        assert not hasattr(main, "RATE_LIMITING_AVAILABLE")
 
     def test_create_application_with_metrics(self, mock_settings):
         """Test application creation with metrics enabled."""
@@ -228,8 +246,6 @@ class TestMainApplication:
         with patch('main.settings', mock_settings), \
              patch('main.configure_exception_handlers'), \
              patch('main.setup_middleware'), \
-             patch('main.limiter', None), \
-             patch('main.RATE_LIMITING_AVAILABLE', False), \
              patch('main.METRICS_AVAILABLE', True), \
              patch('prometheus_fastapi_instrumentator.Instrumentator', return_value=mock_instrumentator):
 
