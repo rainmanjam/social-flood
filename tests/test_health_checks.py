@@ -10,6 +10,7 @@ if either is reintroduced.
 """
 import asyncio
 import importlib
+import pathlib
 
 import pytest
 
@@ -53,18 +54,26 @@ async def test_psutil_is_installed_so_system_check_runs():
     assert "cpu" in result
 
 
-def test_slowapi_is_importable():
-    """slowapi is now declared; main.py's rate-limit path must not be dead.
+def test_slowapi_is_not_a_dependency():
+    """slowapi must stay out of requirements.
 
-    Skipped (not failed) when the interpreter's environment predates the
-    Phase 4 requirements bump, so a stale local venv does not look like a
-    code regression. In CI, where requirements.txt is installed, this asserts.
+    It was briefly added because main.py imported it, before that import was
+    recognised as a dead path worth deleting rather than feeding: slowapi
+    keys by remote address, which is the CRT-8 defect app/core/rate_limiter.py
+    exists to fix, and a second limiter would mean two sources of truth for
+    keying, storage and the 429 body.
     """
-    pytest.importorskip(
-        "slowapi",
-        reason="environment predates requirements.txt declaring slowapi; "
-        "reinstall with -r requirements.txt",
-    )
+    requirements = (
+        pathlib.Path(__file__).resolve().parents[1] / "requirements.txt"
+    ).read_text()
+    declared = [
+        line.strip()
+        for line in requirements.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert not any(
+        line.lower().startswith("slowapi") for line in declared
+    ), "slowapi is declared again; see app/core/rate_limiter.py"
 
 
 def test_tldextract_is_importable():

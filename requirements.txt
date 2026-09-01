@@ -54,9 +54,12 @@ redis[hiredis]==7.1.0
 # should be dropped once Settings.DATABASE_URL goes away.
 psycopg2-binary==2.9.12
 
-# Rate limiting. main.py imports slowapi behind a try/except ImportError, so
-# without it every deployment silently runs with RATE_LIMITING_AVAILABLE=False.
-slowapi==0.1.10
+# NOTE: slowapi is deliberately NOT a dependency. main.py used to import it
+# behind a try/except and build a Limiter keyed by remote address; that path
+# was dead in every deployment, and had it been live it would have keyed
+# limits by IP -- the exact CRT-8 defect app/core/rate_limiter.py fixes.
+# The dead path was removed rather than fed. Rate limiting is entirely
+# app/core/rate_limiter.py, which has no third-party limiter dependency.
 
 # Utilities
 loguru==0.7.3
