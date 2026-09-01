@@ -1,16 +1,88 @@
-name: Create Release
+# .github/workflows/release.yml
+#
+# HOW THE BROKEN TRIGGER WAS FIXED (CRT-6)
+# ----------------------------------------
+# Before: two jobs in one workflow, gated on the actor.
+#
+#     bump-version:  if: github.actor != 'github-actions[bot]'   # ran
+#     release:       if: github.actor == 'github-actions[bot]'   # never ran
+#
+# The `release` job was waiting for the workflow to be re-triggered by the
+# commit that `bump-version` pushed. But `bump-version` pushed with the default
+# GITHUB_TOKEN, and GitHub deliberately does not trigger workflow runs from
+# pushes made with GITHUB_TOKEN (loop protection). So the second run never
+# happened and `release` had not executed since v1.5.1 (2025-09-16). Docker Hub
+# `latest` and `1.6.0` were pushed by hand, unsigned.
+#
+# After: ONE run, sequential jobs joined by `needs`. No second trigger is
+# required, so no token can withhold it.
+#
+#     verify  ->  bump-version  ->  publish
+#
+# `bump-version` still pushes the version commit and now also pushes a `vX.Y.Z`
+# tag, so the tag exists for humans and for `git describe`. But publishing does
+# NOT depend on that tag firing a workflow - it depends on `needs`.
+#
+# TRADE-OFF vs. the alternatives:
+#   * PAT in a secret - works, and is the only way to make a bot push trigger
+#     another workflow, but it means a long-lived human-scoped credential with
+#     write access sitting in repo secrets, plus rotation and audit burden.
+#   * workflow_dispatch only - safe, but makes every release a manual click and
+#     the whole point was to restore automation.
+#   * tag-push trigger (`on: push: tags:`) - clean in principle, BUT it has
+#     exactly the same defect as the current code: the tag would be pushed by
+#     GITHUB_TOKEN and therefore would not trigger the run either. It only works
+#     if you also add a PAT, so it buys nothing over the PAT option.
+#   * CHOSEN: same-run `needs` chaining. Zero new secrets, zero new failure
+#     modes, and the publish step is now provably gated on the verify jobs
+#     because they are in the same run's dependency graph.
+name: Release
 
 on:
   push:
     branches: [ main ]
+  # Manual re-run, e.g. to republish after a registry outage.
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
+  # Same gates a pull request gets. Nothing is bumped or published unless lint,
+  # the full pytest suite (with the coverage floor), the boot check and the
+  # docker health check all pass.
+  verify:
+    name: Verify
+    uses: ./.github/workflows/_verify.yml
+    permissions:
+      contents: read
+
   bump-version:
     name: Bump Version
-    if: github.actor != 'github-actions[bot]'
+    needs: [ verify ]
     runs-on: ubuntu-latest
+    # Two guards:
+    #   * `github.ref == 'refs/heads/main'` - without it, anyone able to run
+    #     workflow_dispatch could pick a feature branch or a tag from the ref
+    #     picker and publish unmerged code as a release. (A dispatch from a tag
+    #     would also fail at `git push origin HEAD:$GITHUB_REF`.)
+    #   * the head-commit check - skip if the head commit is itself a bump
+    #     commit. Pushes made with GITHUB_TOKEN do not re-trigger this workflow,
+    #     but a maintainer pushing a bump commit by hand (or with a PAT) would.
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       !startsWith(github.event.head_commit.message, 'chore: bump version to'))
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.new-version.outputs.version }}
+      changed: ${{ steps.commit.outputs.changed }}
+      tag: ${{ steps.commit.outputs.tag }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -29,88 +101,65 @@ jobs:
         id: new-version
         run: |
           VERSION=$(python -c "from app.__version__ import __version__; print(__version__)")
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Version bumped to $VERSION"
 
-      - name: Commit version bump
+      - name: Commit and tag version bump
         id: commit
         run: |
+          set -euo pipefail
+          VERSION='${{ steps.new-version.outputs.version }}'
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add app/__version__.py
           if git diff --cached --quiet; then
-            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "No version change; nothing to release."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git commit -m "chore: bump version to v${{ steps.new-version.outputs.version }}"
-          echo "changed=true" >> $GITHUB_OUTPUT
+          if git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+            echo "::error::Tag v${VERSION} already exists on origin"
+            exit 1
+          fi
+          git commit -m "chore: bump version to v${VERSION}"
+          git tag -a "v${VERSION}" -m "Release v${VERSION}"
+          git push origin "HEAD:${GITHUB_REF}"
+          git push origin "refs/tags/v${VERSION}"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Push version bump
-        if: steps.commit.outputs.changed == 'true'
-        run: git push origin HEAD:${{ github.ref }}
-
-  release:
+  publish:
     name: Publish Release
-    if: github.actor == 'github-actions[bot]'
+    needs: [ verify, bump-version ]
+    if: needs.bump-version.outputs.changed == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
       packages: write
-      id-token: write
+      id-token: write   # required for keyless cosign signing
+    env:
+      VERSION: ${{ needs.bump-version.outputs.version }}
+      TAG: ${{ needs.bump-version.outputs.tag }}
     steps:
-      - name: Checkout code
+      # Check out the TAG the bump job just pushed, not the pre-bump SHA that
+      # triggered this run - otherwise the published image would not contain the
+      # version it claims.
+      - name: Checkout the tagged commit
         uses: actions/checkout@v4
         with:
+          ref: ${{ needs.bump-version.outputs.tag }}
           fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Read release version
-        id: release-version
-        run: |
-          VERSION=$(python -c "from app.__version__ import __version__; print(__version__)")
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Release version: $VERSION"
-
-      - name: Determine release state
-        id: release-check
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const version = '${{ steps.release-version.outputs.version }}';
-            try {
-              await github.rest.repos.getReleaseByTag({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                tag: `v${version}`,
-              });
-              core.info(`Release v${version} already exists`);
-              core.setOutput('publish', 'false');
-            } catch (error) {
-              if (error.status === 404) {
-                core.info(`Preparing first release for v${version}`);
-                core.setOutput('publish', 'true');
-              } else {
-                throw error;
-              }
-            }
-
       - name: Set up Docker Buildx
-        if: steps.release-check.outputs.publish == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to DockerHub
-        if: steps.release-check.outputs.publish == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Log in to GitHub Container Registry
-        if: steps.release-check.outputs.publish == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -118,7 +167,6 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata
-        if: steps.release-check.outputs.publish == 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -126,12 +174,12 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/social-flood
             ghcr.io/${{ github.repository }}
           tags: |
-            type=raw,value=${{ steps.release-version.outputs.version }}
+            type=raw,value=${{ env.VERSION }}
             type=raw,value=latest
 
       - name: Build and push Docker image
-        if: steps.release-check.outputs.publish == 'true'
-        uses: docker/build-push-action@v5
+        id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -142,103 +190,94 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Install Cosign
-        if: steps.release-check.outputs.publish == 'true'
         uses: sigstore/cosign-installer@v3
 
-      - name: Sign Docker images
-        if: steps.release-check.outputs.publish == 'true'
+      # Sign by DIGEST, not by tag. Signing a mutable tag signs whatever that
+      # tag pointed at when cosign resolved it; the digest is what the build
+      # actually produced and is what `cosign verify` should be pinned to.
+      - name: Sign images (keyless, Sigstore)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
-          cosign sign --yes ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.release-version.outputs.version }}
-          cosign sign --yes ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest
-          cosign sign --yes ghcr.io/${{ github.repository }}:${{ steps.release-version.outputs.version }}
-          cosign sign --yes ghcr.io/${{ github.repository }}:latest
+          set -euo pipefail
+          cosign sign --yes "${DOCKERHUB_USER}/social-flood@${DIGEST}"
+          cosign sign --yes "ghcr.io/${GITHUB_REPOSITORY}@${DIGEST}"
 
-      - name: Generate SBOM tool
-        if: steps.release-check.outputs.publish == 'true'
+      - name: Install Syft
         id: syft
-        uses: anchore/sbom-action/download-syft@v0.14.3
+        uses: anchore/sbom-action/download-syft@v0
 
-      - name: Create SBOM attestation
-        if: steps.release-check.outputs.publish == 'true'
+      - name: Generate and attest SBOM
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          SYFT: ${{ steps.syft.outputs.cmd }}
         run: |
-          ${{ steps.syft.outputs.cmd }} ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.release-version.outputs.version }} -o spdx-json > sbom-dockerhub.json
-          cosign attest --predicate sbom-dockerhub.json --type spdx ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.release-version.outputs.version }}
+          set -euo pipefail
+          "$SYFT" "${DOCKERHUB_USER}/social-flood@${DIGEST}" -o spdx-json > sbom.json
+          cosign attest --yes --predicate sbom.json --type spdx \
+            "${DOCKERHUB_USER}/social-flood@${DIGEST}"
+          cosign attest --yes --predicate sbom.json --type spdx \
+            "ghcr.io/${GITHUB_REPOSITORY}@${DIGEST}"
 
-          ${{ steps.syft.outputs.cmd }} ghcr.io/${{ github.repository }}:${{ steps.release-version.outputs.version }} -o spdx-json > sbom-ghcr.json
-          cosign attest --predicate sbom-ghcr.json --type spdx ghcr.io/${{ github.repository }}:${{ steps.release-version.outputs.version }}
-
-      - name: Generate release notes
-        if: steps.release-check.outputs.publish == 'true'
-        id: release-notes
-        run: |
-          COMMITS=$(git log --oneline -10 --pretty=format:"- %s" 2>/dev/null || echo "- Various improvements and updates")
-
-          RELEASE_NOTES="## 🚀 Release v${{ steps.release-version.outputs.version }}
-
-          **Automatic Release**: Created from push to main branch
-          **Triggered by**: ${{ github.triggering_actor }}
-
-          ### 📋 What's Changed
-
-          $COMMITS
-
-          ### 🐳 Deployment
-
-          - **Docker Hub**: \`${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.release-version.outputs.version }}\`
-          - **Latest Tag**: \`${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest\`
-          - **GitHub Packages**: \`ghcr.io/${{ github.repository }}:${{ steps.release-version.outputs.version }}\`
-          - **Container Signing**: ✅ Signed with [cosign](https://github.com/sigstore/cosign)
-
-          ### 🔒 Security Features
-
-          - **SBOM**: Software Bill of Materials attached for vulnerability scanning
-          - **Provenance**: Cryptographic attestation of build process included
-          - **Container Signing**: All images are cryptographically signed
-
-          ### 📦 Installation
-
-          \`\`\`bash
-          # From Docker Hub
-          docker pull ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.release-version.outputs.version }}
-          docker pull ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest
-
-          # From GitHub Packages
-          docker pull ghcr.io/${{ github.repository }}:${{ steps.release-version.outputs.version }}
-          docker pull ghcr.io/${{ github.repository }}:latest
-          \`\`\`
-
-          ### 🔍 Verification
-
-          Verify the container signatures:
-          \`\`\`bash
-          # Docker Hub
-          cosign verify ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:${{ steps.release-version.outputs.version }}
-          cosign verify ${{ secrets.DOCKERHUB_USERNAME }}/social-flood:latest
-
-          # GitHub Packages
-          cosign verify ghcr.io/${{ github.repository }}:${{ steps.release-version.outputs.version }}
-          cosign verify ghcr.io/${{ github.repository }}:latest
-          \`\`\`
-
-          ---
-
-          *This release was automatically created when code was pushed to the main branch.*"
-
-          RELEASE_NOTES="${RELEASE_NOTES//'%'/'%25'}"
-          RELEASE_NOTES="${RELEASE_NOTES//$'\n'/'%0A'}"
-          RELEASE_NOTES="${RELEASE_NOTES//$'\r'/'%0D'}"
-
-          echo "release_notes<<EOF" >> $GITHUB_OUTPUT
-          echo "$RELEASE_NOTES" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Create release
-        if: steps.release-check.outputs.publish == 'true'
-        uses: softprops/action-gh-release@v1
+      - name: Upload SBOM artifact
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: v${{ steps.release-version.outputs.version }}
-          name: Release v${{ steps.release-version.outputs.version }}
-          body: ${{ steps.release-notes.outputs.release_notes }}
+          name: sbom
+          path: sbom.json
+          if-no-files-found: ignore
+
+      # Commit subjects are untrusted input. They are written to a file with a
+      # heredoc rather than interpolated into a shell command.
+      - name: Generate release notes
+        id: notes
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          set -euo pipefail
+          PREV_TAG=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            git log --pretty=format:'- %s' "${PREV_TAG}..${TAG}" > changes.txt
+          else
+            git log --pretty=format:'- %s' -20 > changes.txt
+          fi
+
+          {
+            echo "## Release ${TAG}"
+            echo ""
+            echo "### Changes"
+            echo ""
+            cat changes.txt
+            echo ""
+            echo ""
+            echo "### Images"
+            echo ""
+            echo "- \`${DOCKERHUB_USER}/social-flood:${VERSION}\`"
+            echo "- \`ghcr.io/${GITHUB_REPOSITORY}:${VERSION}\`"
+            echo "- Digest: \`${DIGEST}\`"
+            echo ""
+            echo "### Verify the signature"
+            echo ""
+            echo '```bash'
+            echo "cosign verify \\"
+            echo "  --certificate-identity-regexp 'https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@.*' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  ghcr.io/${GITHUB_REPOSITORY}@${DIGEST}"
+            echo '```'
+          } > release-notes.md
+
+          echo "path=release-notes.md" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: Release ${{ env.TAG }}
+          body_path: release-notes.md
+          files: sbom.json
           draft: false
           prerelease: false
         env:

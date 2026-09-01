@@ -1,0 +1,77 @@
+# Pre-commit hooks for Social Flood.
+#
+#   pip install pre-commit && pre-commit install
+#   pre-commit run --all-files        # first run will be noisy, see below
+#
+# Adapted from the abandoned branch
+# `origin/claude/review-project-updates-011CUsCr2DU59u88cneyTm6D`. Four hooks
+# from that version were deliberately dropped because they would fail on a
+# clean checkout of main and train everyone to run `--no-verify`:
+#
+#   * detect-secrets  - needs a `.secrets.baseline` file that does not exist.
+#   * python-safety-dependencies-check - `safety` now requires an account;
+#     dependency CVEs are covered by pip-audit in .github/workflows/security.yml.
+#   * markdownlint --fix and pretty-format-yaml --autofix - both rewrite files
+#     wholesale on first run, producing an enormous unrelated diff.
+#   * name-tests-test - would rename existing test files.
+#
+# `ruff` runs WITHOUT --fix here: the repository currently has ~1242 findings
+# and an auto-fixing hook would silently rewrite unrelated code in every commit.
+# Match the CI ratchet instead: only the blocking rule set is enforced.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: check-json
+      - id: check-toml
+      - id: check-added-large-files
+        args: [--maxkb=1000]
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: debug-statements
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      # Catches the class of mistake this project has actually shipped:
+      # a real .env committed to the repository.
+      - id: detect-private-key
+
+  # Same blocking rule set the CI lint job uses (see _verify.yml).
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.4
+    hooks:
+      - id: ruff
+        name: ruff (blocking rules only)
+        args: [--select, "E9,F63,F7,F82", --no-fix]
+
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.8.0
+    hooks:
+      - id: bandit
+        args: [-c, pyproject.toml]
+        additional_dependencies: ["bandit[toml]"]
+        exclude: ^(tests|scripts|examples)/
+
+  - repo: https://github.com/hadolint/hadolint
+    rev: v2.13.1-beta
+    hooks:
+      - id: hadolint-docker
+        args: [--ignore, DL3008, --ignore, DL3009]
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+
+ci:
+  autofix_commit_msg: '[pre-commit.ci] auto fixes from pre-commit hooks'
+  autofix_prs: true
+  autoupdate_commit_msg: '[pre-commit.ci] pre-commit autoupdate'
+  autoupdate_schedule: weekly
+  # hadolint-docker needs a Docker daemon, which pre-commit.ci does not provide.
+  skip: [hadolint-docker]
+  submodules: false
