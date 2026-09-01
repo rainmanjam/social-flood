@@ -651,6 +651,86 @@ def test_unexpected_service_failure_does_not_leak_internals(client):
     assert b"6379" not in response.content
 
 
+UPSTREAM_LEAK = (
+    "playwright: connect ECONNREFUSED proxy.internal:8118 while loading "
+    "https://maps.google.com/maps/place/x"
+)
+
+
+def test_service_reported_failure_does_not_leak_its_message(client):
+    """The service puts ``str(exc)`` in ``message``; it must not be returned.
+
+    This is the same leak as the catch-all handlers, on the path where the
+    service returns an error dict instead of raising.
+    """
+    with mock.patch.object(
+        google_maps_service,
+        "get_place_by_id",
+        new=AsyncMock(return_value={"error": True, "message": UPSTREAM_LEAK}),
+    ):
+        response = client.get(
+            "/api/v1/google-maps/place/some-place-id", headers=HEADERS_A
+        )
+
+    assert response.status_code == 500
+    for fragment in (b"proxy.internal", b"8118", b"ECONNREFUSED", b"playwright"):
+        assert fragment not in response.content
+
+
+def test_upstream_cannot_choose_our_status_code(client):
+    """An unfiltered upstream status is itself a per-cause signal."""
+    with mock.patch.object(
+        google_maps_service,
+        "get_place_by_id",
+        new=AsyncMock(
+            return_value={"error": True, "status_code": 418, "message": UPSTREAM_LEAK}
+        ),
+    ):
+        response = client.get(
+            "/api/v1/google-maps/place/some-place-id", headers=HEADERS_A
+        )
+
+    assert response.status_code == 500
+
+
+def test_upstream_404_still_reaches_the_caller(client):
+    """Clamping status codes must not turn a real 'not found' into a 500."""
+    with mock.patch.object(
+        google_maps_service,
+        "get_place_by_id",
+        new=AsyncMock(
+            return_value={"error": True, "status_code": 404, "message": "no such place"}
+        ),
+    ):
+        response = client.get(
+            "/api/v1/google-maps/place/some-place-id", headers=HEADERS_A
+        )
+
+    assert response.status_code == 404
+    assert b"no such place" not in response.content
+
+
+def test_failed_job_reports_a_constant_detail(client):
+    """A failed job says so, and says nothing about why.
+
+    A truthy ``error`` on the status dict is consumed by the error check above
+    this branch, so the reason arrives (if at all) on other keys; none of them
+    belong in the response.
+    """
+    with mock.patch.object(
+        google_maps_service,
+        "get_job_status",
+        new=AsyncMock(return_value={"status": "failed", "detail": UPSTREAM_LEAK}),
+    ):
+        response = client.get(
+            f"/api/v1/google-maps/jobs/{JOB_OF_A}/results", headers=HEADERS_A
+        )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Job failed."
+    assert b"proxy.internal" not in response.content
+
+
 def test_malformed_results_payload_is_an_error_not_an_empty_success(client):
     """A bad upstream shape used to become 200 with zero results."""
     with mock.patch.multiple(

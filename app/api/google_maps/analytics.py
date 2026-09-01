@@ -8,7 +8,11 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 
-from app.api.google_maps.common import INTERNAL_ERROR_DETAIL, SafeUrlValidationRoute
+from app.api.google_maps.common import (
+    INTERNAL_ERROR_DETAIL,
+    SafeUrlValidationRoute,
+    upstream_error,
+)
 from app.api.google_maps.schemas import (
     CompetitorRequest,
 )
@@ -64,10 +68,7 @@ async def get_review_analytics(
         )
 
         if result.get("error"):
-            raise HTTPException(
-                status_code=result.get("status_code", 500),
-                detail=result.get("message", "Failed to get analytics")
-            )
+            raise upstream_error(result, "Failed to get analytics")
 
         return {
             "success": True,
@@ -127,10 +128,7 @@ async def analyze_competitors(
         )
 
         if result.get("error"):
-            raise HTTPException(
-                status_code=500,
-                detail=result.get("message", "Competitor analysis failed")
-            )
+            raise upstream_error(result, "Competitor analysis failed")
 
         return {
             "success": True,

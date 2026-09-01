@@ -8,7 +8,11 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from app.api.google_maps.common import INTERNAL_ERROR_DETAIL, SafeUrlValidationRoute
+from app.api.google_maps.common import (
+    INTERNAL_ERROR_DETAIL,
+    SafeUrlValidationRoute,
+    upstream_error,
+)
 from app.api.google_maps.schemas import (
     DirectionsRequest,
     GeocodeRequest,
@@ -62,10 +66,7 @@ async def get_directions(
         )
 
         if result.get("error"):
-            raise HTTPException(
-                status_code=500,
-                detail=result.get("message", "Failed to get directions")
-            )
+            raise upstream_error(result, "Failed to get directions")
 
         return {
             "success": True,
@@ -155,10 +156,7 @@ async def batch_geocode(
         )
 
         if result.get("error"):
-            raise HTTPException(
-                status_code=500,
-                detail=result.get("message", "Geocoding failed")
-            )
+            raise upstream_error(result, "Geocoding failed")
 
         return {
             "success": True,

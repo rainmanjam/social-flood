@@ -21,6 +21,7 @@ from app.api.google_maps.common import (
     INTERNAL_ERROR_DETAIL,
     SafeUrlValidationRoute,
     places_from_result,
+    upstream_error,
 )
 from app.api.google_maps.schemas import (
     ExportFormat,
@@ -64,10 +65,7 @@ async def list_jobs(
 
     # gosom returns a list on success, dict on error
     if isinstance(result, dict) and result.get("error"):
-        raise HTTPException(
-            status_code=500,
-            detail=result.get("message", "Failed to list jobs")
-        )
+        raise upstream_error(result, "Failed to list jobs")
 
     # If result is a list, use it directly as jobs
     jobs = result if isinstance(result, list) else result.get("jobs", [])
@@ -104,10 +102,7 @@ async def get_job_status(
     if result.get("error"):
         if result.get("status_code") == 404:
             raise HTTPException(status_code=404, detail="Job not found")
-        raise HTTPException(
-            status_code=500,
-            detail=result.get("message", "Failed to get job status")
-        )
+        raise upstream_error(result, "Failed to get job status")
 
     return {
         "success": True,
@@ -152,10 +147,7 @@ async def get_job_results(
     if status_result.get("error"):
         if status_result.get("status_code") == 404:
             raise HTTPException(status_code=404, detail="Job not found")
-        raise HTTPException(
-            status_code=500,
-            detail=status_result.get("message", "Failed to get job status")
-        )
+        raise upstream_error(status_result, "Failed to get job status")
 
     job_status = status_result.get("status", "").lower()
 
@@ -170,10 +162,13 @@ async def get_job_results(
         }
 
     if job_status == "failed":
-        raise HTTPException(
-            status_code=500,
-            detail=f"Job failed: {status_result.get('error', 'Unknown error')}"
-        )
+        # This used to interpolate ``status_result['error']`` into the detail,
+        # which could only ever render "Unknown error": a truthy ``error`` is
+        # already consumed by the check above, so the branch is only reached
+        # when the key is absent. Made explicit, and the reason -- which names
+        # browser paths and proxy hosts -- is logged rather than returned.
+        logger.warning("Job %s reported status 'failed': %s", job_id, status_result)
+        raise HTTPException(status_code=500, detail="Job failed.")
 
     # Get results
     result = await google_maps_service.get_job_results(
@@ -181,10 +176,7 @@ async def get_job_results(
     )
 
     if result.get("error"):
-        raise HTTPException(
-            status_code=500,
-            detail=result.get("message", "Failed to get job results")
-        )
+        raise upstream_error(result, "Failed to get job results")
 
     if format == "csv":
         return {
@@ -231,10 +223,7 @@ async def delete_job(
     if result.get("error"):
         if result.get("status_code") == 404:
             raise HTTPException(status_code=404, detail="Job not found")
-        raise HTTPException(
-            status_code=500,
-            detail=result.get("message", "Failed to delete job")
-        )
+        raise upstream_error(result, "Failed to delete job")
 
     return {
         "success": True,
@@ -280,10 +269,7 @@ async def export_job_results(
         if result.get("error"):
             if result.get("status_code") == 404:
                 raise HTTPException(status_code=404, detail="Job not found")
-            raise HTTPException(
-                status_code=500,
-                detail=result.get("message", "Failed to get results")
-            )
+            raise upstream_error(result, "Failed to get results")
 
         places = places_from_result(result, f"job {job_id} export")
 

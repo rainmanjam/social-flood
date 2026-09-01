@@ -48,6 +48,39 @@ _URL_REJECTED_MARKER = "__google_maps_url_rejected__"
 
 INTERNAL_ERROR_DETAIL = "The request could not be completed."
 
+NOT_FOUND_DETAIL = "Not found."
+
+# The only upstream status codes a caller is allowed to observe. The service
+# layer builds its error dicts from whatever it caught, so an unfiltered
+# ``result["status_code"]`` lets the upstream failure mode pick our HTTP status
+# -- another way for the caller to tell one cause from another.
+_PASSTHROUGH_STATUS_CODES = frozenset({400, 404})
+
+
+def upstream_error(result: Dict[str, Any], fallback: str) -> HTTPException:
+    """Build the HTTP error for a service call that reported failure.
+
+    The service layer puts ``str(exc)`` into ``result["message"]``, so passing
+    that straight into ``detail`` -- which every endpoint here used to do --
+    hands the caller Playwright, Redis and DNS internals: container host names,
+    file paths, ports, and a different sentence per cause. The message is
+    logged and the caller gets ``fallback``, which is a constant chosen per
+    endpoint and never varies with the reason.
+
+    Args:
+        result: The service's error dict.
+        fallback: Constant, cause-independent detail for the response.
+
+    Returns:
+        The exception to raise.
+    """
+    logger.warning("Upstream failure (%s): %s", fallback, result.get("message"))
+    status_code = result.get("status_code")
+    if status_code not in _PASSTHROUGH_STATUS_CODES:
+        status_code = 500
+    detail = NOT_FOUND_DETAIL if status_code == 404 else fallback
+    return HTTPException(status_code=status_code, detail=detail)
+
 
 def places_from_result(result: Dict[str, Any], context: str) -> List[Dict[str, Any]]:
     """Extract the place list from a service result, or fail loudly.
@@ -91,6 +124,23 @@ def validate_maps_url(value: Optional[str]) -> Optional[str]:
 
     Returns:
         The normalised URL, or ``value`` unchanged when it is empty.
+
+    Known residual risk, not fixable from this layer:
+
+    This validates the URL the caller supplied and nothing after it. Chromium
+    then follows redirects on its own, and ``MAPS_ALLOWED_HOSTS`` includes
+    ``goo.gl`` and ``maps.app.goo.gl`` -- shorteners -- as well as
+    ``www.google.com``, which has historically carried open redirects. Any
+    working redirector on an allow-listed host therefore reaches whatever it
+    points at. ``ValidatedUrl.ip_addresses`` exists so the caller can pin the
+    connection and close the same window against DNS rebinding, and is
+    discarded here because the service layer does not yet accept it.
+
+    Closing this properly means enforcing the allow-list at navigation time --
+    a Playwright route handler that re-checks every request the page makes,
+    pinned to the validated addresses -- which belongs in the scraper, not
+    here. Until then treat the allow-list as reducing the attack surface, not
+    as a complete barrier.
 
     Raises:
         ValueError: carrying ``_URL_REJECTED_MARKER`` and nothing else.

@@ -14,6 +14,7 @@ from app.api.google_maps.common import (
     INTERNAL_ERROR_DETAIL,
     SafeUrlValidationRoute,
     places_from_result,
+    upstream_error,
 )
 from app.api.google_maps.schemas import (
     SearchRequest,
@@ -114,10 +115,7 @@ async def search_places(
             )
 
             if result.get("error"):
-                raise HTTPException(
-                    status_code=500,
-                    detail=result.get("message", "Search failed")
-                )
+                raise upstream_error(result, "Search failed")
 
             # Process the results
             places = places_from_result(result, "search")
@@ -144,10 +142,7 @@ async def search_places(
             )
 
             if job_result.get("error"):
-                raise HTTPException(
-                    status_code=500,
-                    detail=job_result.get("message", "Failed to create search job")
-                )
+                raise upstream_error(job_result, "Failed to create search job")
 
             return {
                 "success": True,
@@ -259,10 +254,7 @@ async def nearby_search(
         )
 
         if result.get("error"):
-            raise HTTPException(
-                status_code=500,
-                detail=result.get("message", "Nearby search failed")
-            )
+            raise upstream_error(result, "Nearby search failed")
 
         places = result.get("places", [])
         if isinstance(places, list):
@@ -372,7 +364,7 @@ async def grid_search(
         )
 
         if result.get("error"):
-            raise HTTPException(status_code=500, detail=result.get("message"))
+            raise upstream_error(result, "Grid search failed")
 
         result["timestamp"] = datetime.now().isoformat()
         return result
@@ -424,7 +416,7 @@ async def bounding_box_search(
         )
 
         if result.get("error"):
-            raise HTTPException(status_code=500, detail=result.get("message"))
+            raise upstream_error(result, "Bounding box search failed")
 
         result["bounding_box"] = {
             "north_lat": request.north_lat,
@@ -481,7 +473,7 @@ async def location_search(
         )
 
         if result.get("error"):
-            raise HTTPException(status_code=500, detail=result.get("message"))
+            raise upstream_error(result, "Location search failed")
 
         result["timestamp"] = datetime.now().isoformat()
         return result
@@ -604,10 +596,7 @@ async def autocomplete(
         )
 
         if result.get("error"):
-            raise HTTPException(
-                status_code=result.get("status_code", 500),
-                detail=result.get("message", "Autocomplete failed")
-            )
+            raise upstream_error(result, "Autocomplete failed")
 
         return {
             "success": True,
@@ -664,10 +653,7 @@ async def bulk_search(
         )
 
         if result.get("error"):
-            raise HTTPException(
-                status_code=500,
-                detail=result.get("message", "Bulk search failed")
-            )
+            raise upstream_error(result, "Bulk search failed")
 
         return {
             "success": True,

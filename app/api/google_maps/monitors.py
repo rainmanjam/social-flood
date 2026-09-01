@@ -9,7 +9,11 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 
-from app.api.google_maps.common import INTERNAL_ERROR_DETAIL, SafeUrlValidationRoute
+from app.api.google_maps.common import (
+    INTERNAL_ERROR_DETAIL,
+    SafeUrlValidationRoute,
+    upstream_error,
+)
 from app.api.google_maps.schemas import (
     MonitorRequest,
     WebhookRequest,
@@ -65,10 +69,7 @@ async def create_monitor(
         )
 
         if result.get("error"):
-            raise HTTPException(
-                status_code=500,
-                detail=result.get("message", "Failed to create monitor")
-            )
+            raise upstream_error(result, "Failed to create monitor")
 
         return {
             "success": True,
@@ -116,10 +117,7 @@ async def list_monitors(
         )
 
         if result.get("error"):
-            raise HTTPException(
-                status_code=500,
-                detail=result.get("message", "Failed to list monitors")
-            )
+            raise upstream_error(result, "Failed to list monitors")
 
         return {
             "success": True,
@@ -162,10 +160,7 @@ async def get_monitor(
         if result.get("error"):
             if result.get("status_code") == 404:
                 raise HTTPException(status_code=404, detail="Monitor not found")
-            raise HTTPException(
-                status_code=500,
-                detail=result.get("message", "Failed to get monitor")
-            )
+            raise upstream_error(result, "Failed to get monitor")
 
         return {
             "success": True,
@@ -200,10 +195,7 @@ async def delete_monitor(
         if result.get("error"):
             if result.get("status_code") == 404:
                 raise HTTPException(status_code=404, detail="Monitor not found")
-            raise HTTPException(
-                status_code=500,
-                detail=result.get("message", "Failed to delete monitor")
-            )
+            raise upstream_error(result, "Failed to delete monitor")
 
         return {
             "success": True,
@@ -256,10 +248,7 @@ async def register_webhook(
         )
 
         if result.get("error"):
-            raise HTTPException(
-                status_code=500,
-                detail=result.get("message", "Failed to register webhook")
-            )
+            raise upstream_error(result, "Failed to register webhook")
 
         return {
             "success": True,
@@ -293,10 +282,7 @@ async def list_webhooks(
         result = await google_maps_service.list_webhooks()
 
         if result.get("error"):
-            raise HTTPException(
-                status_code=500,
-                detail=result.get("message", "Failed to list webhooks")
-            )
+            raise upstream_error(result, "Failed to list webhooks")
 
         return {
             "success": True,
@@ -330,10 +316,7 @@ async def delete_webhook(
         if result.get("error"):
             if result.get("status_code") == 404:
                 raise HTTPException(status_code=404, detail="Webhook not found")
-            raise HTTPException(
-                status_code=500,
-                detail=result.get("message", "Failed to delete webhook")
-            )
+            raise upstream_error(result, "Failed to delete webhook")
 
         return {
             "success": True,

@@ -10,7 +10,11 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 
-from app.api.google_maps.common import INTERNAL_ERROR_DETAIL, SafeUrlValidationRoute
+from app.api.google_maps.common import (
+    INTERNAL_ERROR_DETAIL,
+    SafeUrlValidationRoute,
+    upstream_error,
+)
 from app.api.google_maps.schemas import (
     PlaceLookupRequest,
 )
@@ -48,10 +52,7 @@ async def get_place_by_id(
         result = await google_maps_service.get_place_by_id(place_id)
 
         if result.get("error"):
-            raise HTTPException(
-                status_code=result.get("status_code", 500),
-                detail=result.get("message", "Failed to get place details")
-            )
+            raise upstream_error(result, "Failed to get place details")
 
         return {
             "success": True,
@@ -99,10 +100,7 @@ async def lookup_place(
         )
 
         if result.get("error"):
-            raise HTTPException(
-                status_code=result.get("status_code", 500),
-                detail=result.get("message", "Failed to lookup place")
-            )
+            raise upstream_error(result, "Failed to lookup place")
 
         return {
             "success": True,
@@ -160,10 +158,7 @@ async def get_place_reviews(
         )
 
         if result.get("error"):
-            raise HTTPException(
-                status_code=result.get("status_code", 500),
-                detail=result.get("message", "Failed to get reviews")
-            )
+            raise upstream_error(result, "Failed to get reviews")
 
         return {
             "success": True,
@@ -228,10 +223,7 @@ async def get_place_photos(
         )
 
         if result.get("error"):
-            raise HTTPException(
-                status_code=result.get("status_code", 500),
-                detail=result.get("message", "Failed to get photos")
-            )
+            raise upstream_error(result, "Failed to get photos")
 
         return {
             "success": True,
@@ -278,10 +270,7 @@ async def get_place_qa(
         )
 
         if result.get("error"):
-            raise HTTPException(
-                status_code=result.get("status_code", 500),
-                detail=result.get("message", "Failed to get Q&A")
-            )
+            raise upstream_error(result, "Failed to get Q&A")
 
         return {
             "success": True,
@@ -334,10 +323,7 @@ async def extract_menu(
         )
 
         if result.get("error"):
-            raise HTTPException(
-                status_code=result.get("status_code", 500),
-                detail=result.get("message", "Failed to extract menu")
-            )
+            raise upstream_error(result, "Failed to extract menu")
 
         return {
             "success": True,
@@ -385,10 +371,7 @@ async def get_place_attributes(
         )
 
         if result.get("error"):
-            raise HTTPException(
-                status_code=result.get("status_code", 500),
-                detail=result.get("message", "Failed to get attributes")
-            )
+            raise upstream_error(result, "Failed to get attributes")
 
         return {
             "success": True,
@@ -441,10 +424,7 @@ async def get_place_history(
         )
 
         if result.get("error"):
-            raise HTTPException(
-                status_code=result.get("status_code", 500),
-                detail=result.get("message", "Failed to get history")
-            )
+            raise upstream_error(result, "Failed to get history")
 
         return {
             "success": True,
@@ -491,10 +471,7 @@ async def check_availability(
         )
 
         if result.get("error"):
-            raise HTTPException(
-                status_code=result.get("status_code", 500),
-                detail=result.get("message", "Failed to check availability")
-            )
+            raise upstream_error(result, "Failed to check availability")
 
         return {
             "success": True,
