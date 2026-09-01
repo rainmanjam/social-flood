@@ -200,6 +200,13 @@ def is_empty_result(value) -> bool:
 
     Empty is a legitimate answer (a keyword nobody searched for), so it is
     reported as 200 with an explanatory message -- never as a failure.
+
+    ``None`` is counted as empty deliberately: trendspy returns it for "no
+    data", and every way of *failing* now raises instead (see
+    :func:`run_trends_call`), so ``None`` no longer doubles as a swallowed
+    error the way it did when each endpoint caught ``Exception`` and returned
+    ``None`` itself. If a future trendspy release starts returning ``None``
+    for errors as well, this is the line that has to change.
     """
     if value is None:
         return True

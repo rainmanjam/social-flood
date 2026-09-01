@@ -1,3 +1,4 @@
+import httpx
 import pytest
 from unittest import mock
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -37,6 +38,35 @@ def clear_cache():
     cache_manager_module._cache_store.clear()
     yield
     cache_manager_module._cache_store.clear()
+
+
+@pytest.fixture
+def stub_article_fetch(monkeypatch):
+    """Serve /article-details/ a canned HTTP response instead of the network.
+
+    The endpoint fetches the page itself (so it can re-validate redirects)
+    rather than letting newspaper do it, so the HTTP client is what tests have
+    to stand in for. Returns a setter for the response the client will give.
+    """
+    mock_client = AsyncMock()
+
+    def set_response(response):
+        mock_client.get = AsyncMock(return_value=response)
+
+    set_response(
+        httpx.Response(
+            200,
+            html="<html><body><p>Test article content</p></body></html>",
+            request=httpx.Request("GET", "https://example.com/article"),
+        )
+    )
+
+    async def fake_get_client(proxy_url=None):
+        return mock_client
+
+    monkeypatch.setattr(google_news_api, "get_gnews_http_client", fake_get_client)
+    set_response.client = mock_client
+    return set_response
 
 
 @pytest.fixture
@@ -425,7 +455,9 @@ async def test_get_google_news_articles_success(mock_decode_process, mock_get_gn
 # Test /article-details/ endpoint
 @pytest.mark.asyncio
 @patch('app.api.google_news.google_news_api.Article')
-async def test_get_article_details_success(mock_article_class, allow_example_articles):
+async def test_get_article_details_success(
+    mock_article_class, allow_example_articles, stub_article_fetch
+):
     # Create a mock article instance
     mock_article = MagicMock()
     mock_article.title = "Test Article Title"
@@ -641,20 +673,18 @@ def test_article_details_refusals_are_indistinguishable(allow_example_articles, 
     assert response.json() == {"detail": "The supplied URL is not permitted."}
 
 
-@patch('app.api.google_news.google_news_api.Article')
-def test_article_details_does_not_leak_upstream_failure(mock_article_class, allow_example_articles):
+def test_article_details_does_not_leak_upstream_failure(
+    allow_example_articles, stub_article_fetch
+):
     """A fetch failure must not describe itself to the caller.
 
-    The old handler returned 503 with the newspaper exception text, which
-    named the host and said why the connection failed.
+    The old handler returned 503 with the exception text, which named the host
+    and said why the connection failed -- so a caller could tell "port closed"
+    from "port open but not HTML" and map the internal network.
     """
-    from newspaper import ArticleException
-
-    mock_article = MagicMock()
-    mock_article.download.side_effect = ArticleException(
-        "Connection refused to 10.0.0.5:6379"
+    stub_article_fetch.client.get = AsyncMock(
+        side_effect=httpx.ConnectError("Connection refused to 10.0.0.5:6379")
     )
-    mock_article_class.return_value = mock_article
 
     response = client.get(
         "/news/article-details/", params={"url": "https://example.com/article"}
@@ -664,6 +694,96 @@ def test_article_details_does_not_leak_upstream_failure(mock_article_class, allo
     assert response.json() == {"detail": "Could not retrieve the requested article."}
     assert "10.0.0.5" not in response.text
     assert "refused" not in response.text.lower()
+
+
+def test_article_details_does_not_follow_redirect_off_the_allow_list():
+    """A redirect is a second request and gets the same validation.
+
+    Validating once and handing the URL to a library that follows redirects
+    checks only the first hop: an allow-listed host answering
+    ``302 -> http://169.254.169.254/`` would send the library somewhere the
+    guard never saw.
+    """
+    redirect = httpx.Response(
+        302,
+        headers={"location": "http://169.254.169.254/latest/meta-data/"},
+        request=httpx.Request("GET", "https://example.com/article"),
+    )
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=redirect)
+
+    with patch('app.api.google_news.google_news_api.ARTICLE_DETAILS_ALLOWED_HOSTS',
+               ("example.com", ".example.com")), \
+         patch('app.api.google_news.google_news_api.ARTICLE_DETAILS_RESOLVE_DNS', False), \
+         patch('app.api.google_news.google_news_api.get_gnews_http_client',
+               new_callable=AsyncMock) as mock_get_client, \
+         patch('app.api.google_news.google_news_api.Article') as mock_article_class:
+        mock_get_client.return_value = mock_client
+
+        response = client.get(
+            "/news/article-details/", params={"url": "https://example.com/article"}
+        )
+
+    # The redirect target was refused, so nothing was ever parsed.
+    assert response.status_code == 502
+    assert response.json() == {"detail": "Could not retrieve the requested article."}
+    mock_article_class.assert_not_called()
+    # Exactly one outbound request: the redirect was not followed.
+    assert mock_client.get.await_count == 1
+    assert mock_client.get.await_args.kwargs["follow_redirects"] is False
+
+
+def test_article_details_follows_an_allow_listed_redirect():
+    """A redirect that stays on the allow-list is followed and parsed."""
+    hop = httpx.Response(
+        302,
+        headers={"location": "https://www.example.com/final"},
+        request=httpx.Request("GET", "https://example.com/article"),
+    )
+    final = httpx.Response(
+        200,
+        html="<html><body><p>Body text</p></body></html>",
+        request=httpx.Request("GET", "https://www.example.com/final"),
+    )
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=[hop, final])
+
+    mock_article = MagicMock()
+    mock_article.title = "Redirected"
+    mock_article.text = "Body text"
+    mock_article.authors = []
+    mock_article.publish_date = None
+    mock_article.top_image = ""
+    mock_article.images = set()
+    mock_article.movies = []
+    mock_article.meta_data = {}
+    mock_article.meta_description = ""
+    mock_article.meta_keywords = ""
+    mock_article.summary = ""
+    mock_article.keywords = []
+
+    with patch('app.api.google_news.google_news_api.ARTICLE_DETAILS_ALLOWED_HOSTS',
+               ("example.com", ".example.com")), \
+         patch('app.api.google_news.google_news_api.ARTICLE_DETAILS_RESOLVE_DNS', False), \
+         patch('app.api.google_news.google_news_api.get_gnews_http_client',
+               new_callable=AsyncMock) as mock_get_client, \
+         patch('app.api.google_news.google_news_api.Article') as mock_article_class:
+        mock_get_client.return_value = mock_client
+        mock_article_class.return_value = mock_article
+
+        response = client.get(
+            "/news/article-details/", params={"url": "https://example.com/article"}
+        )
+
+    assert response.status_code == 200
+    assert response.json()["title"] == "Redirected"
+    # Newspaper parsed the body we fetched; it made no request of its own.
+    mock_article.download.assert_called_once_with(
+        "<html><body><p>Body text</p></body></html>"
+    )
+    assert mock_article_class.call_args[0][0] == "https://www.example.com/final"
 
 
 def test_article_details_default_allow_list_is_closed():
@@ -859,6 +979,51 @@ def test_total_decode_failure_is_502_not_404():
     assert response.json() == {
         "detail": "Could not resolve articles from Google News. Please retry."
     }
+
+
+def test_partial_results_are_not_cached():
+    """A partial result must not be pinned for the whole TTL.
+
+    Caching one is the quieter version of caching a failure: the short list
+    gets served to everyone for ten minutes, and nothing about the response
+    says it came from a bad moment rather than from Google News.
+    """
+    from app.api.google_news.google_news_api import ProcessedArticles
+
+    def article(title):
+        return NewsArticle(
+            title=title,
+            url=f"http://decoded.com/{title}",
+            publisher="Pub",
+            published_date="date",
+            description="desc",
+        ).model_dump()
+
+    mock_gnews_instance = MagicMock()
+    mock_gnews_instance.get_top_news.return_value = [{"title": "a"}, {"title": "b"}]
+
+    with patch('app.api.google_news.google_news_api.get_gnews_instance', new_callable=AsyncMock) as mock_get_gnews, \
+         patch('app.api.google_news.google_news_api.decode_and_process_articles', new_callable=AsyncMock) as mock_decode_process:
+        mock_get_gnews.return_value = mock_gnews_instance
+        mock_decode_process.return_value = ProcessedArticles(
+            [article("one")], total=2, failed=1
+        )
+
+        first = client.get("/news/top/")
+        assert first.status_code == 200
+        assert first.json()["partial"] is True
+        assert cache_manager_module._cache_store == {}
+
+        # The transient failure clears: the next request sees both articles.
+        mock_decode_process.return_value = ProcessedArticles(
+            [article("one"), article("two")], total=2, failed=0
+        )
+        second = client.get("/news/top/")
+
+    assert len(second.json()["articles"]) == 2
+    assert "partial" not in second.json()
+    # A complete result is worth keeping.
+    assert cache_manager_module._cache_store != {}
 
 
 def test_failed_news_response_is_not_cached():

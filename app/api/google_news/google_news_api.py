@@ -244,10 +244,22 @@ def generate_cache_key(base_key: str, **params) -> str:
     return key
 
 
+def is_cacheable(value: Any) -> bool:
+    """Return False for results that must not outlive the request.
+
+    A partial response is the visible half of a transient failure: some
+    articles were lost this time. Storing it would pin that loss for the whole
+    TTL and serve the short list to everyone -- the same mistake as caching an
+    outright failure, just harder to notice.
+    """
+    return not (isinstance(value, dict) and value.get("partial"))
+
+
 async def get_cached_or_fetch(
     cache_key: str,
     fetch_func: Callable[[], Any],
     ttl: Optional[int] = None,
+    should_cache: Callable[[Any], bool] = is_cacheable,
 ) -> Any:
     """Return the cached value for ``cache_key``, or fetch and store it.
 
@@ -255,6 +267,10 @@ async def get_cached_or_fetch(
     Google News gives us nothing usable -- propagate untouched and nothing is
     written to the cache. Caching a failure as if it were a result is how one
     upstream blip becomes an hour of wrong answers.
+
+    Args:
+        should_cache: Decides whether a successful result is worth keeping.
+            Defaults to :func:`is_cacheable`, which refuses partial results.
     """
     if not getattr(settings, "ENABLE_CACHE", True):
         return await fetch_func()
@@ -265,7 +281,10 @@ async def get_cached_or_fetch(
         return cached
 
     data = await fetch_func()
-    await cache_manager.set(cache_key, data, ttl=ttl, namespace=CACHE_NAMESPACE)
+    if should_cache(data):
+        await cache_manager.set(cache_key, data, ttl=ttl, namespace=CACHE_NAMESPACE)
+    else:
+        logger.info("Not caching a partial result for %s", cache_key)
     return data
 
 
@@ -733,12 +752,18 @@ def transform_article(article: dict) -> dict:
 # -----------------------------------------------------------------------------
 
 @gnews_router.get("/available-languages/", summary="Available Languages", response_model=dict)
-async def get_languages():
+async def get_languages(
+    # === AUTH ===
+    rate_limit_check: None = Depends(rate_limit),
+):
     """Get supported languages for Google News."""
     return {"available_languages": AVAILABLE_LANGUAGES}
 
 @gnews_router.get("/available-countries/", summary="Available Countries", response_model=dict)
-async def get_available_countries():
+async def get_available_countries(
+    # === AUTH ===
+    rate_limit_check: None = Depends(rate_limit),
+):
     """Get supported countries for Google News."""
     return {"available_countries": AVAILABLE_COUNTRIES}
 
@@ -755,6 +780,8 @@ async def get_news_by_source(
     end_date: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$", description="End date (YYYY-MM-DD)"),
     # === OPTIONS ===
     exclude_duplicates: bool = Query(False, description="Exclude duplicates"),
+    # === AUTH ===
+    rate_limit_check: None = Depends(rate_limit),
 ):
     """Get news articles from a specific source."""
     try:
@@ -900,6 +927,8 @@ async def get_top_google_news(
     language: str = Query("en", description="Language code", example="en"),
     country: str = Query("US", description="Country code", example="US"),
     max_results: int = Query(10, ge=1, le=100, description="Max results (1-100)"),
+    # === AUTH ===
+    rate_limit_check: None = Depends(rate_limit),
 ):
     """Get top news articles."""
     try:
@@ -950,6 +979,8 @@ async def get_news_by_topic(
     max_results: int = Query(5, ge=1, le=100, description="Max results (1-100)"),
     # === OPTIONS ===
     exclude_duplicates: bool = Query(False, description="Exclude duplicates"),
+    # === AUTH ===
+    rate_limit_check: None = Depends(rate_limit),
 ):
     """Get news articles by topic."""
     if topic.upper() not in AVAILABLE_TOPICS:
@@ -1011,6 +1042,8 @@ async def get_news_by_location(
     end_date: Optional[str] = Query(None, regex=r"^\d{4}-\d{2}-\d{2}$", description="End date (YYYY-MM-DD)"),
     # === OPTIONS ===
     exclude_duplicates: bool = Query(False, description="Exclude duplicates"),
+    # === AUTH ===
+    rate_limit_check: None = Depends(rate_limit),
 ):
     """Get news articles by location."""
     try:
@@ -1078,6 +1111,8 @@ async def get_google_news_articles(
     max_results: int = Query(5, ge=1, le=100, description="Max results (1-100)"),
     # === TIME PERIOD ===
     period: str = Query("1d", regex=r"^\d+[dwmy]$", description="Period: 7d, 1w, 1m, 1y"),
+    # === AUTH ===
+    rate_limit_check: None = Depends(rate_limit),
 ):
     """Get bulk news articles over a time period."""
     try:
@@ -1165,21 +1200,84 @@ BLOCKED_URL_DETAIL = "The supplied URL is not permitted."
 ARTICLE_FETCH_FAILED_DETAIL = "Could not retrieve the requested article."
 
 
+# A redirect chain is bounded: each hop is another outbound request, and an
+# unbounded chain is a cheap way to keep a worker busy.
+ARTICLE_MAX_REDIRECTS = 3
+
+
+def validate_article_url(raw_url: str):
+    """Run a URL through the shared guard with this endpoint's policy."""
+    return validate_outbound_url(
+        raw_url,
+        allowed_hosts=ARTICLE_DETAILS_ALLOWED_HOSTS,
+        allow_http=ARTICLE_DETAILS_ALLOW_HTTP,
+        resolve_dns=ARTICLE_DETAILS_RESOLVE_DNS,
+    )
+
+
+async def fetch_allow_listed_html(validated_url: str) -> Tuple[str, str]:
+    """Fetch ``validated_url``, re-validating every redirect it is sent on.
+
+    Validating once and then handing the URL to a library that follows
+    redirects checks only the first hop: an allow-listed host that answers
+    ``302 Location: http://169.254.169.254/`` sends the *library's* request
+    somewhere the guard never saw. Redirects are therefore not followed
+    automatically; each ``Location`` goes back through the same validation as
+    the caller's original URL.
+
+    Returns:
+        ``(html, final_url)`` -- the body, and the URL it actually came from.
+
+    Raises:
+        UrlNotAllowed: if any hop fails validation.
+        httpx.HTTPError: on a transport or status failure.
+
+    Known residual risk: between validation and connect, a hostile DNS server
+    could swap a public answer for a private one (rebinding). Closing that
+    needs connection-level pinning to ``ValidatedUrl.ip_addresses``, which
+    httpx cannot express without a custom transport. The window is narrow
+    here because the host must already be on an operator-managed allow-list.
+    """
+    proxy_url = await get_proxy()
+    client = await get_gnews_http_client(proxy_url=proxy_url)
+
+    current = validated_url
+    for _ in range(ARTICLE_MAX_REDIRECTS + 1):
+        response = await client.get(
+            current,
+            follow_redirects=False,
+            timeout=settings.HTTP_READ_TIMEOUT,
+            headers={"User-Agent": USER_AGENTS["windows_chrome"]},
+        )
+
+        if not response.is_redirect:
+            response.raise_for_status()
+            return response.text, current
+
+        location = response.headers.get("location")
+        if not location:
+            raise UrlNotAllowed("redirect without a Location header")
+
+        # Relative redirects resolve against the current URL; validating the
+        # joined result means a relative hop cannot smuggle in a new host.
+        next_url = str(httpx.URL(current).join(location))
+        current = validate_article_url(next_url).url
+
+    raise UrlNotAllowed(f"redirect chain exceeded {ARTICLE_MAX_REDIRECTS} hops")
+
+
 @gnews_router.get("/article-details/", summary="Article Details", response_model=dict)
 async def get_article_details(
     # === REQUIRED ===
     url: str = Query(..., description="Article URL to analyze"),
+    # === AUTH ===
+    rate_limit_check: None = Depends(rate_limit),
 ):
     """Get detailed article information (title, text, summary, keywords)."""
     try:
         # Validate BEFORE anything else touches the URL: no fetch, no cache
         # lookup, no logging of the target at info level.
-        validated = validate_outbound_url(
-            url,
-            allowed_hosts=ARTICLE_DETAILS_ALLOWED_HOSTS,
-            allow_http=ARTICLE_DETAILS_ALLOW_HTTP,
-            resolve_dns=ARTICLE_DETAILS_RESOLVE_DNS,
-        )
+        validated = validate_article_url(url)
     except UrlNotAllowed as exc:
         # Detail to the logs, generic message to the caller.
         logger.warning("Blocked outbound article fetch: %s", exc.reason)
@@ -1198,27 +1296,23 @@ async def get_article_details(
             # Ensure NLTK is set up (only runs once)
             await ensure_nltk_setup()
 
-            proxy_url = await get_proxy()  # Adjust if needed
+            # Fetch here rather than letting newspaper do it. Newspaper follows
+            # redirects itself, and a redirect is a second, unvalidated request
+            # -- an allow-listed host answering "302 -> http://169.254.169.254"
+            # would walk straight past the check above. fetch_allow_listed_html
+            # re-validates every hop.
+            html, final_url = await fetch_allow_listed_html(target_url)
 
             config = Config()
             config.request_timeout = settings.HTTP_READ_TIMEOUT  # Use configured timeout
             config.thread_timeout = settings.HTTP_READ_TIMEOUT
-            if proxy_url:
-                logger.debug(f"Using proxy settings for requests: {proxy_url}")
-                config.proxies = {
-                    "http": proxy_url,
-                    "https": proxy_url
-                }
-            else:
-                logger.debug("No proxy is being used.")
 
-            # Use asyncio to run newspaper operations
             loop = asyncio.get_event_loop()
 
-            # Fetch the normalised URL that passed validation, never the raw
-            # caller string.
-            article = Article(target_url, config=config)
-            await loop.run_in_executor(None, article.download)
+            # input_html means newspaper parses what we already fetched and
+            # makes no network request of its own.
+            article = Article(final_url, config=config)
+            await loop.run_in_executor(None, article.download, html)
 
             # Parse article
             await loop.run_in_executor(None, article.parse)
@@ -1264,6 +1358,12 @@ async def get_article_details(
 
     except HTTPException:
         raise
+    except UrlNotAllowed as exc:
+        # A redirect hop failed validation. Reported exactly like any other
+        # fetch failure, so the response cannot say whether the allow-listed
+        # host tried to redirect us somewhere internal.
+        logger.warning("Blocked redirect while fetching article: %s", exc.reason)
+        raise HTTPException(status_code=502, detail=ARTICLE_FETCH_FAILED_DETAIL)
     except ArticleException as ae:
         # The old body echoed the target host and the underlying failure, which
         # let a caller tell "port closed" from "port open but not HTML" and use
