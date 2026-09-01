@@ -453,7 +453,9 @@ class GoogleMapsScraper:
         self._browser = None
         self._playwright = None
         self._semaphore: Optional[asyncio.Semaphore] = None
+        self._init_lock = asyncio.Lock()
         # Per-search extraction bookkeeping; see _assert_selectors_fresh.
+        self._candidates = 0
         self._attempted = 0
         self._extracted = 0
         self._partial = 0
@@ -489,17 +491,25 @@ class GoogleMapsScraper:
 
         from playwright.async_api import async_playwright
 
-        semaphore = _browser_semaphore()
-        await semaphore.acquire()
-        self._semaphore = semaphore
-        try:
-            await self._launch(async_playwright)
-        except BaseException:
-            # Never leak a permit on a failed launch, or the cap ratchets down
-            # to zero and every later request deadlocks.
-            self._semaphore = None
-            semaphore.release()
-            raise
+        # The check-then-acquire below is not atomic across awaits, so two
+        # coroutines sharing one scraper could each take a permit and only one
+        # would ever be released. The instance lock makes initialisation
+        # single-entry.
+        async with self._init_lock:
+            if self._browser is not None or self._semaphore is not None:
+                return
+
+            semaphore = _browser_semaphore()
+            await semaphore.acquire()
+            self._semaphore = semaphore
+            try:
+                await self._launch(async_playwright)
+            except BaseException:
+                # Never leak a permit on a failed launch, or the cap ratchets
+                # down to zero and every later request deadlocks.
+                self._semaphore = None
+                semaphore.release()
+                raise
 
     def _release_semaphore(self) -> None:
         """Give back the browser permit, at most once."""
@@ -609,6 +619,7 @@ class GoogleMapsScraper:
         # we found a card/link for and tried to open; ``extracted`` counts the
         # ones that yielded a usable record. attempted > 0 with extracted == 0
         # is the fingerprint of a DOM rotation, not of an empty area.
+        self._candidates = 0
         self._attempted = 0
         self._extracted = 0
         self._partial = 0
@@ -699,6 +710,7 @@ class GoogleMapsScraper:
                     results = await self._extract_from_place_links(page, place_links, max_results)
                 else:
                     # Single place result - extract directly
+                    self._candidates += 1
                     self._attempted += 1
                     try:
                         place_data = await self._extract_place_details(page)
@@ -749,10 +761,16 @@ class GoogleMapsScraper:
                 missing=["div[role='feed']", "a[href*='/maps/place/']"],
             )
 
-        if self._attempted > 0 and self._extracted == 0:
+        # ``candidates`` rather than ``attempted``: a card that was visible but
+        # never reached extraction -- because its link selector matched
+        # nothing, or clicking it threw -- is still evidence that results exist
+        # and we cannot read them. Keying off ``attempted`` alone would let a
+        # link-selector rotation return a successful empty list.
+        if self._candidates > 0 and self._extracted == 0:
             raise SelectorsStaleError(
-                f"Found {self._attempted} candidate place(s) for {query!r} but "
-                f"extracted none of them; Google Maps markup has likely changed",
+                f"Found {self._candidates} candidate place(s) for {query!r} but "
+                f"extracted none of them ({self._attempted} reached the details "
+                f"panel); Google Maps markup has likely changed",
                 attempted=self._attempted,
                 extracted=self._extracted,
                 missing=sorted(set(self._required_misses)) or list(REQUIRED_PLACE_FIELDS),
@@ -776,6 +794,9 @@ class GoogleMapsScraper:
         results = []
         seen_names = set()
         link_count = await place_links.count()
+        # Every link is a candidate; extracting none of them is a stale-selector
+        # signal, not an empty result. See _assert_selectors_fresh.
+        self._candidates = max(self._candidates, min(link_count, max_results))
 
         for i in range(min(link_count, max_results)):
             try:
@@ -818,7 +839,13 @@ class GoogleMapsScraper:
         return results
 
     async def _extract_search_results(self, page, max_results: int) -> List[Dict[str, Any]]:
-        """Extract places from search results list."""
+        """Extract places from search results list.
+
+        Raises:
+            SelectorsStaleError: The feed rendered and contains place links,
+                but the card selector matched none of them. Returning ``[]``
+                here would report a card-markup change as an empty area.
+        """
         results = []
         seen_names = set()
         scroll_count = 0
@@ -828,6 +855,29 @@ class GoogleMapsScraper:
             # Find all place cards in the feed
             place_cards = page.locator("div[role='feed'] > div > div[jsaction]")
             card_count = await place_cards.count()
+
+            if card_count == 0 and not results:
+                # The feed exists but our card selector sees nothing in it.
+                # Place links are how a result manifests regardless of the
+                # surrounding card markup, so they discriminate the two cases:
+                # links present means our selector went stale; no links means
+                # the area really is empty.
+                stray_links = await page.locator("a[href*='/maps/place/']").count()
+                if stray_links > 0:
+                    raise SelectorsStaleError(
+                        f"The results feed contains {stray_links} place link(s) "
+                        f"but the card selector matched none of them; the "
+                        f"result-card markup has changed",
+                        attempted=0,
+                        extracted=0,
+                        missing=["div[role='feed'] > div > div[jsaction]"],
+                    )
+                break
+
+            # Candidates are cards we can see. If we can see candidates and
+            # extract nothing from any of them, search() treats that as stale
+            # rather than as an empty result -- see _assert_selectors_fresh.
+            self._candidates = max(self._candidates, card_count)
 
             for i in range(card_count):
                 if len(results) >= max_results:
@@ -1528,35 +1578,31 @@ class GoogleMapsScraper:
     async def _extract_expanded_hours(self, page) -> Optional[Dict[str, List[str]]]:
         """Extract hours from expanded hours table.
 
-        Returns None when no hours row parses. Opening hours are optional --
-        plenty of listings have none -- and the caller runs this inside
-        :meth:`_optional`, so a wholesale failure is still recorded rather than
-        vanishing.
+        Returns None when no hours row parses -- opening hours are optional and
+        plenty of listings have none. A locator that *raises* is deliberately
+        not caught here: the caller runs this inside :meth:`_optional`, which
+        records the miss, so swallowing it locally would hide it again.
         """
-        try:
-            hours = {}
-            # Look for table rows with day and time info
-            rows = page.locator("table tr, div[role='listitem']")
-            row_count = await rows.count()
+        hours = {}
+        # Look for table rows with day and time info
+        rows = page.locator("table tr, div[role='listitem']")
+        row_count = await rows.count()
 
-            days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+        days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
 
-            for i in range(row_count):
-                row = rows.nth(i)
-                row_text = await row.text_content()
-                if row_text:
-                    for day in days:
-                        if day in row_text:
-                            # Extract time portion
-                            time_match = re.search(r'(\d{1,2}(?::\d{2})?\s*(?:AM|PM)\s*[–-]\s*\d{1,2}(?::\d{2})?\s*(?:AM|PM)|Closed|Open 24 hours)', row_text, re.IGNORECASE)
-                            if time_match:
-                                hours[day] = [time_match.group(0)]
-                            break
+        for i in range(row_count):
+            row = rows.nth(i)
+            row_text = await row.text_content()
+            if row_text:
+                for day in days:
+                    if day in row_text:
+                        # Extract time portion
+                        time_match = re.search(r'(\d{1,2}(?::\d{2})?\s*(?:AM|PM)\s*[–-]\s*\d{1,2}(?::\d{2})?\s*(?:AM|PM)|Closed|Open 24 hours)', row_text, re.IGNORECASE)
+                        if time_match:
+                            hours[day] = [time_match.group(0)]
+                        break
 
-            return hours if hours else None
-        except Exception as exc:
-            logger.debug("Expanded hours table not parsed: %s", exc)
-            return None
+        return hours if hours else None
 
     def _parse_hours_label(self, label: str) -> Optional[Dict[str, List[str]]]:
         """Parse hours from aria-label into structured format."""

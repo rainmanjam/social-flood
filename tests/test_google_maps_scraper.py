@@ -471,6 +471,35 @@ class TestBrowserConcurrency:
             await asyncio.wait_for(scraper._init_browser(), timeout=2)
             await scraper.close()
 
+    async def test_concurrent_init_on_one_scraper_takes_a_single_permit(self):
+        # Two coroutines sharing a scraper used to race the `is None` check and
+        # each take a permit, of which only one was ever released.
+        configure_limits(max_concurrent_browsers=2)
+        launches = []
+
+        async def fake_launch(self, _async_playwright):
+            launches.append(1)
+            await REAL_SLEEP(0.01)
+
+        with patch.object(GoogleMapsScraper, "_launch", fake_launch):
+            scraper = GoogleMapsScraper()
+            # Bounded: four racing inits against a cap of two would otherwise
+            # deadlock here rather than fail.
+            await asyncio.wait_for(
+                asyncio.gather(*(scraper._init_browser() for _ in range(4))),
+                timeout=2,
+            )
+            await scraper.close()
+
+            assert len(launches) == 1
+
+            # Both permits must still be available: a leak would block one.
+            a, b = GoogleMapsScraper(), GoogleMapsScraper()
+            await asyncio.wait_for(a._init_browser(), timeout=2)
+            await asyncio.wait_for(b._init_browser(), timeout=2)
+            await a.close()
+            await b.close()
+
     async def test_close_is_idempotent_and_returns_one_permit_only(self):
         configure_limits(max_concurrent_browsers=1)
 
@@ -544,12 +573,56 @@ class TestStaleSelectorDetection:
         assert error.to_dict()["selectors_stale"] is True
 
     async def test_a_genuinely_empty_area_still_returns_an_empty_list(self):
-        # The results container rendered and contains no cards. That is a real
-        # zero, and tightening stale detection must not turn it into an error.
+        # The results container rendered, holds no cards, and there are no
+        # place links anywhere on the page. That is a real zero, and tightening
+        # stale detection must not turn it into an error.
         page = FakePage(elements={FEED_SELECTOR: [{}]})
         scraper = make_scraper(page)
 
         assert await scraper.search("igloo repair in death valley") == []
+
+    async def test_a_stale_card_selector_is_not_reported_as_an_empty_area(self):
+        # The feed rendered and the page is full of place links, but the card
+        # selector matches none of them -- a card-markup rotation. Counting
+        # only cards would have returned a successful empty list here.
+        page = FakePage(elements={
+            FEED_SELECTOR: [{}],
+            LINK_SELECTOR: [{"attrs": {"aria-label": "Blue Bottle"}}] * 12,
+        })
+        scraper = make_scraper(page)
+
+        with pytest.raises(SelectorsStaleError, match="card selector matched none"):
+            await scraper.search("coffee")
+
+    async def test_cards_whose_link_selector_is_dead_are_not_an_empty_area(self):
+        # Cards render, but the anchor inside each one no longer matches, so no
+        # place is ever even attempted. `attempted` stays 0; only counting
+        # visible candidates catches this.
+        page = FakePage(elements={
+            FEED_SELECTOR: [{}],
+            CARD_SELECTOR: [{"children": {}}, {"children": {}}, {"children": {}}],
+        })
+        scraper = make_scraper(page)
+
+        with pytest.raises(SelectorsStaleError) as excinfo:
+            await scraper.search("coffee")
+
+        assert excinfo.value.attempted == 0
+        assert excinfo.value.extracted == 0
+
+    async def test_cards_that_all_throw_are_not_an_empty_area(self):
+        # Every card blows up on interaction. The per-card `except: continue`
+        # must not add up to a successful empty result.
+        page = FakePage(elements={
+            FEED_SELECTOR: [{}],
+            CARD_SELECTOR: [
+                {"children": {LINK_SELECTOR: [{"raises": True}]}} for _ in range(3)
+            ],
+        })
+        scraper = make_scraper(page)
+
+        with pytest.raises(SelectorsStaleError):
+            await scraper.search("coffee")
 
     async def test_no_results_container_at_all_is_reported_not_swallowed(self):
         # Nothing matched: not the feed, not a place link, not a place panel.
