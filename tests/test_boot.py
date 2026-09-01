@@ -40,7 +40,27 @@ def _example_env() -> dict:
     return values
 
 
+def _example_documented_keys() -> set:
+    """Every Settings key .env.example mentions, including commented-out ones.
+
+    A key deliberately left unset -- REDIS_URL, because the example file must
+    stay runnable without Docker -- is still documented if it appears as a
+    commented assignment. Drift detection cares that the key is described;
+    whether it ships with a value is a separate decision.
+    """
+    keys = set()
+    for line in ENV_EXAMPLE.read_text().splitlines():
+        line = line.strip().lstrip("#").strip()
+        if "=" not in line:
+            continue
+        key = line.partition("=")[0].strip()
+        if key.isidentifier() and key.isupper():
+            keys.add(key)
+    return keys
+
+
 EXAMPLE_ENV = _example_env()
+EXAMPLE_DOCUMENTED_KEYS = _example_documented_keys()
 EXAMPLE_API_KEY = EXAMPLE_ENV["API_KEYS"]
 
 
@@ -453,7 +473,10 @@ def test_env_example_covers_every_settings_field():
     """
     from app.core.config import Settings
 
-    documented = set(EXAMPLE_ENV)
+    # Commented-out keys count as documented: REDIS_URL is deliberately unset
+    # so the example file runs standalone (its compose hostname made every
+    # local request 503), but it is still described in the file.
+    documented = EXAMPLE_DOCUMENTED_KEYS
     # VERSION is derived from app/__version__.py and only overridden manually.
     expected = set(Settings.model_fields) - {"VERSION"}
     missing = sorted(expected - documented)
