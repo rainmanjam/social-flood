@@ -143,9 +143,16 @@ jobs:
           fail-on-severity: high
           deny-licenses: GPL-3.0, AGPL-3.0
 
+  # The BLOCKING dependency audit that gates every change lives in
+  # _verify.yml (`deps-audit`). This job is the time-based sweep: a new advisory
+  # can be published against a dependency nobody touched, so the closure needs
+  # re-checking on a schedule even when no pull request is open.
+  #
+  # Skipped on pull_request to avoid auditing the same thing twice in one PR.
   pip-audit:
-    name: pip-audit (known CVEs in dependencies)
+    name: pip-audit (scheduled sweep)
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -155,17 +162,23 @@ jobs:
         with:
           python-version: '3.12'
           cache: 'pip'
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: requirements-dev.txt
 
-      - name: Install pip-audit
-        run: python -m pip install --upgrade pip && pip install pip-audit
-
-      # Advisory for now (see ratchet note at the top of this file). Drop
-      # `|| true` once the current backlog of advisories is cleared.
-      - name: Audit requirements.txt
+      - name: Install pip-audit at the pinned version
         run: |
-          pip-audit --requirement requirements.txt --format json --output pip-audit.json || true
-          pip-audit --requirement requirements.txt --format columns || true
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          PIN=$(grep -E '^pip-audit==' requirements-dev.txt)
+          echo "Installing ${PIN}"
+          pip install "${PIN}"
+
+      - name: Audit the locked closure
+        run: |
+          set -euo pipefail
+          pip-audit --requirement requirements.lock --no-deps \
+            --format json --output pip-audit.json --progress-spinner=off || true
+          pip-audit --requirement requirements.lock --no-deps \
+            --strict --progress-spinner=off
 
       - name: Upload pip-audit report
         if: always()

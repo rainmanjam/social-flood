@@ -65,12 +65,18 @@ jobs:
     name: Bump Version
     needs: [ verify ]
     runs-on: ubuntu-latest
-    # Belt and braces: skip if the head commit is itself a bump commit. Pushes
-    # made with GITHUB_TOKEN do not re-trigger this workflow, but a maintainer
-    # pushing a bump commit by hand (or with a PAT) otherwise would.
+    # Two guards:
+    #   * `github.ref == 'refs/heads/main'` - without it, anyone able to run
+    #     workflow_dispatch could pick a feature branch or a tag from the ref
+    #     picker and publish unmerged code as a release. (A dispatch from a tag
+    #     would also fail at `git push origin HEAD:$GITHUB_REF`.)
+    #   * the head-commit check - skip if the head commit is itself a bump
+    #     commit. Pushes made with GITHUB_TOKEN do not re-trigger this workflow,
+    #     but a maintainer pushing a bump commit by hand (or with a PAT) would.
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      !startsWith(github.event.head_commit.message, 'chore: bump version to')
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       !startsWith(github.event.head_commit.message, 'chore: bump version to'))
     permissions:
       contents: write
     outputs:
