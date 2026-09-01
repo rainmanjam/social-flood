@@ -6,6 +6,7 @@ exception handlers, and API routers. It serves as the main entry point for the
 Social Flood API service.
 """
 import logging
+import os
 import time
 import nltk
 from contextlib import asynccontextmanager
@@ -19,22 +20,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from fastapi.openapi.utils import get_openapi
 from starlette.exceptions import HTTPException
-from starlette.status import HTTP_429_TOO_MANY_REQUESTS
 
 # Import application modules
 from app.core.config import get_settings, Settings
 from app.core.exceptions import (
     SocialFloodException, 
     configure_exception_handlers,
-    RateLimitExceededError
 )
 from app.core.middleware import setup_middleware
 from app.core.health_checks import check_health
 from app.core.auth import get_api_key
 from app.core.http_client import shutdown_http_client_manager
 from app.core.rate_limiter import (
+    RateLimitMiddleware,
+    shutdown_rate_limiting,
     start_cleanup_task as start_rate_limit_cleanup_task,
-    stop_cleanup_task as stop_rate_limit_cleanup_task,
+)
+from app.services.google_maps_monitors import (
+    start_monitor_scheduler,
+    stop_monitor_scheduler,
 )
 
 # Import API routers
@@ -54,19 +58,14 @@ logger = logging.getLogger(__name__)
 # Get application settings
 settings = get_settings()
 
-# Try to import slowapi for rate limiting
-try:
-    from slowapi import Limiter
-    from slowapi.util import get_remote_address
-    from slowapi.errors import RateLimitExceeded
-    
-    # Create rate limiter
-    limiter = Limiter(key_func=get_remote_address)
-    RATE_LIMITING_AVAILABLE = True
-except ImportError:
-    logger.warning("slowapi not installed. Rate limiting will be disabled.")
-    limiter = None
-    RATE_LIMITING_AVAILABLE = False
+# NOTE: slowapi was imported here behind a try/except and a `limiter` was
+# built with key_func=get_remote_address. It was never installed in any
+# deployment, so the whole path was dead -- and had it been installed it would
+# have keyed limits by IP, which is precisely the CRT-8 bug that
+# app/core/rate_limiter.py exists to fix. Worse, /api-config reported
+# `RATE_LIMIT_ENABLED and RATE_LIMITING_AVAILABLE`, i.e. whether a package
+# imported, so the endpoint advertised enforcement that did not exist.
+# Rate limiting is owned entirely by app.core.rate_limiter.
 
 # Try to import prometheus client for metrics
 try:
@@ -160,8 +159,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("API documentation disabled in production")
     logger.info("Health check available at /health")
 
+    # Start the Maps monitor scheduler (re-scrapes watched places on their
+    # interval and fires webhooks on change). Idempotent.
+    start_monitor_scheduler()
+
     # Log rate limiting status
-    if RATE_LIMITING_AVAILABLE and settings.RATE_LIMIT_ENABLED:
+    if settings.RATE_LIMIT_ENABLED:
         logger.info(f"Rate limiting enabled: {settings.RATE_LIMIT_REQUESTS} requests per {settings.RATE_LIMIT_TIMEFRAME} seconds")
     else:
         logger.info("Rate limiting disabled")
@@ -177,8 +180,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         # --- shutdown ---
         logger.info(f"Shutting down {settings.PROJECT_NAME}")
-        stop_rate_limit_cleanup_task()
+        await stop_monitor_scheduler()
+        # shutdown_rate_limiting cancels AND awaits the janitor, avoiding a
+        # "Task was destroyed but it is pending" warning at loop close.
+        await shutdown_rate_limiting()
         await shutdown_http_client_manager()
+
+
+def _env_file_configured(settings) -> bool:
+    """Whether pydantic-settings was pointed at a .env file.
+
+    ``model_config["env_file"]`` is None when unset, a str/Path when one file
+    is configured, or a sequence when several are. The previous expression,
+    ``".env" in settings.model_config.get("env_file", [])``, raised TypeError
+    on the None case and did a substring test on the str case.
+    """
+    configured = settings.model_config.get("env_file")
+    if not configured:
+        return False
+    if isinstance(configured, (str, os.PathLike)):
+        configured = (configured,)
+    return any(str(entry).endswith(".env") for entry in configured)
 
 
 # Create the FastAPI application
@@ -209,22 +231,10 @@ def create_application() -> FastAPI:
     # Configure exception handlers
     configure_exception_handlers(app)
     
-    # Setup rate limiting if available
-    if RATE_LIMITING_AVAILABLE and settings.RATE_LIMIT_ENABLED:
-        app.state.limiter = limiter
-        
-        @app.exception_handler(RateLimitExceeded)
-        async def rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
-            """Handle rate limit exceeded errors."""
-            error = RateLimitExceededError(
-                detail=f"Rate limit exceeded: {exc.detail}",
-                headers={"Retry-After": str(exc.retry_after)}
-            )
-            return JSONResponse(
-                status_code=HTTP_429_TOO_MANY_REQUESTS,
-                content=error.to_dict(),
-                headers=error.headers
-            )
+    # Install the real rate limiter. Depends(rate_limit) covers the /api/v1
+    # routes that declare it; the middleware covers everything else, including
+    # /api-config, /status and /health.
+    app.add_middleware(RateLimitMiddleware)
     
     # Setup metrics if available.
     # /metrics is gated too: Prometheus' default collectors publish process
@@ -320,7 +330,7 @@ def create_application() -> FastAPI:
             "version": settings.VERSION,
             "environment": settings.ENVIRONMENT,
             "rate_limiting": {
-                "enabled": settings.RATE_LIMIT_ENABLED and RATE_LIMITING_AVAILABLE,
+                "enabled": settings.RATE_LIMIT_ENABLED,
                 "requests": settings.RATE_LIMIT_REQUESTS,
                 "timeframe": settings.RATE_LIMIT_TIMEFRAME
             },
@@ -345,7 +355,9 @@ def create_application() -> FastAPI:
         """Configuration sources endpoint."""
         return {
             "environment_variables": True,
-            "env_file": ".env" in settings.model_config.get("env_file", []),
+            # model_config["env_file"] may be None, a single path, or a
+            # sequence. `".env" in None` raises TypeError, so normalise first.
+            "env_file": _env_file_configured(settings),
             "defaults": True
         }
     
