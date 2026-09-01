@@ -1,0 +1,308 @@
+# Reusable verification pipeline for Social Flood.
+#
+# This is the single definition of "does this code actually work?".
+# It is called by:
+#   - main.yml    (pull requests, non-main pushes, merge queue, manual)
+#   - release.yml (pushes to main, before any version bump or publish)
+#
+# Keeping it in one reusable workflow means a release can never publish an
+# artifact that has not passed exactly the same gates a pull request passes.
+name: Verify
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: 'Python version used for lint / test / boot jobs.'
+        required: false
+        type: string
+        default: '3.12'
+      coverage-floor:
+        description: >-
+          Minimum statement coverage of app/. This is a ratchet: it is the real
+          measured coverage at the time the gate was introduced and must only
+          ever be raised, never lowered.
+        required: false
+        type: number
+        default: 53
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Lint
+  # ---------------------------------------------------------------------------
+  # Ratchet, deliberately in two steps:
+  #
+  #   1. "Ruff (blocking)" runs only the rules that flag genuinely broken code:
+  #      E9  syntax errors, F63 invalid comparisons, F7  misplaced statements,
+  #      F82 undefined names. The repository is currently CLEAN on these
+  #      (verified: 0 findings), so this gate blocks today and catches the
+  #      class of mistake that would otherwise reach production as a NameError.
+  #
+  #   2. "Ruff (full, advisory)" runs the whole configured rule set with
+  #      --exit-zero. WHY: the full rule set currently reports ~1242 findings
+  #      across the existing codebase. Making that blocking on day one would
+  #      turn every pull request red for pre-existing debt and force everyone to
+  #      bypass CI, which is how the pipeline became meaningless in the first
+  #      place. Instead the count is published to the job summary every run so
+  #      the trend is visible.
+  #
+  #   RATCHET PLAN: as the count is driven down, move rule groups out of
+  #   `lint.ignore` in pyproject.toml, or drop `--exit-zero` from step 2 once
+  #   the count reaches 0. Do not weaken step 1.
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      # ruff is intentionally installed standalone rather than via
+      # requirements-dev.txt: that file is owned elsewhere and does not list it.
+      - name: Install ruff
+        run: python -m pip install --upgrade pip && pip install 'ruff==0.16.4'
+
+      - name: Ruff (blocking - real errors only)
+        run: ruff check --output-format=github --select E9,F63,F7,F82 .
+
+      - name: Ruff (full rule set, advisory)
+        run: |
+          set -euo pipefail
+          ruff check --exit-zero --statistics . | tee ruff-report.txt
+          COUNT=$(ruff check --exit-zero --output-format=concise . | wc -l | tr -d ' ')
+          {
+            echo "## Ruff findings (advisory)"
+            echo ""
+            echo "**Total: ${COUNT}**  (baseline at gate introduction: 1242)"
+            echo ""
+            echo '```'
+            cat ruff-report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload ruff report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruff-report
+          path: ruff-report.txt
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Test
+  # ---------------------------------------------------------------------------
+  # This job has NO `|| true` and NO `continue-on-error`. A failing test fails
+  # the pipeline. That is the entire point of this rewrite.
+  test:
+    name: Test (pytest + coverage)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Download NLTK data
+        run: python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab')"
+
+      # No .env is created here. tests/conftest.py pins the settings source so
+      # the suite behaves identically whether or not a .env exists on disk.
+      - name: Run test suite
+        run: |
+          pytest \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-fail-under=${{ inputs.coverage-floor }} \
+            --junitxml=junit.xml \
+            -ra
+
+      - name: Upload coverage and test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            coverage.xml
+            junit.xml
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Boot
+  # ---------------------------------------------------------------------------
+  # The exit criterion the owner asked for: a pull request that breaks boot must
+  # fail CI. This job copies .env.example to .env VERBATIM (which is what a new
+  # contributor does on day one), starts the real ASGI app with uvicorn, and
+  # requires a 2xx from /health.
+  #
+  # It also runs the full pytest suite a second time in "boot" configuration so
+  # that tests/test_boot.py is picked up automatically the moment it lands -
+  # nothing here needs editing when that file appears.
+  boot:
+    name: Boot from .env.example
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Download NLTK data
+        run: python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab')"
+
+      # VERBATIM. Do not edit, filter or template this file. If the shipped
+      # example config cannot boot the app, that is a bug in the app or in the
+      # example - not something CI should paper over.
+      - name: Create .env from .env.example (verbatim)
+        run: cp .env.example .env
+
+      - name: Import the application
+        run: python -c "import main; print('imported app:', main.app.title)"
+
+      - name: Start the application
+        run: |
+          nohup python -m uvicorn main:app --host 127.0.0.1 --port 8000 \
+            > uvicorn.log 2>&1 &
+          echo $! > uvicorn.pid
+
+      - name: Wait for /health
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/health > health.json; then
+              echo "App answered /health after ${i}s:"
+              cat health.json
+              exit 0
+            fi
+            # Fail fast if the process already died.
+            if ! kill -0 "$(cat uvicorn.pid)" 2>/dev/null; then
+              echo "::error::uvicorn exited before serving /health"
+              cat uvicorn.log
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "::error::App did not serve /health within 30s"
+          cat uvicorn.log
+          exit 1
+
+      - name: Check the OpenAPI schema is generated
+        run: curl -fsS http://127.0.0.1:8000/openapi.json > /dev/null
+
+      - name: Stop the application
+        if: always()
+        run: |
+          if [ -f uvicorn.pid ]; then kill "$(cat uvicorn.pid)" 2>/dev/null || true; fi
+
+      - name: Show application log
+        if: always()
+        run: cat uvicorn.log || true
+
+      # Picks up tests/test_boot.py automatically once that file exists.
+      # Runs against the .env created above, so it also proves the suite is
+      # insensitive to a developer's local .env (see tests/conftest.py).
+      - name: Run test suite with a .env present
+        run: pytest -ra -q
+
+  # ---------------------------------------------------------------------------
+  # Docker smoke test
+  # ---------------------------------------------------------------------------
+  # Builds the production image and requires the image's own HEALTHCHECK to
+  # report `healthy`, then hits /health from outside the container.
+  docker:
+    name: Docker build + health check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Single-arch on purpose: a multi-arch build cannot be `load`ed into the
+      # local daemon, and we need a runnable image to smoke test. The release
+      # workflow still publishes amd64 + arm64.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: social-flood:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Deliberately started with NO env file: `docker --env-file` does not
+      # expand `${VAR}` references, and .env.example uses them (DATABASE_URL,
+      # REDIS_URL). Booting from .env.example is the `boot` job's contract;
+      # this job's contract is "the shipped image starts and self-reports
+      # healthy on its built-in defaults".
+      - name: Run container
+        run: docker run -d --name social-flood-ci -p 8000:8000 social-flood:ci
+
+      - name: Wait for the container HEALTHCHECK to pass
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            STATUS=$(docker inspect -f '{{.State.Health.Status}}' social-flood-ci 2>/dev/null || echo "missing")
+            RUNNING=$(docker inspect -f '{{.State.Running}}' social-flood-ci 2>/dev/null || echo "false")
+            echo "t=${i}s health=${STATUS} running=${RUNNING}"
+            if [ "$STATUS" = "healthy" ]; then
+              exit 0
+            fi
+            if [ "$RUNNING" != "true" ]; then
+              echo "::error::container exited before becoming healthy"
+              docker logs social-flood-ci
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "::error::container never reported healthy"
+          docker logs social-flood-ci
+          exit 1
+
+      - name: Hit /health from the host
+        run: curl -fsS http://127.0.0.1:8000/health
+
+      - name: Container logs
+        if: always()
+        run: docker logs social-flood-ci || true
+
+      - name: Tear down
+        if: always()
+        run: docker rm -f social-flood-ci || true
