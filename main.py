@@ -226,10 +226,19 @@ def create_application() -> FastAPI:
                 headers=error.headers
             )
     
-    # Setup metrics if available
+    # Setup metrics if available.
+    # /metrics is gated too: Prometheus' default collectors publish process
+    # memory and start time, the Python version, and one labelled series per
+    # instrumented route - i.e. host detail plus a traffic-weighted map of the
+    # API. Scrapers send the key as a header like any other client.
     if METRICS_AVAILABLE:
         instrumentator = Instrumentator()
-        instrumentator.instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
+        instrumentator.instrument(app).expose(
+            app,
+            endpoint="/metrics",
+            include_in_schema=False,
+            dependencies=[Depends(require_api_key)],
+        )
     
     # Add custom OpenAPI documentation endpoints (non-production only, see
     # _docs_enabled: they enumerate the entire authenticated API surface).

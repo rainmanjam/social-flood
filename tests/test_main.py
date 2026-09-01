@@ -229,7 +229,35 @@ class TestMainApplication:
             app = create_application()
 
             # Verify expose was called on the instrumented app
-            mock_instrumented_app.expose.assert_called_once_with(app, endpoint="/metrics", include_in_schema=False)
+            mock_instrumented_app.expose.assert_called_once()
+            kwargs = mock_instrumented_app.expose.call_args.kwargs
+            assert mock_instrumented_app.expose.call_args.args == (app,)
+            assert kwargs["endpoint"] == "/metrics"
+            assert kwargs["include_in_schema"] is False
+
+            # /metrics must be behind the API key: Prometheus' default
+            # collectors publish process memory, start time, the Python
+            # version and a labelled series per instrumented route.
+            import main
+            dependency_calls = kwargs["dependencies"]
+            assert [dep.dependency for dep in dependency_calls] == [main.require_api_key]
+
+    def test_metrics_expose_kwargs_are_accepted_by_instrumentator(self):
+        """
+        The dependencies kwarg must actually reach app.get().
+
+        Instrumentator.expose forwards **kwargs to the route decorator; if a
+        future version dropped that, create_application() would raise at
+        startup rather than at test time.
+        """
+        instrumentator_module = pytest.importorskip("prometheus_fastapi_instrumentator")
+
+        import inspect
+        signature = inspect.signature(instrumentator_module.Instrumentator.expose)
+        assert any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        ), "Instrumentator.expose no longer forwards **kwargs to the route"
 
     @patch('main.stop_rate_limit_cleanup_task')
     @patch('main.start_rate_limit_cleanup_task')
