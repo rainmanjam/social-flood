@@ -245,14 +245,21 @@ def generate_cache_key(base_key: str, **params) -> str:
 
 
 def is_cacheable(value: Any) -> bool:
-    """Return False for results that must not outlive the request.
+    """Return False for degraded results that must not outlive the request.
 
-    A partial response is the visible half of a transient failure: some
-    articles were lost this time. Storing it would pin that loss for the whole
-    TTL and serve the short list to everyone -- the same mistake as caching an
-    outright failure, just harder to notice.
+    Two shapes are refused, both for the same reason: they are successes that
+    are missing something, and storing one pins that gap for the whole TTL.
+
+    * ``partial`` -- some articles were lost this time. Cache it and the short
+      list is served to everyone until it expires.
+    * ``error`` -- the article was fetched but part of the processing failed
+      (NLP, when the NLTK corpus is unavailable). Caching it means that even
+      once the corpus is installed, callers keep getting the summary-less
+      version for an hour.
     """
-    return not (isinstance(value, dict) and value.get("partial"))
+    if not isinstance(value, dict):
+        return True
+    return not (value.get("partial") or value.get("error"))
 
 
 async def get_cached_or_fetch(
@@ -1204,6 +1211,10 @@ ARTICLE_FETCH_FAILED_DETAIL = "Could not retrieve the requested article."
 # unbounded chain is a cheap way to keep a worker busy.
 ARTICLE_MAX_REDIRECTS = 3
 
+# Cap on the decompressed article body. Generous for a news page, and small
+# enough that one request cannot exhaust the worker's memory.
+ARTICLE_MAX_BYTES = 8 * 1024 * 1024
+
 
 def validate_article_url(raw_url: str):
     """Run a URL through the shared guard with this endpoint's policy."""
@@ -1225,11 +1236,16 @@ async def fetch_allow_listed_html(validated_url: str) -> Tuple[str, str]:
     automatically; each ``Location`` goes back through the same validation as
     the caller's original URL.
 
+    The body is streamed and capped at ``ARTICLE_MAX_BYTES``. Reading
+    ``response.text`` in one go would buffer whatever the far end sends, and
+    the cap has to be applied to the *decompressed* stream: a few kilobytes of
+    gzip can expand to gigabytes, so a Content-Length check is not enough.
+
     Returns:
         ``(html, final_url)`` -- the body, and the URL it actually came from.
 
     Raises:
-        UrlNotAllowed: if any hop fails validation.
+        UrlNotAllowed: if any hop fails validation, or the body is too large.
         httpx.HTTPError: on a transport or status failure.
 
     Known residual risk: between validation and connect, a hostile DNS server
@@ -1237,31 +1253,49 @@ async def fetch_allow_listed_html(validated_url: str) -> Tuple[str, str]:
     needs connection-level pinning to ``ValidatedUrl.ip_addresses``, which
     httpx cannot express without a custom transport. The window is narrow
     here because the host must already be on an operator-managed allow-list.
+    A configured outbound proxy resolves the host itself, which makes the
+    guard's DNS check advisory on that path; the scheme, host and port checks
+    still apply.
     """
     proxy_url = await get_proxy()
     client = await get_gnews_http_client(proxy_url=proxy_url)
 
     current = validated_url
     for _ in range(ARTICLE_MAX_REDIRECTS + 1):
-        response = await client.get(
+        async with client.stream(
+            "GET",
             current,
             follow_redirects=False,
             timeout=settings.HTTP_READ_TIMEOUT,
             headers={"User-Agent": USER_AGENTS["windows_chrome"]},
-        )
+        ) as response:
+            if response.is_redirect:
+                location = response.headers.get("location")
+                if not location:
+                    raise UrlNotAllowed("redirect without a Location header")
 
-        if not response.is_redirect:
+                # Relative redirects resolve against the current URL, so
+                # validating the joined result means a relative hop cannot
+                # smuggle in a new host. A hop to another scheme is validated
+                # like any other: only https (http if explicitly enabled).
+                next_url = str(httpx.URL(current).join(location))
+                current = validate_article_url(next_url).url
+                continue
+
             response.raise_for_status()
-            return response.text, current
 
-        location = response.headers.get("location")
-        if not location:
-            raise UrlNotAllowed("redirect without a Location header")
+            chunks = []
+            total = 0
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > ARTICLE_MAX_BYTES:
+                    raise UrlNotAllowed(
+                        f"response body exceeded {ARTICLE_MAX_BYTES} bytes"
+                    )
+                chunks.append(chunk)
 
-        # Relative redirects resolve against the current URL; validating the
-        # joined result means a relative hop cannot smuggle in a new host.
-        next_url = str(httpx.URL(current).join(location))
-        current = validate_article_url(next_url).url
+            encoding = response.charset_encoding or "utf-8"
+            return b"".join(chunks).decode(encoding, errors="replace"), current
 
     raise UrlNotAllowed(f"redirect chain exceeded {ARTICLE_MAX_REDIRECTS} hops")
 

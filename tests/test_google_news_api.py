@@ -40,33 +40,73 @@ def clear_cache():
     cache_manager_module._cache_store.clear()
 
 
+class StubStream:
+    """Stand-in for ``httpx.AsyncClient.stream``'s async context manager.
+
+    Hands back pre-built responses in order and records the keyword arguments
+    each call was made with, so tests can assert that redirects are not
+    followed automatically.
+    """
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []
+
+    def __call__(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        outcome = self._responses.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return _StubStreamContext(outcome)
+
+
+class _StubStreamContext:
+    def __init__(self, response):
+        self._response = response
+
+    async def __aenter__(self):
+        return self._response
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
+def html_response(body: str, url: str = "https://example.com/article"):
+    return httpx.Response(200, html=body, request=httpx.Request("GET", url))
+
+
+def redirect_response(location: str, url: str = "https://example.com/article"):
+    return httpx.Response(
+        302, headers={"location": location}, request=httpx.Request("GET", url)
+    )
+
+
 @pytest.fixture
 def stub_article_fetch(monkeypatch):
-    """Serve /article-details/ a canned HTTP response instead of the network.
+    """Serve /article-details/ canned HTTP responses instead of the network.
 
-    The endpoint fetches the page itself (so it can re-validate redirects)
-    rather than letting newspaper do it, so the HTTP client is what tests have
-    to stand in for. Returns a setter for the response the client will give.
+    The endpoint streams the page itself -- so it can re-validate redirects
+    and cap the body size -- rather than letting newspaper fetch it, so the
+    HTTP client is what tests stand in for. Returns a callable that installs
+    the sequence of responses the client will yield.
     """
-    mock_client = AsyncMock()
+    mock_client = MagicMock()
+    holder = {}
 
-    def set_response(response):
-        mock_client.get = AsyncMock(return_value=response)
+    def use(*responses):
+        stream = StubStream(responses)
+        mock_client.stream = stream
+        holder["stream"] = stream
+        return stream
 
-    set_response(
-        httpx.Response(
-            200,
-            html="<html><body><p>Test article content</p></body></html>",
-            request=httpx.Request("GET", "https://example.com/article"),
-        )
-    )
+    use(html_response("<html><body><p>Test article content</p></body></html>"))
 
     async def fake_get_client(proxy_url=None):
         return mock_client
 
     monkeypatch.setattr(google_news_api, "get_gnews_http_client", fake_get_client)
-    set_response.client = mock_client
-    return set_response
+    use.calls = lambda: holder["stream"].calls
+    return use
 
 
 @pytest.fixture
@@ -682,9 +722,7 @@ def test_article_details_does_not_leak_upstream_failure(
     and said why the connection failed -- so a caller could tell "port closed"
     from "port open but not HTML" and map the internal network.
     """
-    stub_article_fetch.client.get = AsyncMock(
-        side_effect=httpx.ConnectError("Connection refused to 10.0.0.5:6379")
-    )
+    stub_article_fetch(httpx.ConnectError("Connection refused to 10.0.0.5:6379"))
 
     response = client.get(
         "/news/article-details/", params={"url": "https://example.com/article"}
@@ -696,7 +734,35 @@ def test_article_details_does_not_leak_upstream_failure(
     assert "refused" not in response.text.lower()
 
 
-def test_article_details_does_not_follow_redirect_off_the_allow_list():
+def _stub_parsed_article(title="Parsed"):
+    article = MagicMock()
+    article.title = title
+    article.text = "Body text"
+    article.authors = []
+    article.publish_date = None
+    article.top_image = ""
+    article.images = set()
+    article.movies = []
+    article.meta_data = {}
+    article.meta_description = ""
+    article.meta_keywords = ""
+    article.summary = ""
+    article.keywords = []
+    return article
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        pytest.param("http://169.254.169.254/latest/meta-data/", id="absolute"),
+        pytest.param("http://127.0.0.1:6379/", id="loopback"),
+        pytest.param("file:///etc/passwd", id="scheme-change"),
+    ],
+)
+@patch('app.api.google_news.google_news_api.Article')
+def test_article_details_does_not_follow_redirect_off_the_allow_list(
+    mock_article_class, allow_example_articles, stub_article_fetch, location
+):
     """A redirect is a second request and gets the same validation.
 
     Validating once and handing the URL to a library that follows redirects
@@ -704,86 +770,123 @@ def test_article_details_does_not_follow_redirect_off_the_allow_list():
     ``302 -> http://169.254.169.254/`` would send the library somewhere the
     guard never saw.
     """
-    redirect = httpx.Response(
-        302,
-        headers={"location": "http://169.254.169.254/latest/meta-data/"},
-        request=httpx.Request("GET", "https://example.com/article"),
+    stub_article_fetch(redirect_response(location))
+
+    response = client.get(
+        "/news/article-details/", params={"url": "https://example.com/article"}
     )
-
-    mock_client = AsyncMock()
-    mock_client.get = AsyncMock(return_value=redirect)
-
-    with patch('app.api.google_news.google_news_api.ARTICLE_DETAILS_ALLOWED_HOSTS',
-               ("example.com", ".example.com")), \
-         patch('app.api.google_news.google_news_api.ARTICLE_DETAILS_RESOLVE_DNS', False), \
-         patch('app.api.google_news.google_news_api.get_gnews_http_client',
-               new_callable=AsyncMock) as mock_get_client, \
-         patch('app.api.google_news.google_news_api.Article') as mock_article_class:
-        mock_get_client.return_value = mock_client
-
-        response = client.get(
-            "/news/article-details/", params={"url": "https://example.com/article"}
-        )
 
     # The redirect target was refused, so nothing was ever parsed.
     assert response.status_code == 502
     assert response.json() == {"detail": "Could not retrieve the requested article."}
     mock_article_class.assert_not_called()
+
+    calls = stub_article_fetch.calls()
     # Exactly one outbound request: the redirect was not followed.
-    assert mock_client.get.await_count == 1
-    assert mock_client.get.await_args.kwargs["follow_redirects"] is False
+    assert len(calls) == 1
+    assert calls[0][2]["follow_redirects"] is False
 
 
-def test_article_details_follows_an_allow_listed_redirect():
+@patch('app.api.google_news.google_news_api.Article')
+def test_article_details_follows_an_allow_listed_redirect(
+    mock_article_class, allow_example_articles, stub_article_fetch
+):
     """A redirect that stays on the allow-list is followed and parsed."""
-    hop = httpx.Response(
-        302,
-        headers={"location": "https://www.example.com/final"},
-        request=httpx.Request("GET", "https://example.com/article"),
+    stub_article_fetch(
+        redirect_response("/final"),  # relative: resolves to example.com
+        html_response("<html><body><p>Body text</p></body></html>"),
     )
-    final = httpx.Response(
-        200,
-        html="<html><body><p>Body text</p></body></html>",
-        request=httpx.Request("GET", "https://www.example.com/final"),
+    mock_article_class.return_value = _stub_parsed_article("Redirected")
+
+    response = client.get(
+        "/news/article-details/", params={"url": "https://example.com/article"}
     )
-
-    mock_client = AsyncMock()
-    mock_client.get = AsyncMock(side_effect=[hop, final])
-
-    mock_article = MagicMock()
-    mock_article.title = "Redirected"
-    mock_article.text = "Body text"
-    mock_article.authors = []
-    mock_article.publish_date = None
-    mock_article.top_image = ""
-    mock_article.images = set()
-    mock_article.movies = []
-    mock_article.meta_data = {}
-    mock_article.meta_description = ""
-    mock_article.meta_keywords = ""
-    mock_article.summary = ""
-    mock_article.keywords = []
-
-    with patch('app.api.google_news.google_news_api.ARTICLE_DETAILS_ALLOWED_HOSTS',
-               ("example.com", ".example.com")), \
-         patch('app.api.google_news.google_news_api.ARTICLE_DETAILS_RESOLVE_DNS', False), \
-         patch('app.api.google_news.google_news_api.get_gnews_http_client',
-               new_callable=AsyncMock) as mock_get_client, \
-         patch('app.api.google_news.google_news_api.Article') as mock_article_class:
-        mock_get_client.return_value = mock_client
-        mock_article_class.return_value = mock_article
-
-        response = client.get(
-            "/news/article-details/", params={"url": "https://example.com/article"}
-        )
 
     assert response.status_code == 200
     assert response.json()["title"] == "Redirected"
     # Newspaper parsed the body we fetched; it made no request of its own.
-    mock_article.download.assert_called_once_with(
+    mock_article_class.return_value.download.assert_called_once_with(
         "<html><body><p>Body text</p></body></html>"
     )
-    assert mock_article_class.call_args[0][0] == "https://www.example.com/final"
+    assert mock_article_class.call_args[0][0] == "https://example.com/final"
+
+
+@patch('app.api.google_news.google_news_api.Article')
+def test_article_details_bounds_the_redirect_chain(
+    mock_article_class, allow_example_articles, stub_article_fetch
+):
+    """A redirect loop must not keep a worker busy indefinitely."""
+    stub_article_fetch(*[redirect_response("/next") for _ in range(10)])
+
+    response = client.get(
+        "/news/article-details/", params={"url": "https://example.com/article"}
+    )
+
+    assert response.status_code == 502
+    mock_article_class.assert_not_called()
+    assert len(stub_article_fetch.calls()) == google_news_api.ARTICLE_MAX_REDIRECTS + 1
+
+
+@patch('app.api.google_news.google_news_api.Article')
+def test_article_details_caps_the_response_body(
+    mock_article_class, allow_example_articles, stub_article_fetch, monkeypatch
+):
+    """An oversized body is abandoned rather than buffered.
+
+    The cap has to apply to the decompressed stream: a few kilobytes of gzip
+    can expand to gigabytes, so a Content-Length check would not do.
+    """
+    monkeypatch.setattr(google_news_api, "ARTICLE_MAX_BYTES", 1024)
+    stub_article_fetch(html_response("x" * 5000))
+
+    response = client.get(
+        "/news/article-details/", params={"url": "https://example.com/article"}
+    )
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "Could not retrieve the requested article."}
+    mock_article_class.assert_not_called()
+
+
+@patch('app.api.google_news.google_news_api.Article')
+def test_degraded_nlp_result_is_not_cached(
+    mock_article_class, allow_example_articles, stub_article_fetch
+):
+    """A response missing its NLP fields must not be pinned for an hour.
+
+    ``article.nlp()`` raises LookupError when the NLTK corpus is unavailable,
+    and the endpoint still answers 200 with the article minus its summary.
+    Caching that means callers keep getting the degraded version long after
+    the corpus is installed.
+    """
+    degraded = _stub_parsed_article("No NLP")
+    degraded.nlp.side_effect = LookupError("punkt not found")
+    mock_article_class.return_value = degraded
+
+    first = client.get(
+        "/news/article-details/", params={"url": "https://example.com/article"}
+    )
+
+    assert first.status_code == 200
+    assert "error" in first.json()
+    assert "summary" not in first.json()
+    assert cache_manager_module._cache_store == {}
+
+    # NLTK becomes available; the next request must get the full article.
+    healthy = _stub_parsed_article("With NLP")
+    healthy.summary = "A summary"
+    healthy.keywords = ["a"]
+    mock_article_class.return_value = healthy
+    stub_article_fetch(html_response("<html><body><p>Body text</p></body></html>"))
+
+    second = client.get(
+        "/news/article-details/", params={"url": "https://example.com/article"}
+    )
+
+    assert second.json()["summary"] == "A summary"
+    assert "error" not in second.json()
+    # A complete result is worth keeping.
+    assert cache_manager_module._cache_store != {}
 
 
 def test_article_details_default_allow_list_is_closed():
