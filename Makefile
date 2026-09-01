@@ -193,6 +193,12 @@ docker-pushx-no-cache:
 	@read DOCKER_USER && ./scripts/docker_multiarch.sh push-no-cache $$DOCKER_USER
 
 # Docker image signing
+# The private signing key lives OUTSIDE the repo so it can never enter the
+# Docker build context (Dockerfile ends in `COPY . .`). Override with:
+#   make docker-sign COSIGN_KEY=/path/to/cosign.key
+COSIGN_KEY ?= $(HOME)/.secrets/social-flood/cosign.key
+COSIGN_PUB ?= cosign.pub
+
 docker-sign:
 	@echo "Signing Docker image with Cosign..."
 	@echo "Enter your Docker Hub username:"
@@ -200,7 +206,7 @@ docker-sign:
 	echo "Enter image tag (default: latest):" && \
 	read IMAGE_TAG && \
 	IMAGE_TAG=$${IMAGE_TAG:-latest} && \
-	./scripts/sign_image.sh --image $$DOCKER_USER/social-flood --tag $$IMAGE_TAG --key cosign.key
+	./scripts/sign_image.sh --image $$DOCKER_USER/social-flood --tag $$IMAGE_TAG --key $(COSIGN_KEY)
 
 docker-sign-sbom:
 	@echo "Signing Docker image and creating SBOM attestation..."
@@ -209,7 +215,7 @@ docker-sign-sbom:
 	echo "Enter image tag (default: latest):" && \
 	read IMAGE_TAG && \
 	IMAGE_TAG=$${IMAGE_TAG:-latest} && \
-	./scripts/sign_image.sh --image $$DOCKER_USER/social-flood --tag $$IMAGE_TAG --key cosign.key --attestation sbom
+	./scripts/sign_image.sh --image $$DOCKER_USER/social-flood --tag $$IMAGE_TAG --key $(COSIGN_KEY) --attestation sbom
 
 docker-sign-vuln:
 	@echo "Signing Docker image and creating vulnerability attestation..."
@@ -218,7 +224,7 @@ docker-sign-vuln:
 	echo "Enter image tag (default: latest):" && \
 	read IMAGE_TAG && \
 	IMAGE_TAG=$${IMAGE_TAG:-latest} && \
-	./scripts/sign_image.sh --image $$DOCKER_USER/social-flood --tag $$IMAGE_TAG --key cosign.key --attestation vulnerability
+	./scripts/sign_image.sh --image $$DOCKER_USER/social-flood --tag $$IMAGE_TAG --key $(COSIGN_KEY) --attestation vulnerability
 
 docker-verify:
 	@echo "Verifying Docker image signatures and attestations..."
@@ -227,7 +233,7 @@ docker-verify:
 	echo "Enter image tag (default: latest):" && \
 	read IMAGE_TAG && \
 	IMAGE_TAG=$${IMAGE_TAG:-latest} && \
-	./scripts/verify_attestations.sh --image $$DOCKER_USER/social-flood --tag $$IMAGE_TAG --key cosign.pub
+	./scripts/verify_attestations.sh --image $$DOCKER_USER/social-flood --tag $$IMAGE_TAG --key $(COSIGN_PUB)
 
 # Base image management
 update-base-image:

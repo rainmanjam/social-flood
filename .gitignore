@@ -72,8 +72,13 @@ dump.rdb
 # config/config.py removed - use app/core/config.py instead
 
 # Environment variable files
+# NOTE: `*.env` matches `.env` itself. Do NOT re-include with a broad `!.env.*`
+# negation -- that un-ignores `.env.bak`, `.env.local`, `.env.production`, etc.
+# Only the placeholder template is tracked.
 *.env
-!.env.*
+.env
+.env.*
+!.env.example
 
 # Coverage
 .coverage
