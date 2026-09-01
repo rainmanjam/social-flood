@@ -123,7 +123,18 @@ def app() -> FastAPI:
 @pytest.fixture
 def known_api_keys():
     """Make API_KEY_A and API_KEY_B valid for the duration of a test."""
-    with mock.patch("app.core.auth._api_keys_set", {API_KEY_A, API_KEY_B}):
+    from app.core import auth
+    from app.core.config import get_settings
+
+    # Patch the snapshot accessor rather than the state tuple: auth rebuilds
+    # its state whenever the Settings identity changes, which would silently
+    # discard a patched tuple mid-test.
+    auth_state = auth._AuthState(
+        settings=get_settings(),
+        keys=frozenset({API_KEY_A, API_KEY_B}),
+        metadata={},
+    )
+    with mock.patch.object(auth, "_auth_snapshot", return_value=auth_state):
         yield
 
 

@@ -30,9 +30,17 @@ def api_key_auth_enforced():
     settings_stub = MagicMock()
     settings_stub.ENABLE_API_KEY_AUTH = True
 
+    # auth resolves every decision through _auth_snapshot(), which rebuilds
+    # itself whenever the Settings identity changes -- so patching the state
+    # tuple directly would be discarded on the next call. Patch the accessor.
+    auth_state = auth._AuthState(
+        settings=settings_stub,
+        keys=frozenset({VALID_TEST_KEY}),
+        metadata={},
+    )
+
     with patch.object(main, "get_settings", return_value=settings_stub), \
-         patch.object(auth.auth_settings, "ENABLE_API_KEY_AUTH", True), \
-         patch.object(auth, "_api_keys_set", {VALID_TEST_KEY}):
+         patch.object(auth, "_auth_snapshot", return_value=auth_state):
         yield
 
 
