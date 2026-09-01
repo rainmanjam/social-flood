@@ -132,22 +132,59 @@ def _host_allowed(host: str, allowed_hosts: Sequence[str]) -> bool:
     return False
 
 
+# NAT64 well-known prefix (RFC 6052). An address in this range carries an IPv4
+# address in its low 32 bits, so 64:ff9b::7f00:1 reaches 127.0.0.1 through a
+# NAT64 gateway while looking like an ordinary global IPv6 address.
+_NAT64_WELL_KNOWN = ipaddress.ip_network("64:ff9b::/96")
+
+
+def _unwrap_embedded_ipv4(
+    addr: ipaddress._BaseAddress,
+) -> ipaddress._BaseAddress:
+    """Reduce IPv6 forms that carry an IPv4 address to that IPv4 address.
+
+    Three transition mechanisms embed IPv4 inside IPv6, and each one can be
+    used to express an internal IPv4 destination in a way that IPv6 property
+    checks alone judge as global:
+
+    * IPv4-mapped -- ``::ffff:127.0.0.1``
+    * 6to4 (RFC 3056) -- ``2002:7f00:1::``
+    * NAT64 (RFC 6052) -- ``64:ff9b::7f00:1``
+    """
+    if not isinstance(addr, ipaddress.IPv6Address):
+        return addr
+    if addr.ipv4_mapped is not None:
+        return addr.ipv4_mapped
+    if addr.sixtofour is not None:
+        return addr.sixtofour
+    if addr in _NAT64_WELL_KNOWN:
+        return ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF)
+    return addr
+
+
 def _is_globally_routable(ip: str) -> bool:
     """Return True only for addresses safe to send an outbound request to.
 
-    Rejects loopback, private (RFC 1918), link-local (which covers the cloud
-    metadata address 169.254.169.254), multicast, reserved and unspecified
-    ranges, for both IPv4 and IPv6. IPv4-mapped IPv6 addresses are unwrapped
-    first, since ``::ffff:127.0.0.1`` is not otherwise flagged as loopback.
+    The primary test is ``is_global``, not a hand-written list of bad ranges.
+    An enumeration gets it wrong: the original version checked private,
+    loopback, link-local, multicast, reserved and unspecified, and still
+    admitted CGNAT ``100.64.0.0/10`` (RFC 6598), which is routable inside many
+    ISP and cloud networks. ``is_global`` already excludes CGNAT, benchmarking
+    space (198.18.0.0/15), IETF protocol assignments (192.0.0.0/24) and the
+    240.0.0.0/4 reserved block.
+
+    The explicit checks are kept as well, because ``is_global`` alone admits
+    the NAT64 well-known prefix, and defence in depth here costs nothing.
     """
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
         return False
 
-    # ::ffff:127.0.0.1 must be judged as 127.0.0.1, not as a global v6 address.
-    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
-        addr = addr.ipv4_mapped
+    addr = _unwrap_embedded_ipv4(addr)
+
+    if not addr.is_global:
+        return False
 
     return not (
         addr.is_private
