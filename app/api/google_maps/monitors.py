@@ -65,7 +65,8 @@ async def create_monitor(
             url=request.url,
             webhook_url=request.webhook_url,
             check_interval_hours=request.check_interval_hours,
-            track_fields=request.track_fields
+            track_fields=request.track_fields,
+            api_key=api_key
         )
 
         if result.get("error"):
@@ -113,7 +114,8 @@ async def list_monitors(
         result = await google_maps_service.list_monitors(
             status=status,
             limit=limit,
-            offset=offset
+            offset=offset,
+            api_key=api_key
         )
 
         if result.get("error"):
@@ -154,7 +156,8 @@ async def get_monitor(
     try:
         result = await google_maps_service.get_monitor(
             monitor_id=monitor_id,
-            include_history=include_history
+            include_history=include_history,
+            api_key=api_key
         )
 
         if result.get("error"):
@@ -190,7 +193,7 @@ async def delete_monitor(
     Delete a place monitor.
     """
     try:
-        result = await google_maps_service.delete_monitor(monitor_id)
+        result = await google_maps_service.delete_monitor(monitor_id, api_key=api_key)
 
         if result.get("error"):
             if result.get("status_code") == 404:
@@ -244,7 +247,8 @@ async def register_webhook(
         result = await google_maps_service.register_webhook(
             url=request.url,
             events=request.events,
-            secret=request.secret
+            secret=request.secret,
+            api_key=api_key
         )
 
         if result.get("error"):
@@ -279,7 +283,7 @@ async def list_webhooks(
     List all registered webhooks.
     """
     try:
-        result = await google_maps_service.list_webhooks()
+        result = await google_maps_service.list_webhooks(api_key=api_key)
 
         if result.get("error"):
             raise upstream_error(result, "Failed to list webhooks")
@@ -311,7 +315,7 @@ async def delete_webhook(
     Delete a registered webhook.
     """
     try:
-        result = await google_maps_service.delete_webhook(webhook_id)
+        result = await google_maps_service.delete_webhook(webhook_id, api_key=api_key)
 
         if result.get("error"):
             if result.get("status_code") == 404:

@@ -758,3 +758,65 @@ def test_malformed_results_payload_is_an_error_not_an_empty_success(client):
 
     assert response.status_code == 500
     assert response.content == INTERNAL_ERROR_BODY
+
+
+class TestOwnerIsPropagatedToService:
+    """Regression guard for a cross-tenant hole created at the router/service seam.
+
+    The service methods accept `api_key` and derive an owner partition from it.
+    The router authenticated the caller and then called those methods WITHOUT
+    passing it, so every caller resolved to the same `anonymous` partition and
+    any user could read or delete any other user's monitors and webhooks.
+
+    Both halves were individually correct; only the seam was wrong. These
+    tests assert the argument actually crosses it.
+    """
+
+    MONITOR_CALLS = [
+        ("post", "/api/v1/google-maps/monitors", "create_monitor",
+         {"json": {"place_id": "ChIJtest", "check_interval_hours": 24}}),
+        ("get", "/api/v1/google-maps/monitors", "list_monitors", {}),
+        ("get", "/api/v1/google-maps/monitors/m1", "get_monitor", {}),
+        ("delete", "/api/v1/google-maps/monitors/m1", "delete_monitor", {}),
+        ("post", "/api/v1/google-maps/webhooks", "register_webhook",
+         {"json": {"url": "https://example.com/hook", "events": ["place.changed"]}}),
+        ("get", "/api/v1/google-maps/webhooks", "list_webhooks", {}),
+        ("delete", "/api/v1/google-maps/webhooks/w1", "delete_webhook", {}),
+    ]
+
+    @pytest.mark.parametrize(
+        "method,path,service_method,kwargs",
+        MONITOR_CALLS,
+        ids=[c[2] for c in MONITOR_CALLS],
+    )
+    def test_api_key_reaches_the_service(self, client, method, path, service_method, kwargs):
+        from app.services import google_maps_service as svc_module
+
+        stub = mock.AsyncMock(return_value={"monitors": [], "webhooks": [], "total": 0})
+        with mock.patch.object(
+            svc_module.google_maps_service, service_method, stub
+        ):
+            getattr(client, method)(
+                path, headers={"X-API-Key": API_KEY_A}, **kwargs
+            )
+
+        assert stub.await_count == 1, f"{service_method} was not called"
+        passed = stub.await_args.kwargs.get("api_key")
+        assert passed == API_KEY_A, (
+            f"{service_method} received api_key={passed!r}; without the real key "
+            "every caller collapses into the 'anonymous' owner partition and "
+            "monitors/webhooks leak across tenants"
+        )
+
+    def test_place_history_receives_api_key(self, client):
+        from app.services import google_maps_service as svc_module
+
+        stub = mock.AsyncMock(return_value={"history": [], "monitored": False})
+        with mock.patch.object(svc_module.google_maps_service, "get_place_history", stub):
+            client.get(
+                "/api/v1/google-maps/place/ChIJtest/history",
+                headers={"X-API-Key": API_KEY_A},
+            )
+
+        assert stub.await_count == 1
+        assert stub.await_args.kwargs.get("api_key") == API_KEY_A

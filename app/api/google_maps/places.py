@@ -420,7 +420,8 @@ async def get_place_history(
             place_id=place_id,
             field=field,
             start_date=start_date,
-            end_date=end_date
+            end_date=end_date,
+            api_key=api_key
         )
 
         if result.get("error"):
