@@ -2,7 +2,13 @@
 Health check utilities for the Social Flood application.
 
 This module provides functions to check the health of various
-dependencies like databases, Redis, and external APIs.
+dependencies like Redis, external APIs, and system resources.
+
+Note: there is no database health check. The application has no database
+layer (``app/core/database.py`` was removed in the Phase 4 dependency
+cleanup); the previous check imported SQLAlchemy/asyncpg, neither of which
+was ever a declared dependency, and it ``await``-ed an async generator, so
+it could never have succeeded.
 """
 from typing import Dict, List, Optional, Any, Tuple, Union
 import logging
@@ -16,61 +22,6 @@ from app.core.exceptions import ServiceUnavailableError
 
 # Configure logger
 logger = logging.getLogger(__name__)
-
-
-async def check_database_connection() -> Dict[str, Any]:
-    """
-    Check the database connection.
-    
-    Returns:
-        Dict[str, Any]: Status information
-        
-    Raises:
-        ServiceUnavailableError: If the database is unavailable
-    """
-    settings = get_settings()
-    
-    if not settings.DATABASE_URL:
-        return {
-            "status": "skipped",
-            "message": "Database URL not configured"
-        }
-    
-    try:
-        # Import here to avoid circular imports
-        from app.core.database import get_db
-
-        # Get a database session
-        session = await get_db()
-        
-        # Execute a simple query
-        start_time = time.time()
-        result = await session.execute("SELECT 1")
-        response_time = time.time() - start_time
-        
-        # Check the result
-        if result:
-            return {
-                "status": "healthy",
-                "message": "Database connection successful",
-                "response_time_ms": round(response_time * 1000, 2)
-            }
-        else:
-            raise ServiceUnavailableError(
-                detail="Database query failed",
-                error_type="database_unavailable"
-            )
-    except ImportError:
-        return {
-            "status": "skipped",
-            "message": "Database module not available"
-        }
-    except Exception as e:
-        logger.exception("Database health check failed")
-        raise ServiceUnavailableError(
-            detail=f"Database connection failed: {str(e)}",
-            error_type="database_unavailable"
-        )
 
 
 async def check_redis_connection() -> Dict[str, Any]:
@@ -264,7 +215,6 @@ async def check_health(
     """
     # Run all health checks concurrently
     checks = await asyncio.gather(
-        check_database_connection(),
         check_redis_connection(),
         check_external_apis(),
         check_system_resources(),
@@ -273,10 +223,9 @@ async def check_health(
     
     # Process the results
     results = {
-        "database": checks[0] if not isinstance(checks[0], Exception) else {"status": "unhealthy", "message": str(checks[0])},
-        "redis": checks[1] if not isinstance(checks[1], Exception) else {"status": "unhealthy", "message": str(checks[1])},
-        "external_apis": checks[2] if not isinstance(checks[2], Exception) else {"status": "unhealthy", "message": str(checks[2])},
-        "system": checks[3] if not isinstance(checks[3], Exception) else {"status": "unhealthy", "message": str(checks[3])}
+        "redis": checks[0] if not isinstance(checks[0], Exception) else {"status": "unhealthy", "message": str(checks[0])},
+        "external_apis": checks[1] if not isinstance(checks[1], Exception) else {"status": "unhealthy", "message": str(checks[1])},
+        "system": checks[2] if not isinstance(checks[2], Exception) else {"status": "unhealthy", "message": str(checks[2])}
     }
     
     # Determine overall status
@@ -322,7 +271,6 @@ async def require_healthy_service(
     """
     # Map service names to health check functions
     health_checks = {
-        "database": check_database_connection,
         "redis": check_redis_connection,
         "external_apis": check_external_apis,
         "system": check_system_resources
