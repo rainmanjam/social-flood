@@ -159,6 +159,17 @@ class TestDnsResolution:
             "fd00::1",  # IPv6 unique-local
             "::ffff:127.0.0.1",  # IPv4-mapped loopback
             "0.0.0.0",  # unspecified
+            # Ranges an enumerate-the-bad-ones check misses:
+            "100.64.0.1",  # CGNAT (RFC 6598) -- routable inside ISP/cloud nets
+            "100.127.255.254",  # CGNAT upper bound
+            "192.0.0.1",  # IETF protocol assignments
+            "198.18.0.1",  # benchmarking range
+            "240.0.0.1",  # reserved 240.0.0.0/4
+            # IPv6 transition forms carrying an internal IPv4 destination:
+            "64:ff9b::7f00:1",  # NAT64 -> 127.0.0.1
+            "64:ff9b::a9fe:a9fe",  # NAT64 -> 169.254.169.254 (metadata)
+            "2002:7f00:1::",  # 6to4 -> 127.0.0.1
+            "2002:a00:1::",  # 6to4 -> 10.0.0.1
         ],
     )
     def test_non_routable_answers_rejected(self, ip):
@@ -216,3 +227,44 @@ class TestErrorMessagesAreNotAnOracle:
         with pytest.raises(UrlNotAllowed) as exc:
             _validate("https://evil.com/x")
         assert "evil.com" in exc.value.reason
+
+
+class TestGloballyRoutableHelper:
+    """Direct coverage of the address classifier.
+
+    Regression guard: the first implementation enumerated private/loopback/
+    link-local/multicast/reserved/unspecified and therefore admitted CGNAT.
+    """
+
+    @pytest.mark.parametrize(
+        "ip",
+        [
+            "8.8.8.8",
+            "142.250.72.238",
+            "2001:4860:4860::8888",
+            "64:ff9b::8.8.8.8",  # NAT64 to a genuinely public IPv4 is fine
+        ],
+    )
+    def test_public_addresses_allowed(self, ip):
+        from app.core.url_guard import _is_globally_routable
+
+        assert _is_globally_routable(ip) is True
+
+    @pytest.mark.parametrize(
+        "ip",
+        [
+            "100.64.0.1",
+            "192.0.0.1",
+            "198.18.0.1",
+            "240.0.0.1",
+            "64:ff9b::7f00:1",
+            "2002:7f00:1::",
+            "127.0.0.1",
+            "169.254.169.254",
+            "not-an-ip",
+        ],
+    )
+    def test_non_routable_addresses_blocked(self, ip):
+        from app.core.url_guard import _is_globally_routable
+
+        assert _is_globally_routable(ip) is False
