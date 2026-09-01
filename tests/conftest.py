@@ -401,3 +401,30 @@ def mock_async_client(mock_http_response):
     client.__aenter__.return_value = client
     client.__aexit__.return_value = None
     return client
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limit_state():
+    """Clear the process-global rate-limit store between every test.
+
+    ``app.core.rate_limiter`` keeps its buckets in a module-level dict, and
+    ``RateLimitMiddleware`` counts *every* request -- so without this, requests
+    made by one test consume another test's budget and unrelated tests start
+    seeing 429s depending on execution order. That ordering sensitivity is the
+    same fact as CRT-8's "a per-process store multiplies limits by worker
+    count", observed from the test side.
+
+    Autouse and global rather than per-file: a reset that each test module has
+    to remember is a reset that the next new test file will forget.
+    """
+    try:
+        from app.core.rate_limiter import reset_rate_limit_state
+    except ImportError:  # pragma: no cover - module always present in-tree
+        yield
+        return
+
+    reset_rate_limit_state()
+    try:
+        yield
+    finally:
+        reset_rate_limit_state()
