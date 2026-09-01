@@ -573,9 +573,10 @@ class TestStaleSelectorDetection:
         assert error.to_dict()["selectors_stale"] is True
 
     async def test_a_genuinely_empty_area_still_returns_an_empty_list(self):
-        # The results container rendered, holds no cards, and there are no
-        # place links anywhere on the page. That is a real zero, and tightening
-        # stale detection must not turn it into an error.
+        # The results container rendered and holds nothing we recognise. This
+        # is what a genuinely empty area looks like, so tightening stale
+        # detection must NOT turn it into a 503 -- it is labelled instead, see
+        # test_a_feed_where_nothing_matches_flags_the_empty_as_unverified.
         page = FakePage(elements={FEED_SELECTOR: [{}]})
         scraper = make_scraper(page)
 
@@ -609,6 +610,18 @@ class TestStaleSelectorDetection:
 
         assert excinfo.value.attempted == 0
         assert excinfo.value.extracted == 0
+
+    async def test_a_feed_where_nothing_matches_flags_the_empty_as_unverified(self):
+        # The one irreducibly ambiguous case: the feed rendered but neither
+        # cards nor place links matched, so an empty area and a wholesale
+        # markup rotation are indistinguishable. Raising would 503 every
+        # legitimately empty search, so the empty result is returned but
+        # labelled -- it must never be reported as a confirmed zero.
+        page = FakePage(elements={FEED_SELECTOR: [{}]})
+        scraper = make_scraper(page)
+
+        assert await scraper.search("coffee") == []
+        assert scraper._unverified_empty is True
 
     async def test_cards_that_all_throw_are_not_an_empty_area(self):
         # Every card blows up on interaction. The per-card `except: continue`
@@ -783,8 +796,9 @@ class TestExtractExpandedHours:
 
 @pytest.mark.asyncio
 class TestRunScrapeJob:
-    async def _run(self, store, target, search):
+    async def _run(self, store, target, search, unverified_empty=False):
         async def fake_search(self, **kwargs):
+            self._unverified_empty = unverified_empty
             return await search()
 
         with patch("app.services.google_maps_scraper.get_job_store", return_value=store), \
@@ -871,3 +885,37 @@ class TestRunScrapeJob:
         stored = await memory_store.get("alice", "job-1")
         assert stored.status is JobStatus.COMPLETED
         assert stored.total == 0
+        assert stored.empty_unverified is False
+        assert stored.to_dict()["empty_unverified"] is False
+
+    async def test_an_unverifiable_empty_result_is_labelled_on_the_job(
+        self, memory_store
+    ):
+        # Completed, but the caller is told the zero could not be confirmed --
+        # so an empty result is never silently authoritative.
+        target = job("job-1", owner="alice")
+        await memory_store.create(target)
+
+        async def empty():
+            return []
+
+        await self._run(memory_store, target, empty, unverified_empty=True)
+
+        stored = await memory_store.get("alice", "job-1")
+        assert stored.status is JobStatus.COMPLETED
+        assert stored.empty_unverified is True
+        assert stored.to_dict()["empty_unverified"] is True
+
+    async def test_a_non_empty_result_is_never_labelled_unverified(
+        self, memory_store
+    ):
+        target = job("job-1", owner="alice")
+        await memory_store.create(target)
+
+        async def one():
+            return [{"title": "Blue Bottle"}]
+
+        await self._run(memory_store, target, one, unverified_empty=True)
+
+        stored = await memory_store.get("alice", "job-1")
+        assert stored.empty_unverified is False

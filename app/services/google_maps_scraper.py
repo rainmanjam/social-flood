@@ -280,6 +280,11 @@ class ScrapeJob:
     #: True when the job failed because Google's markup changed rather than
     #: because of a transient error; routers should surface this as 503.
     selectors_stale: bool = False
+    #: True when the job completed with zero results that could NOT be
+    #: confirmed as a genuine zero (the results feed rendered but nothing
+    #: inside it matched). The job is not failed, but callers must not treat
+    #: the empty list as authoritative.
+    empty_unverified: bool = False
     progress: int = 0
     total: int = 0
 
@@ -309,6 +314,7 @@ class ScrapeJob:
             # Lets a router turn a markup-rotation failure into a 503 rather
             # than reporting a job that merely "found nothing".
             "selectors_stale": self.selectors_stale,
+            "empty_unverified": self.empty_unverified,
             "Data": {
                 "keywords": [self.query],
                 "lang": self.language,
@@ -456,6 +462,7 @@ class GoogleMapsScraper:
         self._init_lock = asyncio.Lock()
         # Per-search extraction bookkeeping; see _assert_selectors_fresh.
         self._candidates = 0
+        self._unverified_empty = False
         self._attempted = 0
         self._extracted = 0
         self._partial = 0
@@ -620,6 +627,7 @@ class GoogleMapsScraper:
         # ones that yielded a usable record. attempted > 0 with extracted == 0
         # is the fingerprint of a DOM rotation, not of an empty area.
         self._candidates = 0
+        self._unverified_empty = False
         self._attempted = 0
         self._extracted = 0
         self._partial = 0
@@ -872,6 +880,19 @@ class GoogleMapsScraper:
                         extracted=0,
                         missing=["div[role='feed'] > div > div[jsaction]"],
                     )
+
+                # Neither cards nor place links matched inside a feed that did
+                # render. This is genuinely ambiguous -- an empty area looks
+                # exactly like a wholesale markup rotation -- so raising would
+                # turn every legitimately empty search into a 503. Instead the
+                # emptiness is labelled as unverified and carried out to the
+                # caller, so it is never presented as a *confirmed* zero.
+                self._unverified_empty = True
+                logger.error(
+                    "Results feed rendered but neither the card selector nor "
+                    "any place link matched; returning an EMPTY result that "
+                    "could not be verified as a genuine zero"
+                )
                 break
 
             # Candidates are cards we can see. If we can see candidates and
@@ -1682,6 +1703,9 @@ async def run_scrape_job(
         job.completed_at = datetime.now()
         job.total = len(results)
         job.progress = len(results)
+        # An empty result the scraper could not verify is reported as such
+        # rather than as a confirmed zero.
+        job.empty_unverified = bool(scraper._unverified_empty and not results)
         await store.update(job)
 
         logger.info(f"Job {job.id} completed with {len(results)} results")
