@@ -15,12 +15,53 @@ from fastapi.testclient import TestClient
 import os
 import time
 
-from app.core.rate_limiter import RateLimitMiddleware
+from app.core.config import get_settings
+from app.core.rate_limiter import RateLimitMiddleware, reset_rate_limit_state
+
+
+ISOLATED_ENV_VARS = (
+    "WEB_CONCURRENCY", "UVICORN_WORKERS", "GUNICORN_WORKERS", "WORKERS",
+    "RATE_LIMIT_FAIL_OPEN", "REDIS_URL", "API_KEY",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_rate_limiter():
+    """
+    Guarantee isolation by construction, not by test ordering.
+
+    The limiter's store, cleanup task handle and cached Redis manager are
+    process globals shared with tests/test_rate_limiter.py, so they are reset
+    around every test here rather than relying on each test remembering to
+    clear the store itself.
+    """
+    saved = {var: os.environ.pop(var, None) for var in ISOLATED_ENV_VARS}
+    reset_rate_limit_state()
+    get_settings.cache_clear()
+    yield
+    reset_rate_limit_state()
+    for var, value in saved.items():
+        if value is None:
+            os.environ.pop(var, None)
+        else:
+            os.environ[var] = value
+    get_settings.cache_clear()
 
 
 def _install_rate_limiting(app):
-    """Attach the real rate limit middleware to a freshly created app."""
-    app.add_middleware(RateLimitMiddleware)
+    """
+    Attach the real rate limit middleware to a freshly created app.
+
+    Idempotent: main.py is expected to grow an
+    ``app.add_middleware(RateLimitMiddleware)`` call of its own, and installing
+    a second copy would count every request twice.
+    """
+    already_installed = any(
+        getattr(middleware, "cls", None) is RateLimitMiddleware
+        for middleware in getattr(app, "user_middleware", [])
+    )
+    if not already_installed:
+        app.add_middleware(RateLimitMiddleware)
     return app
 
 
@@ -241,6 +282,16 @@ class TestRateLimitByKey:
                 "/api-config",
                 headers={"X-API-Key": "key-user-a"}
             )
+
+        # Precondition, so a regression here reports its cause rather than just
+        # "B got 429": A's traffic must have landed in a per-API-key bucket. If
+        # the configured keys stop being recognised, both users collapse onto
+        # one IP bucket and this test fails for the CRT-8 reason all over again.
+        assert len(_rate_limit_store) == 1, _rate_limit_store
+        assert next(iter(_rate_limit_store)).startswith("rate_limit:api_key:"), (
+            "API key not recognised; both users would share the IP bucket: "
+            f"{list(_rate_limit_store)}"
+        )
 
         # User A should be rate limited
         response_a = client.get(

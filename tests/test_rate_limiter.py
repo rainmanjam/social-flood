@@ -14,6 +14,7 @@ These cover the CRT-8 regressions:
     operator explicitly asks for it).
 """
 import asyncio
+import contextlib
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -22,6 +23,7 @@ import pytest
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
+from app.core.config import get_settings
 from app.core.exceptions import RateLimitExceededError, ServiceUnavailableError
 from app.core.rate_limiter import (
     API_KEY_KEY_PREFIX,
@@ -33,7 +35,9 @@ from app.core.rate_limiter import (
     build_rate_limit_key,
     cleanup_rate_limit_store,
     get_worker_count,
+    parse_api_keys_env,
     purge_expired_entries,
+    reset_rate_limit_state,
     rate_limit,
     limiter,
     requires_shared_store,
@@ -162,15 +166,30 @@ def fake_redis_manager(client=None):
     return manager
 
 
+ISOLATED_ENV_VARS = (
+    "WEB_CONCURRENCY", "UVICORN_WORKERS", "GUNICORN_WORKERS", "WORKERS",
+    "RATE_LIMIT_FAIL_OPEN", "RATE_LIMIT_ENABLED", "RATE_LIMIT_REQUESTS",
+    "RATE_LIMIT_TIMEFRAME", "REDIS_URL", "API_KEYS", "API_KEY",
+)
+
+
 @pytest.fixture(autouse=True)
-def _clean_store(monkeypatch):
-    """Isolate every test from store state, worker env and fail-open env."""
-    _rate_limit_store.clear()
-    for var in ("WEB_CONCURRENCY", "UVICORN_WORKERS", "GUNICORN_WORKERS",
-                "WORKERS", "RATE_LIMIT_FAIL_OPEN"):
+def _isolate_rate_limiter(monkeypatch):
+    """
+    Guarantee isolation by construction, not by test ordering.
+
+    Every limiter global (the store, the cleanup task handle, the cached Redis
+    manager) and every environment variable the limiter reads is reset around
+    each test, so this module cannot leave residue for the integration tests --
+    or for the next test in this file.
+    """
+    reset_rate_limit_state()
+    for var in ISOLATED_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
+    get_settings.cache_clear()
     yield
-    _rate_limit_store.clear()
+    reset_rate_limit_state()
+    get_settings.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +302,20 @@ class TestRateLimitKey:
         assert "super-secret" not in key
 
     @pytest.mark.asyncio
+    async def test_key_configured_only_in_the_environment_is_recognised(self, monkeypatch):
+        """
+        Settings and AuthSettings disagree about how to decode API_KEYS, so the
+        bucket must not depend on which parser won.
+        """
+        monkeypatch.setenv("API_KEYS", "env-key-a,env-key-b")
+        limiter_ = RateLimiter(settings=settings_stub(API_KEYS=[]))
+
+        key = await limiter_._get_rate_limit_key(make_request(api_key="env-key-a"))
+
+        assert key == build_rate_limit_key(api_key="env-key-a")
+        assert key.startswith(API_KEY_KEY_PREFIX)
+
+    @pytest.mark.asyncio
     async def test_key_falls_back_to_ip_without_api_key(self):
         limiter_ = RateLimiter(settings=settings_stub())
         key = await limiter_._get_rate_limit_key(make_request(host="192.168.1.1"))
@@ -312,6 +345,54 @@ class TestRateLimitKey:
         limiter_ = RateLimiter(settings=settings_stub())
         key = await limiter_._get_rate_limit_key(make_request(host=None))
         assert key == f"{IP_KEY_PREFIX}unknown"
+
+
+class TestApiKeyEnvParsing:
+    """Both encodings of API_KEYS must yield the same key set."""
+
+    @pytest.mark.parametrize("raw", [
+        '["key-a", "key-b"]',      # JSON array (what pydantic-settings decodes)
+        "key-a,key-b",             # comma separated (what assemble_api_keys expects)
+        " key-a , key-b ",
+    ])
+    def test_both_encodings_parse_identically(self, monkeypatch, raw):
+        monkeypatch.setenv("API_KEYS", raw)
+        assert parse_api_keys_env() == {"key-a", "key-b"}
+
+    def test_single_api_key_variable_is_honoured(self, monkeypatch):
+        monkeypatch.setenv("API_KEY", "solo-key")
+        assert parse_api_keys_env() == {"solo-key"}
+
+    def test_absent_and_blank_yield_nothing(self, monkeypatch):
+        assert parse_api_keys_env() == set()
+        monkeypatch.setenv("API_KEYS", "   ")
+        assert parse_api_keys_env() == set()
+
+    def test_malformed_json_falls_back_to_splitting(self, monkeypatch):
+        monkeypatch.setenv("API_KEYS", '["key-a", "key-b"')  # truncated JSON
+        assert parse_api_keys_env() == {"key-a", "key-b"}
+
+
+class TestStateReset:
+    """reset_rate_limit_state must clear every global the limiter owns."""
+
+    @pytest.mark.asyncio
+    async def test_reset_clears_store_and_cleanup_task(self):
+        import app.core.rate_limiter as module
+
+        _rate_limit_store["leftover"] = (5, time.time())
+        with patch("app.core.rate_limiter.get_settings", return_value=settings_stub()):
+            task = start_cleanup_task(interval=0.01)
+        module._redis_manager = object()
+
+        reset_rate_limit_state()
+
+        assert _rate_limit_store == {}
+        assert module._cleanup_task is None
+        assert module._redis_manager is None
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        assert task.cancelled()
 
 
 # ---------------------------------------------------------------------------

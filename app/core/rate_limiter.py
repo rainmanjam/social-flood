@@ -52,6 +52,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
 import contextlib
 import hashlib
+import json
 import os
 import sys
 import time
@@ -264,31 +265,102 @@ def reset_redis_manager() -> None:
     _redis_manager = None
 
 
+def reset_rate_limit_state() -> None:
+    """
+    Drop every piece of module-global limiter state.
+
+    ``_rate_limit_store``, the cleanup task handle and the cached Redis manager
+    all live for the lifetime of the process, so anything that can leave
+    entries behind between tests can leave them behind in a worker. This is the
+    single authoritative reset: one place that knows the full list, rather than
+    each caller remembering to clear the dict and hoping that was all of it.
+
+    Cancellation of a running cleanup task is requested but not awaited; use
+    ``shutdown_rate_limiting()`` when the task must be joined.
+    """
+    global _cleanup_task
+
+    _rate_limit_store.clear()
+    if _cleanup_task is not None and not _cleanup_task.done():
+        _cleanup_task.cancel()
+    _cleanup_task = None
+    reset_redis_manager()
+
+
 # ---------------------------------------------------------------------------
 # Identity helpers
 # ---------------------------------------------------------------------------
+
+def _clean_api_key(value: Any) -> Optional[str]:
+    """Normalise one API key token from any configuration source."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip().strip("[]").strip().strip('"').strip("'").strip()
+    return value or None
+
+
+def parse_api_keys_env(raw: Optional[str] = None) -> Set[str]:
+    """
+    Parse API keys straight from the ``API_KEYS`` environment variable.
+
+    Accepts both encodings this application has used: a JSON array
+    (``["a", "b"]``) and a comma-separated list (``a,b``).
+
+    This exists because ``Settings.API_KEYS`` and ``AuthSettings.API_KEYS``
+    disagree about which of those two forms they can decode -- pydantic-settings
+    JSON-decodes list fields before ``assemble_api_keys`` ever runs. Bucket
+    identity must not depend on which parser happened to win, or the limiter
+    silently degrades to per-IP bucketing again (the CRT-8 failure mode).
+    """
+    raw = os.getenv("API_KEYS") if raw is None else raw
+    keys: Set[str] = set()
+
+    if raw and raw.strip():
+        stripped = raw.strip()
+        decoded = None
+        if stripped.startswith("["):
+            try:
+                decoded = json.loads(stripped)
+            except ValueError:
+                decoded = None
+        tokens = decoded if isinstance(decoded, list) else stripped.split(",")
+        for token in tokens:
+            key = _clean_api_key(token)
+            if key:
+                keys.add(key)
+
+    # Backwards-compatible single-key variable, as honoured by app.core.auth.
+    single = _clean_api_key(os.getenv("API_KEY"))
+    if single:
+        keys.add(single)
+
+    return keys
+
 
 def _configured_api_keys(settings: Optional[Settings] = None) -> Set[str]:
     """
     All API keys this process considers valid.
 
-    Combines the keys from application settings with the set maintained by
-    ``app.core.auth`` so that either configuration source is honoured.
+    Unions every configuration source -- application settings, the set
+    maintained by ``app.core.auth``, and the raw environment -- so that the
+    bucket a request lands in does not depend on which source parsed the value.
     """
     settings = settings or get_settings()
-    keys: Set[str] = set()
+    keys: Set[str] = parse_api_keys_env()
 
     for key in getattr(settings, "API_KEYS", None) or []:
-        if isinstance(key, str) and key.strip():
-            keys.add(key.strip())
+        cleaned = _clean_api_key(key)
+        if cleaned:
+            keys.add(cleaned)
 
     # Read (never mutate) the auth module's key set.
     try:
         from app.core import auth as _auth
 
         for key in getattr(_auth, "_api_keys_set", None) or set():
-            if isinstance(key, str) and key.strip():
-                keys.add(key.strip())
+            cleaned = _clean_api_key(key)
+            if cleaned:
+                keys.add(cleaned)
     except ImportError:  # pragma: no cover - auth is always importable in-app
         logger.warning("app.core.auth unavailable while resolving API keys")
 
