@@ -10,6 +10,11 @@
 # workflow nothing to update. Moved 3.11 -> 3.12 to match the interpreter the
 # test suite and requirements.lock are resolved against (3.12), and because
 # 3.12 has a year more upstream security support than 3.11.
+#
+# ACTION REQUIRED (owner of scripts/): scripts/update_base_image.sh:10 still
+# defaults BASE_IMAGE_TAG to "3.11-slim-bookworm" and .github/workflows/
+# update-base-image.yml invokes it with no --tag, so its grep will not match
+# the FROM lines below until that default becomes "3.12-slim-bookworm".
 # python:3.12-slim-bookworm as of 2026-09-01
 FROM python:3.12-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254 AS builder
 
