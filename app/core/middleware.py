@@ -158,26 +158,90 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         return response
 
 
+class CORSConfigurationError(RuntimeError):
+    """Raised when the configured CORS policy is unsafe and must not be served."""
+
+
+def _is_wildcard_origins(origins: Any) -> bool:
+    """
+    Return True when the configured origin list is (or contains) a wildcard.
+
+    Written defensively so that non-list settings objects (e.g. mocks used in
+    tests) never raise from a membership check.
+    """
+    try:
+        return "*" in origins
+    except TypeError:
+        return False
+
+
+def resolve_cors_policy(settings: Settings) -> Dict[str, Any]:
+    """
+    Resolve a safe CORS policy from settings.
+
+    ``allow_origins=["*"]`` combined with ``allow_credentials=True`` is invalid
+    per the CORS specification: Starlette responds by *reflecting* the request
+    ``Origin`` together with ``Access-Control-Allow-Credentials: true``, which
+    lets any site on the internet make credentialed cross-origin calls to this
+    API. Two rules follow from that:
+
+    1. In production an explicit origin allow-list is mandatory. A wildcard is
+       refused outright rather than silently downgraded.
+    2. Outside production the wildcard is still accepted for developer
+       convenience, but credentials are forcibly disabled so the invalid
+       combination can never be served.
+
+    Args:
+        settings: The application settings
+
+    Returns:
+        Dict[str, Any]: kwargs for ``CORSMiddleware``
+
+    Raises:
+        CORSConfigurationError: If a wildcard origin is configured in production
+    """
+    origins = settings.CORS_ORIGINS
+    environment = getattr(settings, "ENVIRONMENT", "development")
+    wildcard = _is_wildcard_origins(origins)
+
+    if wildcard and environment == "production":
+        raise CORSConfigurationError(
+            "CORS_ORIGINS must list explicit origins in production. "
+            'The default wildcard ("*") cannot be combined with credentialed '
+            "requests; set CORS_ORIGINS to a comma-separated allow-list of "
+            "trusted origins (e.g. https://app.example.com)."
+        )
+
+    if wildcard:
+        logger.warning(
+            "CORS is configured with a wildcard origin (\"*\"); "
+            "credentials are disabled for cross-origin requests. "
+            "Set CORS_ORIGINS to an explicit allow-list to enable them."
+        )
+
+    return {
+        "allow_origins": origins,
+        # Never combine credentials with a wildcard origin.
+        "allow_credentials": not wildcard,
+        "allow_methods": settings.CORS_METHODS,
+        "allow_headers": settings.CORS_HEADERS,
+    }
+
+
 def setup_middleware(app: FastAPI, settings: Optional[Settings] = None) -> None:
     """
     Set up middleware for the FastAPI application.
-    
+
     Args:
         app: The FastAPI application
         settings: Optional settings instance
     """
     if settings is None:
         settings = get_settings()
-    
-    # Add CORS middleware
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.CORS_ORIGINS,
-        allow_credentials=True,
-        allow_methods=settings.CORS_METHODS,
-        allow_headers=settings.CORS_HEADERS,
-    )
-    
+
+    # Add CORS middleware with a policy that can never pair "*" with credentials
+    app.add_middleware(CORSMiddleware, **resolve_cors_policy(settings))
+
     # Add trusted host middleware for production
     if settings.ENVIRONMENT == "production":
         app.add_middleware(

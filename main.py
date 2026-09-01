@@ -8,9 +8,11 @@ Social Flood API service.
 import logging
 import time
 import nltk
-from typing import Dict, Any, Optional
+from contextlib import asynccontextmanager
+from typing import AsyncIterator, Dict, Any, Optional
 
-from fastapi import FastAPI, Depends, Request, Response, APIRouter
+from fastapi import FastAPI, Depends, Request, Response, APIRouter, Security
+from fastapi.security.api_key import APIKeyHeader
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,6 +31,11 @@ from app.core.exceptions import (
 from app.core.middleware import setup_middleware
 from app.core.health_checks import check_health
 from app.core.auth import get_api_key
+from app.core.http_client import shutdown_http_client_manager
+from app.core.rate_limiter import (
+    start_cleanup_task as start_rate_limit_cleanup_task,
+    stop_cleanup_task as stop_rate_limit_cleanup_task,
+)
 
 # Import API routers
 from app.api.google_news.google_news_api import gnews_router, setup_nltk
@@ -84,25 +91,118 @@ except ImportError:
     logger.warning("prometheus-client not installed. Metrics will be disabled.")
     METRICS_AVAILABLE = False
 
+#: Header scheme used only to *declare* the API key in the OpenAPI schema for
+#: the operational endpoints below. ``auto_error=False`` so that the
+#: ENABLE_API_KEY_AUTH switch is honoured by require_api_key rather than being
+#: short-circuited by the security scheme itself.
+_operational_api_key_scheme = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def require_api_key(
+    api_key: Optional[str] = Security(_operational_api_key_scheme),
+) -> None:
+    """
+    Gate for endpoints that disclose host or configuration detail.
+
+    Delegates the actual validation to app.core.auth.get_api_key (unchanged),
+    but reads settings per-request so the documented ENABLE_API_KEY_AUTH
+    switch actually applies.
+
+    Raises:
+        HTTPException: 401 if authentication is enabled and the key is
+            missing or invalid.
+    """
+    if not get_settings().ENABLE_API_KEY_AUTH:
+        return
+    await get_api_key(api_key)
+
+
+def _docs_enabled() -> bool:
+    """
+    Decide whether the interactive docs and OpenAPI schema are served.
+
+    /docs, /redoc and /openapi.json publish the complete API surface -- every
+    path, parameter, enum and response model -- to anyone who can reach the
+    service. They require no API key by design (the schema has to be readable
+    before you can authenticate against it), so in production they hand an
+    unauthenticated attacker a free map of the attack surface.
+
+    They stay on outside production, where they are the main reason the
+    service is pleasant to develop against. In production they are not
+    registered at all, so they 404 rather than 401 -- a 401 would confirm the
+    routes exist. Publish the schema to consumers from CI instead of from the
+    live service.
+    """
+    return getattr(settings, "ENVIRONMENT", "development") != "production"
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """
+    Manage application startup and shutdown.
+
+    Replaces the deprecated @app.on_event hooks, which were removed in newer
+    Starlette releases.
+    """
+    # --- startup ---
+    logger.info(f"Starting {settings.PROJECT_NAME} v{settings.VERSION} in {settings.ENVIRONMENT} mode")
+
+    # Initialize NLTK
+    await setup_nltk()
+
+    # Start the rate limiter's cleanup task. Without this the in-memory
+    # rate-limit store grows without bound for the life of the process.
+    start_rate_limit_cleanup_task()
+
+    if _docs_enabled():
+        logger.info("API documentation available at /api/docs and /api/redoc")
+    else:
+        logger.info("API documentation disabled in production")
+    logger.info("Health check available at /health")
+
+    # Log rate limiting status
+    if RATE_LIMITING_AVAILABLE and settings.RATE_LIMIT_ENABLED:
+        logger.info(f"Rate limiting enabled: {settings.RATE_LIMIT_REQUESTS} requests per {settings.RATE_LIMIT_TIMEFRAME} seconds")
+    else:
+        logger.info("Rate limiting disabled")
+
+    # Log metrics status
+    if METRICS_AVAILABLE:
+        logger.info("Metrics enabled at /metrics")
+    else:
+        logger.info("Metrics disabled")
+
+    try:
+        yield
+    finally:
+        # --- shutdown ---
+        logger.info(f"Shutting down {settings.PROJECT_NAME}")
+        stop_rate_limit_cleanup_task()
+        await shutdown_http_client_manager()
+
+
 # Create the FastAPI application
 def create_application() -> FastAPI:
     """
     Create and configure the FastAPI application.
-    
+
     Returns:
         FastAPI: The configured FastAPI application
     """
+    docs_enabled = _docs_enabled()
+
     # Create FastAPI app with settings from environment
     app = FastAPI(
         title=settings.PROJECT_NAME,
         description=settings.DESCRIPTION,
         version=settings.VERSION,
-        docs_url="/docs",  # Standard docs endpoint
-        redoc_url="/redoc",  # Standard redoc endpoint
-        openapi_url="/openapi.json",
-        debug=settings.DEBUG
+        docs_url="/docs" if docs_enabled else None,
+        redoc_url="/redoc" if docs_enabled else None,
+        openapi_url="/openapi.json" if docs_enabled else None,
+        debug=settings.DEBUG,
+        lifespan=lifespan,
     )
-    
+
     # Setup middleware
     setup_middleware(app, settings)
     
@@ -131,81 +231,64 @@ def create_application() -> FastAPI:
         instrumentator = Instrumentator()
         instrumentator.instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
     
-    # Add startup event
-    @app.on_event("startup")
-    async def startup_event():
-        """Initialize resources on startup."""
-        logger.info(f"Starting {settings.PROJECT_NAME} v{settings.VERSION} in {settings.ENVIRONMENT} mode")
-        
-        # Initialize NLTK
-        await setup_nltk()
-        
-        # Log application settings
-        logger.info(f"API documentation available at /api/docs and /api/redoc")
-        logger.info(f"Health check available at /health")
-        
-        # Log rate limiting status
-        if RATE_LIMITING_AVAILABLE and settings.RATE_LIMIT_ENABLED:
-            logger.info(f"Rate limiting enabled: {settings.RATE_LIMIT_REQUESTS} requests per {settings.RATE_LIMIT_TIMEFRAME} seconds")
-        else:
-            logger.info("Rate limiting disabled")
-        
-        # Log metrics status
-        if METRICS_AVAILABLE:
-            logger.info("Metrics enabled at /metrics")
-        else:
-            logger.info("Metrics disabled")
-    
-    # Add shutdown event
-    @app.on_event("shutdown")
-    async def shutdown_event():
-        """Clean up resources on shutdown."""
-        logger.info(f"Shutting down {settings.PROJECT_NAME}")
-    
-    # Add custom OpenAPI documentation endpoints
-    @app.get("/api/docs", include_in_schema=False)
-    async def custom_swagger_ui_html():
-        """Serve custom Swagger UI."""
-        return get_swagger_ui_html(
-            openapi_url=app.openapi_url,
-            title=f"{settings.PROJECT_NAME} - API Documentation",
-            swagger_js_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js",
-            swagger_css_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css",
-        )
-    
-    @app.get("/api/redoc", include_in_schema=False)
-    async def custom_redoc_html():
-        """Serve custom ReDoc."""
-        return get_redoc_html(
-            openapi_url=app.openapi_url,
-            title=f"{settings.PROJECT_NAME} - API Documentation",
-            redoc_js_url="https://cdn.jsdelivr.net/npm/redoc@next/bundles/redoc.standalone.js",
-        )
-    
+    # Add custom OpenAPI documentation endpoints (non-production only, see
+    # _docs_enabled: they enumerate the entire authenticated API surface).
+    if docs_enabled:
+        @app.get("/api/docs", include_in_schema=False)
+        async def custom_swagger_ui_html():
+            """Serve custom Swagger UI."""
+            return get_swagger_ui_html(
+                openapi_url=app.openapi_url,
+                title=f"{settings.PROJECT_NAME} - API Documentation",
+                swagger_js_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js",
+                swagger_css_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css",
+            )
+
+        @app.get("/api/redoc", include_in_schema=False)
+        async def custom_redoc_html():
+            """Serve custom ReDoc."""
+            return get_redoc_html(
+                openapi_url=app.openapi_url,
+                title=f"{settings.PROJECT_NAME} - API Documentation",
+                redoc_js_url="https://cdn.jsdelivr.net/npm/redoc@next/bundles/redoc.standalone.js",
+            )
+
     # Add health check endpoints
     @app.get("/health", tags=["Health"], summary="Basic health check")
     async def health_check():
-        """Basic health check endpoint."""
-        return {
-            "status": "healthy",
-            "version": settings.VERSION,
-            "environment": settings.ENVIRONMENT,
-            "timestamp": time.time()
-        }
-    
-    @app.get("/health/detailed", tags=["Health"], summary="Detailed health check")
+        """
+        Liveness probe.
+
+        Intentionally returns nothing beyond liveness. Version and environment
+        were removed: this endpoint is unauthenticated, and advertising the
+        running version tells an unauthenticated caller exactly which CVEs to
+        try. Use the authenticated /status endpoint for build details.
+        """
+        return {"status": "healthy"}
+
+    @app.get(
+        "/health/detailed",
+        tags=["Health"],
+        summary="Detailed health check",
+        dependencies=[Depends(require_api_key)],
+    )
     async def detailed_health_check():
-        """Detailed health check endpoint."""
+        """Detailed health check endpoint (requires an API key)."""
         return await check_health(include_details=True, settings=settings)
-    
+
     @app.get("/ping", tags=["Health"], summary="Simple ping endpoint")
     async def ping():
         """Simple ping endpoint for load balancers."""
         return {"ping": "pong"}
-    
-    @app.get("/status", tags=["Health"], summary="Application status")
+
+    @app.get(
+        "/status",
+        tags=["Health"],
+        summary="Application status",
+        dependencies=[Depends(require_api_key)],
+    )
     async def status():
-        """Application status endpoint."""
+        """Application status endpoint (requires an API key)."""
         return {
             "status": "online",
             "version": settings.VERSION,
@@ -213,9 +296,14 @@ def create_application() -> FastAPI:
             "timestamp": time.time(),
             "uptime": time.time() - app.state.start_time if hasattr(app.state, "start_time") else 0
         }
-    
+
     # Add API configuration endpoints
-    @app.get("/api-config", tags=["Configuration"], summary="API configuration")
+    @app.get(
+        "/api-config",
+        tags=["Configuration"],
+        summary="API configuration",
+        dependencies=[Depends(require_api_key)],
+    )
     async def api_config():
         """API configuration endpoint."""
         return {
@@ -238,7 +326,12 @@ def create_application() -> FastAPI:
             }
         }
     
-    @app.get("/config-sources", tags=["Configuration"], summary="Configuration sources")
+    @app.get(
+        "/config-sources",
+        tags=["Configuration"],
+        summary="Configuration sources",
+        dependencies=[Depends(require_api_key)],
+    )
     async def config_sources():
         """Configuration sources endpoint."""
         return {

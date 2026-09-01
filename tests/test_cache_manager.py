@@ -1,9 +1,19 @@
 import pytest
 import asyncio
+import logging
 import time
+from dataclasses import dataclass
+from datetime import date, datetime, time as dt_time, timedelta, timezone
+from decimal import Decimal
+from enum import Enum
+from uuid import UUID
 from unittest.mock import patch, MagicMock
+
+from pydantic import BaseModel
+
 from app.core.cache_manager import (
     CacheManager,
+    CacheSerializationError,
     generate_cache_key,
     get_cached_or_fetch,
     get_from_cache,
@@ -29,8 +39,14 @@ class TestCacheManager:
 
         assert manager.enabled is True
         assert manager.ttl == 600
-        assert manager.redis_url is None
-        assert manager.redis_client is None
+        assert manager.settings is mock_settings
+
+        # CacheManager no longer owns a Redis connection: Redis access goes
+        # through the shared app.core.redis_manager.RedisManager singleton, so
+        # the per-instance redis_url / redis_client attributes this test used
+        # to assert on no longer exist.
+        assert not hasattr(manager, "redis_url")
+        assert not hasattr(manager, "redis_client")
 
     def test_init_defaults(self):
         """Test CacheManager initialization with defaults."""
@@ -534,3 +550,218 @@ class TestCleanupTask:
             # The function completed successfully
         except Exception as e:
             pytest.fail(f"start_cleanup_task() raised an exception: {e}")
+
+class TestSerializationRoundTrip:
+    """
+    Round-trip tests for the cache serializer.
+
+    _serialize used to fall back to str(value) for anything JSON could not
+    encode. A pydantic model was therefore cached as its repr and handed back
+    to the next reader as a corrupted string -- a cache that returns wrong
+    data is worse than no cache at all. Values now either round-trip or are
+    refused loudly.
+    """
+
+    @pytest.fixture
+    def manager(self):
+        mock_settings = MagicMock()
+        mock_settings.ENABLE_CACHE = True
+        mock_settings.CACHE_TTL = 600
+        mock_settings.REDIS_URL = None
+        return CacheManager(settings=mock_settings)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            {"key": "value", "number": 42},
+            ["a", "b", 3],
+            "simple string",
+            42,
+            3.5,
+            True,
+            None,
+            {"nested": {"list": [1, 2, {"deep": "value"}]}},
+        ],
+        ids=["dict", "list", "str", "int", "float", "bool", "none", "nested"],
+    )
+    def test_json_native_types_round_trip(self, manager, value):
+        assert manager._deserialize(manager._serialize(value)) == value
+
+    def test_datetime_round_trips_as_datetime(self, manager):
+        value = datetime(2024, 3, 17, 12, 30, 45, 123456)
+
+        result = manager._deserialize(manager._serialize(value))
+
+        assert result == value
+        assert isinstance(result, datetime), (
+            f"datetime came back as {type(result).__name__}: {result!r}"
+        )
+
+    def test_datetime_with_timezone_round_trips(self, manager):
+        value = datetime(2024, 3, 17, 12, 30, tzinfo=timezone.utc)
+
+        result = manager._deserialize(manager._serialize(value))
+
+        assert result == value
+
+    def test_date_round_trips(self, manager):
+        value = date(2024, 3, 17)
+
+        result = manager._deserialize(manager._serialize(value))
+
+        assert result == value
+        assert isinstance(result, date)
+
+    def test_time_round_trips(self, manager):
+        value = dt_time(23, 59, 58)
+
+        result = manager._deserialize(manager._serialize(value))
+
+        assert result == value
+        assert isinstance(result, dt_time)
+
+    def test_timedelta_round_trips(self, manager):
+        value = timedelta(days=2, seconds=45)
+
+        assert manager._deserialize(manager._serialize(value)) == value
+
+    def test_decimal_round_trips_without_precision_loss(self, manager):
+        value = Decimal("0.1234567890123456789")
+
+        result = manager._deserialize(manager._serialize(value))
+
+        assert result == value
+        assert isinstance(result, Decimal)
+
+    def test_uuid_round_trips(self, manager):
+        value = UUID("12345678-1234-5678-1234-567812345678")
+
+        result = manager._deserialize(manager._serialize(value))
+
+        assert result == value
+        assert isinstance(result, UUID)
+
+    def test_set_round_trips(self, manager):
+        value = {"a", "b", "c"}
+
+        result = manager._deserialize(manager._serialize(value))
+
+        assert result == value
+        assert isinstance(result, set)
+
+    def test_bytes_round_trip(self, manager):
+        value = b"payload bytes"
+
+        assert manager._deserialize(manager._serialize(value)) == value
+
+    def test_pydantic_model_round_trips_as_its_fields(self, manager):
+        """
+        A model comes back as its field data, not as "id=1 name='x'".
+
+        The class is deliberately not reconstructed: doing so would mean
+        importing a dotted path named inside cache content, which is a
+        code-execution vector if the cache backend is ever tampered with.
+        """
+        class Sample(BaseModel):
+            id: int
+            name: str
+            created: datetime
+
+        value = Sample(id=1, name="widget", created=datetime(2024, 1, 2, 3, 4, 5))
+
+        result = manager._deserialize(manager._serialize(value))
+
+        assert isinstance(result, dict)
+        assert result["id"] == 1
+        assert result["name"] == "widget"
+        assert result["created"] == "2024-01-02T03:04:05"
+        assert "Sample(" not in str(result)
+
+    def test_nested_pydantic_and_datetime_round_trip(self, manager):
+        class Item(BaseModel):
+            name: str
+
+        value = {"items": [Item(name="a"), Item(name="b")], "at": date(2024, 5, 6)}
+
+        result = manager._deserialize(manager._serialize(value))
+
+        assert result["items"] == [{"name": "a"}, {"name": "b"}]
+        assert result["at"] == date(2024, 5, 6)
+
+    def test_enum_round_trips_as_its_value(self, manager):
+        class Colour(Enum):
+            RED = "red"
+
+        assert manager._deserialize(manager._serialize(Colour.RED)) == "red"
+
+    def test_dataclass_round_trips_as_dict(self, manager):
+        @dataclass
+        class Point:
+            x: int
+            y: int
+
+        assert manager._deserialize(manager._serialize(Point(1, 2))) == {"x": 1, "y": 2}
+
+    def test_unserializable_value_is_refused_not_stringified(self, manager):
+        """The old code returned str(value) here and cached garbage."""
+        class Opaque:
+            def __repr__(self):
+                return "<Opaque object at 0xdeadbeef>"
+
+        with pytest.raises(CacheSerializationError) as excinfo:
+            manager._serialize(Opaque())
+
+        assert "Opaque" in str(excinfo.value)
+
+
+class TestSetRefusesUncacheableValues:
+    """The refusal must be visible to the caller and to the logs."""
+
+    @pytest.fixture
+    def manager(self):
+        mock_settings = MagicMock()
+        mock_settings.ENABLE_CACHE = True
+        mock_settings.CACHE_TTL = 600
+        mock_settings.REDIS_URL = None
+        return CacheManager(settings=mock_settings)
+
+    @pytest.mark.asyncio
+    async def test_set_returns_false_and_logs_for_uncacheable_value(self, manager, caplog):
+        class Opaque:
+            pass
+
+        with caplog.at_level(logging.ERROR, logger="app.core.cache_manager"):
+            result = await manager.set("opaque_key", Opaque(), ttl=60)
+
+        assert result is False, "set() silently claimed success for an uncacheable value"
+        assert any("Refusing to cache" in record.getMessage() for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_refused_value_is_not_stored(self, manager):
+        class Opaque:
+            pass
+
+        await manager.set("refused_key", Opaque(), ttl=60)
+
+        assert await manager.get("refused_key", default="MISS") == "MISS"
+
+    @pytest.mark.asyncio
+    async def test_datetime_survives_set_then_get(self, manager):
+        value = datetime(2024, 7, 4, 9, 0, 0)
+
+        assert await manager.set("dt_key", value, ttl=60) is True
+        assert await manager.get("dt_key") == value
+
+    @pytest.mark.asyncio
+    async def test_pydantic_model_survives_set_then_get(self, manager):
+        class Sample(BaseModel):
+            id: int
+            name: str
+
+        assert await manager.set("model_key", Sample(id=7, name="x"), ttl=60) is True
+
+        cached_value = await manager.get("model_key")
+        assert cached_value == {"id": 7, "name": "x"}
+        assert not isinstance(cached_value, str), (
+            "model was cached as a string - this is the corruption bug"
+        )

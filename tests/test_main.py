@@ -1,7 +1,150 @@
+import contextlib
+
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
 from fastapi.testclient import TestClient
 from fastapi import FastAPI
+
+
+#: Endpoints that disclose host metrics, dependency topology, rate-limit
+#: thresholds or the effective configuration. None of them may be readable
+#: without an API key.
+SENSITIVE_ENDPOINTS = ["/health/detailed", "/status", "/api-config", "/config-sources"]
+
+VALID_TEST_KEY = "unit-test-api-key"
+
+
+@contextlib.contextmanager
+def api_key_auth_enforced():
+    """
+    Force API key authentication on, deterministically.
+
+    app.core.auth resolves its settings once at import time, and other test
+    modules mutate ENABLE_API_KEY_AUTH in the process environment, so the
+    effective auth mode depends on collection order. Pin every layer here so
+    the security assertions below cannot pass or fail by accident.
+    """
+    import main
+    from app.core import auth
+
+    settings_stub = MagicMock()
+    settings_stub.ENABLE_API_KEY_AUTH = True
+
+    with patch.object(main, "get_settings", return_value=settings_stub), \
+         patch.object(auth.auth_settings, "ENABLE_API_KEY_AUTH", True), \
+         patch.object(auth, "_api_keys_set", {VALID_TEST_KEY}):
+        yield
+
+
+class TestSensitiveEndpointAuthentication:
+    """
+    Regression tests for unauthenticated information disclosure.
+
+    /health/detailed leaks host CPU, memory and disk plus dependency
+    topology; /status leaks the running version and environment; /api-config
+    leaks rate-limit thresholds and the CORS policy; /config-sources leaks
+    how configuration is loaded. All of them used to be world-readable.
+    """
+
+    @pytest.fixture
+    def app(self):
+        from main import create_application
+        return create_application()
+
+    @pytest.mark.parametrize("path", SENSITIVE_ENDPOINTS)
+    def test_sensitive_endpoint_rejects_missing_api_key(self, app, path):
+        """No API key -> 401, and no payload at all."""
+        with api_key_auth_enforced():
+            response = TestClient(app).get(path)
+
+        assert response.status_code == 401, (
+            f"{path} is readable without an API key: {response.text[:200]}"
+        )
+        body = response.text.lower()
+        for leak in ("cpu", "memory", "disk", "rate_limiting", "cors", "uptime"):
+            assert leak not in body, f"{path} leaked {leak!r} in its 401 body"
+
+    @pytest.mark.parametrize("path", SENSITIVE_ENDPOINTS)
+    def test_sensitive_endpoint_rejects_invalid_api_key(self, app, path):
+        """A wrong API key is rejected, not merely a missing one."""
+        with api_key_auth_enforced():
+            response = TestClient(app).get(path, headers={"X-API-Key": "wrong-key"})
+
+        assert response.status_code == 401
+
+    @patch('main.check_health', new_callable=AsyncMock)
+    def test_sensitive_endpoint_accepts_valid_api_key(self, mock_check_health, app):
+        """A valid API key still gets through - the gate is auth, not a block."""
+        mock_check_health.return_value = {"status": "healthy", "details": {}}
+
+        with api_key_auth_enforced():
+            client = TestClient(app)
+            for path in SENSITIVE_ENDPOINTS:
+                response = client.get(path, headers={"X-API-Key": VALID_TEST_KEY})
+                assert response.status_code == 200, f"{path} -> {response.status_code}"
+
+    def test_liveness_endpoints_stay_public(self, app):
+        """Load balancers must still be able to probe liveness without a key."""
+        with api_key_auth_enforced():
+            client = TestClient(app)
+            assert client.get("/health").status_code == 200
+            assert client.get("/ping").status_code == 200
+
+    def test_public_health_discloses_liveness_only(self, app):
+        """
+        /health must not advertise the running version or the environment.
+
+        Version disclosure on an unauthenticated endpoint tells an attacker
+        exactly which known vulnerabilities to try.
+        """
+        with api_key_auth_enforced():
+            response = TestClient(app).get("/health")
+
+        assert response.json() == {"status": "healthy"}
+
+
+class TestDocsExposure:
+    """The OpenAPI schema and interactive docs are gated by environment."""
+
+    def _app_for(self, environment):
+        import main
+        stub = MagicMock()
+        stub.PROJECT_NAME = "Social Flood"
+        stub.DESCRIPTION = "desc"
+        stub.VERSION = "1.2.0"
+        stub.DEBUG = False
+        stub.ENVIRONMENT = environment
+        stub.CORS_ORIGINS = ["https://app.example.com"]
+        stub.CORS_METHODS = ["GET"]
+        stub.CORS_HEADERS = ["*"]
+        with patch.object(main, "settings", stub):
+            return main.create_application()
+
+    def test_docs_served_outside_production(self):
+        app = self._app_for("development")
+        assert app.openapi_url == "/openapi.json"
+        client = TestClient(app)
+        assert client.get("/openapi.json").status_code == 200
+        assert client.get("/api/docs").status_code == 200
+
+    def test_docs_not_served_in_production(self):
+        """
+        In production the API surface map is not published at all.
+
+        404 rather than 401: a 401 would still confirm the routes exist.
+        """
+        app = self._app_for("production")
+        assert app.openapi_url is None
+        assert app.docs_url is None
+        assert app.redoc_url is None
+
+        # "localhost" so TrustedHostMiddleware (production-only) admits us.
+        client = TestClient(app, base_url="http://localhost")
+        assert client.get("/openapi.json").status_code == 404
+        assert client.get("/docs").status_code == 404
+        assert client.get("/redoc").status_code == 404
+        assert client.get("/api/docs").status_code == 404
+        assert client.get("/api/redoc").status_code == 404
 
 
 class TestMainApplication:
@@ -88,12 +231,27 @@ class TestMainApplication:
             # Verify expose was called on the instrumented app
             mock_instrumented_app.expose.assert_called_once_with(app, endpoint="/metrics", include_in_schema=False)
 
-    @pytest.mark.asyncio
+    @patch('main.stop_rate_limit_cleanup_task')
+    @patch('main.start_rate_limit_cleanup_task')
+    @patch('main.shutdown_http_client_manager', new_callable=AsyncMock)
     @patch('main.setup_nltk', new_callable=AsyncMock)
     @patch('main.settings')
-    async def test_startup_event(self, mock_settings_patch, mock_setup_nltk, mock_settings):
-        """Test startup event functionality."""
-        # Configure the mock settings with the fixture values
+    def test_lifespan_startup_and_shutdown(
+        self,
+        mock_settings_patch,
+        mock_setup_nltk,
+        mock_shutdown_http,
+        mock_start_cleanup,
+        mock_stop_cleanup,
+        mock_settings,
+    ):
+        """
+        The app must use the lifespan context manager, not @app.on_event.
+
+        @app.on_event is deprecated and removed in newer Starlette, so this
+        drives the app through TestClient's lifespan rather than walking
+        app.router.on_startup (which is empty under lifespan).
+        """
         mock_settings_patch.PROJECT_NAME = mock_settings.PROJECT_NAME
         mock_settings_patch.VERSION = mock_settings.VERSION
         mock_settings_patch.ENVIRONMENT = mock_settings.ENVIRONMENT
@@ -101,12 +259,32 @@ class TestMainApplication:
         from main import create_application
         app = create_application()
 
-        # Manually trigger startup event
-        for event_handler in app.router.on_startup:
-            await event_handler()
+        # The deprecated event hooks must be gone.
+        assert app.router.on_startup == []
+        assert app.router.on_shutdown == []
 
-        # Verify NLTK setup was called
-        mock_setup_nltk.assert_called_once()
+        with TestClient(app):
+            # Startup ran
+            mock_setup_nltk.assert_called_once()
+            mock_start_cleanup.assert_called_once()
+            mock_stop_cleanup.assert_not_called()
+
+        # Shutdown ran
+        mock_stop_cleanup.assert_called_once()
+        mock_shutdown_http.assert_awaited_once()
+
+    def test_rate_limit_cleanup_task_is_wired_into_lifespan(self):
+        """
+        The rate limiter's cleanup task must actually be started.
+
+        Its in-memory store grows without bound otherwise; before this was
+        wired in, start_cleanup_task() had zero callers anywhere in the tree.
+        """
+        import main
+        from app.core import rate_limiter
+
+        assert main.start_rate_limit_cleanup_task is rate_limiter.start_cleanup_task
+        assert main.stop_rate_limit_cleanup_task is rate_limiter.stop_cleanup_task
 
     @patch('main.settings')
     def test_health_check_endpoints(self, mock_settings_patch, mock_settings):
@@ -120,24 +298,25 @@ class TestMainApplication:
         app = create_application()
         client = TestClient(app)
 
-        # Test basic health check
+        # Basic health check: liveness only. Version and environment were
+        # deliberately removed - see TestSensitiveEndpointAuthentication.
         response = client.get("/health")
         assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "healthy"
-        assert data["version"] == "1.2.0"
-        assert data["environment"] == "development"
-        assert "timestamp" in data
+        assert response.json() == {"status": "healthy"}
 
         # Test ping endpoint
         response = client.get("/ping")
         assert response.status_code == 200
         assert response.json() == {"ping": "pong"}
 
-        # Test status endpoint
-        response = client.get("/status")
-        assert response.status_code == 200
-        data = response.json()
+        # /status now requires an API key; its payload is asserted with a
+        # valid key below.
+        with api_key_auth_enforced():
+            assert client.get("/status").status_code == 401
+
+            data = client.get(
+                "/status", headers={"X-API-Key": VALID_TEST_KEY}
+            ).json()
         assert data["status"] == "online"
         assert data["version"] == "1.2.0"
         assert data["environment"] == "development"
@@ -159,7 +338,10 @@ class TestMainApplication:
         app = create_application()
         client = TestClient(app)
 
-        response = client.get("/health/detailed")
+        with api_key_auth_enforced():
+            response = client.get(
+                "/health/detailed", headers={"X-API-Key": VALID_TEST_KEY}
+            )
         assert response.status_code == 200
 
         # Verify check_health was called with correct parameters
@@ -187,7 +369,10 @@ class TestMainApplication:
         app = create_application()
         client = TestClient(app)
 
-        response = client.get("/api-config")
+        with api_key_auth_enforced():
+            response = client.get(
+                "/api-config", headers={"X-API-Key": VALID_TEST_KEY}
+            )
         assert response.status_code == 200
         data = response.json()
 
@@ -210,7 +395,10 @@ class TestMainApplication:
         app = create_application()
         client = TestClient(app)
 
-        response = client.get("/config-sources")
+        with api_key_auth_enforced():
+            response = client.get(
+                "/config-sources", headers={"X-API-Key": VALID_TEST_KEY}
+            )
         assert response.status_code == 200
         data = response.json()
 
@@ -242,20 +430,39 @@ class TestMainApplication:
 
     @patch('main.settings')
     def test_router_inclusion(self, mock_settings_patch, mock_settings):
-        """Test that API routers are properly included."""
-        # Configure the mock settings with the fixture values
+        """
+        Test that API routers are properly included.
+
+        Asserted against the generated OpenAPI schema rather than
+        app.routes. Since FastAPI 0.141 an included router is kept as a
+        single wrapped _IncludedRouter entry, so walking app.routes only
+        ever sees the ~13 top-level routes and never the mounted /api/v1
+        paths - the old assertion failed even though the routers were
+        mounted correctly. app.openapi() reflects what is actually served.
+        """
         mock_settings_patch.PROJECT_NAME = mock_settings.PROJECT_NAME
         mock_settings_patch.VERSION = mock_settings.VERSION
         mock_settings_patch.ENVIRONMENT = mock_settings.ENVIRONMENT
+        mock_settings_patch.DESCRIPTION = mock_settings.DESCRIPTION
 
         from main import create_application
         app = create_application()
 
-        # Check that routers are included by verifying routes exist
-        routes = [route.path for route in app.routes]
-        # Look for routes that contain the API paths
-        api_routes = [route for route in routes if route.startswith("/api/v1")]
-        assert len(api_routes) > 0, f"No API routes found. Available routes: {routes}"
+        paths = app.openapi()["paths"]
+        api_routes = [path for path in paths if path.startswith("/api/v1")]
+        assert api_routes, f"No API routes found. Available paths: {sorted(paths)}"
+
+        # Every mounted sub-router must be represented.
+        for prefix in (
+            "/api/v1/google-news",
+            "/api/v1/google-trends",
+            "/api/v1/google-autocomplete",
+            "/api/v1/youtube-transcripts",
+            "/api/v1/google-maps",
+        ):
+            assert any(path.startswith(prefix) for path in paths), (
+                f"Router {prefix} is not mounted"
+            )
 
     @patch('main.settings')
     def test_app_state_initialization(self, mock_settings_patch, mock_settings):
@@ -328,7 +535,10 @@ class TestMainApplication:
         app = create_application()
         client = TestClient(app)
 
-        response = client.get("/api-config")
+        with api_key_auth_enforced():
+            response = client.get(
+                "/api-config", headers={"X-API-Key": VALID_TEST_KEY}
+            )
         assert response.status_code == 200
         data = response.json()
 

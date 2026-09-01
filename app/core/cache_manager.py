@@ -13,7 +13,11 @@ import asyncio
 import logging
 import functools
 import hashlib
-from datetime import datetime, timedelta
+from dataclasses import asdict, is_dataclass
+from datetime import date, datetime, time as dt_time, timedelta
+from decimal import Decimal
+from enum import Enum
+from uuid import UUID
 
 from app.core.config import get_settings, Settings
 from app.core.redis_manager import RedisManager
@@ -46,6 +50,100 @@ async def _get_redis_manager() -> Optional[RedisManager]:
     return _redis_manager
 
 
+class CacheSerializationError(TypeError):
+    """
+    Raised when a value cannot be serialized for caching.
+
+    Caching a value that cannot round-trip is worse than not caching it at
+    all, because the corrupted value is served to every later reader. When
+    this is raised the value is simply not cached and the failure is logged.
+    """
+
+
+# Key used to tag values that JSON cannot represent natively. Deliberately
+# obscure so a genuine payload dict is very unlikely to collide with it.
+_TYPE_TAG = "__sf_cache_type__"
+_VALUE_KEY = "__sf_cache_value__"
+
+
+def _encode_uncacheable(value: Any) -> Any:
+    """
+    ``json.dumps`` ``default`` hook: represent non-JSON types losslessly.
+
+    Args:
+        value: A value ``json`` does not know how to encode
+
+    Returns:
+        Any: A JSON-encodable representation
+
+    Raises:
+        CacheSerializationError: If the type is not supported
+    """
+    # Pydantic models (v2 and v1). Cached as their field data - the class
+    # itself is deliberately NOT reconstructed on read, because importing an
+    # arbitrary dotted path named in cache content would be a code-execution
+    # vector if the cache backend were ever tampered with.
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return model_dump(mode="json")
+        except TypeError:
+            return model_dump()
+    legacy_dict = getattr(value, "dict", None)
+    if callable(legacy_dict) and hasattr(value, "__fields__"):
+        return legacy_dict()
+
+    if isinstance(value, datetime):
+        return {_TYPE_TAG: "datetime", _VALUE_KEY: value.isoformat()}
+    if isinstance(value, date):
+        return {_TYPE_TAG: "date", _VALUE_KEY: value.isoformat()}
+    if isinstance(value, dt_time):
+        return {_TYPE_TAG: "time", _VALUE_KEY: value.isoformat()}
+    if isinstance(value, timedelta):
+        return {_TYPE_TAG: "timedelta", _VALUE_KEY: value.total_seconds()}
+    if isinstance(value, Decimal):
+        return {_TYPE_TAG: "decimal", _VALUE_KEY: str(value)}
+    if isinstance(value, UUID):
+        return {_TYPE_TAG: "uuid", _VALUE_KEY: str(value)}
+    if isinstance(value, (set, frozenset)):
+        return {_TYPE_TAG: "set", _VALUE_KEY: sorted(value, key=repr)}
+    if isinstance(value, bytes):
+        return {_TYPE_TAG: "bytes", _VALUE_KEY: value.decode("utf-8", errors="strict")}
+    if isinstance(value, Enum):
+        return value.value
+    if is_dataclass(value) and not isinstance(value, type):
+        return asdict(value)
+
+    raise CacheSerializationError(
+        f"Value of type {type(value).__name__} cannot be serialized for caching. "
+        "Convert it to a JSON-compatible structure before caching it."
+    )
+
+
+_ENVELOPE_DECODERS: Dict[str, Callable[[Any], Any]] = {
+    "datetime": datetime.fromisoformat,
+    "date": date.fromisoformat,
+    "time": dt_time.fromisoformat,
+    "timedelta": lambda v: timedelta(seconds=v),
+    "decimal": Decimal,
+    "uuid": UUID,
+    "set": set,
+    "bytes": lambda v: v.encode("utf-8"),
+}
+
+
+def _decode_envelope(obj: Dict[str, Any]) -> Any:
+    """``json.loads`` ``object_hook``: rebuild values tagged by the encoder."""
+    if len(obj) == 2 and _TYPE_TAG in obj and _VALUE_KEY in obj:
+        decoder = _ENVELOPE_DECODERS.get(obj[_TYPE_TAG])
+        if decoder is not None:
+            try:
+                return decoder(obj[_VALUE_KEY])
+            except (TypeError, ValueError):
+                logger.warning("Could not decode cached %s value", obj[_TYPE_TAG])
+    return obj
+
+
 class CacheManager:
     """
     Cache manager for storing and retrieving data.
@@ -68,36 +166,53 @@ class CacheManager:
     
     def _serialize(self, value: Any) -> str:
         """
-        Serialize a value to a string.
-        
+        Serialize a value to a JSON string that round-trips.
+
+        Values that JSON cannot represent natively (datetimes, ``Decimal``,
+        ``UUID``, sets, pydantic models, ...) are wrapped in a small typed
+        envelope so that :meth:`_deserialize` can rebuild the original object.
+
+        Anything that still cannot be represented is *refused* rather than
+        silently degraded. The previous implementation fell back to
+        ``str(value)``, which meant a pydantic model or a datetime was cached
+        as its ``repr`` and handed back to the next caller as a corrupted
+        string.
+
         Args:
             value: The value to serialize
-            
+
         Returns:
             str: Serialized value
+
+        Raises:
+            CacheSerializationError: If the value cannot be represented
         """
         try:
-            return json.dumps(value)
-        except (TypeError, ValueError):
-            # If the value can't be JSON serialized, use string representation
-            return str(value)
-    
+            return json.dumps(value, default=_encode_uncacheable)
+        except CacheSerializationError:
+            raise
+        except (TypeError, ValueError) as exc:
+            raise CacheSerializationError(
+                f"Value of type {type(value).__name__} cannot be cached: {exc}"
+            ) from exc
+
     def _deserialize(self, value: str) -> Any:
         """
-        Deserialize a string to a value.
-        
+        Deserialize a string produced by :meth:`_serialize`.
+
         Args:
             value: The string to deserialize
-            
+
         Returns:
             Any: Deserialized value
         """
         try:
-            return json.loads(value)
+            return json.loads(value, object_hook=_decode_envelope)
         except (json.JSONDecodeError, TypeError):
-            # If the value can't be JSON deserialized, return as is
+            # Not JSON at all (e.g. a raw string written by another writer):
+            # return it untouched rather than raising.
             return value
-    
+
     def _generate_key(self, key: str, namespace: Optional[str] = None) -> str:
         """
         Generate a cache key with optional namespace.
@@ -187,11 +302,22 @@ class CacheManager:
         ttl = ttl if ttl is not None else self.ttl
         full_key = self._generate_key(key, namespace)
 
+        # Serialize up front so that a value which cannot round-trip is
+        # refused loudly and consistently, whichever backend is in use.
+        # Storing something Redis would mangle only when Redis happens to be
+        # down is a correctness trap, not a fallback.
+        try:
+            serialized = self._serialize(value)
+        except CacheSerializationError as exc:
+            logger.error(
+                "Refusing to cache key %s: %s", full_key, exc
+            )
+            return False
+
         # Try Redis first if available (async)
         redis_manager = await _get_redis_manager()
         if redis_manager and redis_manager.is_available:
             try:
-                serialized = self._serialize(value)
                 success = await redis_manager.set(full_key, serialized, ttl)
                 if success:
                     logger.debug(f"Cache set (Redis): {full_key}, TTL: {ttl}s")
@@ -199,10 +325,14 @@ class CacheManager:
             except Exception as e:
                 logger.error(f"Redis error in set: {str(e)}")
 
-        # Fall back to in-memory cache with thread-safe access
+        # Fall back to in-memory cache with thread-safe access.
+        # Store the round-tripped value, not the original object, so that a
+        # reader sees exactly the same thing whether the hit came from Redis
+        # or from memory (and so mutating the caller's object cannot mutate
+        # the cached entry).
         async with _cache_lock:
             expiry = time.time() + ttl
-            _cache_store[full_key] = (value, expiry)
+            _cache_store[full_key] = (self._deserialize(serialized), expiry)
             logger.debug(f"Cache set (memory): {full_key}, TTL: {ttl}s")
         return True
     
