@@ -3,18 +3,250 @@ Native Google Maps Scraper using Playwright.
 
 This module provides direct Google Maps scraping without requiring
 the gosom Docker sidecar. It uses Playwright for browser automation.
+
+Three defects this module previously shipped, and how they are addressed here:
+
+1. **Jobs were global.** ``JobStore`` was a process-local dict with no owner
+   parameter, so any valid API key could read, list and delete every other
+   caller's jobs, and every job vanished on restart or was invisible to a
+   sibling ``--workers`` process. Persistence now goes through
+   :mod:`app.services.record_store`, which makes ``owner`` part of the key.
+
+2. **Unbounded browser fan-out.** Nothing capped how many Chromium instances
+   could be alive at once; an 11x11 grid search meant 121 of them at ~100 MB
+   resident each. A permit from :func:`_browser_semaphore` is now held for the
+   whole life of a browser, and :func:`cap_fanout` gives callers a hard
+   fan-out ceiling.
+
+3. **Failures became successful empty results.** Every selector was wrapped in
+   ``except Exception: pass``, so a Google DOM rotation produced
+   ``{"success": true, "places": []}`` -- indistinguishable from a genuine
+   no-results search. Optional fields still degrade gracefully, but they are
+   now *recorded* (see :meth:`GoogleMapsScraper._optional`), required fields
+   raise :class:`PlaceExtractionError`, and a search that finds candidate
+   places but extracts none of them raises :class:`SelectorsStaleError`.
 """
 import asyncio
+import contextlib
 import logging
+import os
 import re
 import json
 import uuid
-from typing import Optional, List, Dict, Any
+import weakref
+from typing import Optional, List, Dict, Any, Sequence, TypeVar
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 
+from app.services.record_store import (
+    RecordStore,
+    get_record_store,
+    # Re-exported so callers can derive a job owner without also having to know
+    # about the record-store module: `from ...google_maps_scraper import
+    # owner_id_for_api_key`.
+    owner_id_for_api_key,  # noqa: F401
+)
+
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+#: Namespace for scrape jobs in the owner-scoped record store.
+JOB_NAMESPACE = "maps:jobs"
+
+# -- Concurrency limits -------------------------------------------------------
+#
+# Chromium is roughly 100 MB resident per instance. These are deliberately
+# small: the failure mode of too low a cap is a slow request, the failure mode
+# of too high a cap is the container being OOM-killed mid-request.
+#
+# Configured via environment rather than ``Settings`` so that this module does
+# not have to be edited in lockstep with ``app/core/config.py``. If/when a
+# ``Settings`` field is added, point these defaults at it.
+
+DEFAULT_MAX_CONCURRENT_BROWSERS = 4
+
+#: Hard ceiling on grid/bulk fan-out, regardless of what a caller requests.
+#: An 11x11 grid is 121 points; that is allowed as a *request*, but the number
+#: of points actually visited is clamped to this.
+DEFAULT_MAX_FANOUT = 25
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read a positive int from the environment, falling back to ``default``.
+
+    A malformed or non-positive value is a configuration error, not a licence
+    to run unbounded, so it logs and uses the safe default.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using %d", name, raw, default)
+        return default
+    if value < 1:
+        logger.warning("%s=%d must be >= 1; using %d", name, value, default)
+        return default
+    return value
+
+
+_max_concurrent_browsers = _env_int(
+    "GOOGLE_MAPS_MAX_CONCURRENT_BROWSERS", DEFAULT_MAX_CONCURRENT_BROWSERS
+)
+_max_fanout = _env_int("GOOGLE_MAPS_MAX_FANOUT", DEFAULT_MAX_FANOUT)
+
+# Semaphores are per event loop: a single module-level Semaphore binds to the
+# first loop that awaits it, and reusing it from another loop (pytest creates
+# one per test, uvicorn one per worker) raises or silently fails to bound.
+_browser_semaphores: "weakref.WeakKeyDictionary[Any, asyncio.Semaphore]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def get_max_concurrent_browsers() -> int:
+    """Current cap on simultaneously-live Chromium instances in this process."""
+    return _max_concurrent_browsers
+
+
+def get_max_fanout() -> int:
+    """Current hard ceiling on grid/bulk fan-out."""
+    return _max_fanout
+
+
+def configure_limits(
+    *,
+    max_concurrent_browsers: Optional[int] = None,
+    max_fanout: Optional[int] = None,
+) -> None:
+    """Override the concurrency limits (startup configuration and tests).
+
+    Changing ``max_concurrent_browsers`` discards the existing semaphores, so
+    the new cap applies to browsers acquired from now on.
+    """
+    global _max_concurrent_browsers, _max_fanout
+    if max_concurrent_browsers is not None:
+        if max_concurrent_browsers < 1:
+            raise ValueError("max_concurrent_browsers must be >= 1")
+        _max_concurrent_browsers = max_concurrent_browsers
+        _browser_semaphores.clear()
+    if max_fanout is not None:
+        if max_fanout < 1:
+            raise ValueError("max_fanout must be >= 1")
+        _max_fanout = max_fanout
+
+
+def _browser_semaphore() -> asyncio.Semaphore:
+    """Return this event loop's browser-acquisition semaphore."""
+    loop = asyncio.get_running_loop()
+    sem = _browser_semaphores.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(_max_concurrent_browsers)
+        _browser_semaphores[loop] = sem
+    return sem
+
+
+def cap_fanout(items: Sequence[T], *, kind: str = "fan-out") -> List[T]:
+    """Clamp a fan-out list (grid points, bulk queries) to the hard ceiling.
+
+    Callers that build a work list -- ``grid_search``, ``bulk_search`` -- must
+    pass it through here before iterating. Truncating loudly is preferable to
+    either silently accepting 121 browser launches or rejecting the request
+    outright, but the log line makes the truncation auditable.
+    """
+    limit = _max_fanout
+    if len(items) <= limit:
+        return list(items)
+    logger.warning(
+        "%s requested %d points; truncated to the %d-point limit "
+        "(raise GOOGLE_MAPS_MAX_FANOUT to allow more)",
+        kind,
+        len(items),
+        limit,
+    )
+    return list(items[:limit])
+
+
+# -- Failure signals ----------------------------------------------------------
+
+
+class ScraperError(RuntimeError):
+    """Base class for scraper failures that must not look like empty success."""
+
+    status_code = 502
+
+
+class PlaceExtractionError(ScraperError):
+    """A single place could not be extracted (required fields missing).
+
+    Attributes:
+        missing: Required field names that no selector matched.
+    """
+
+    status_code = 502
+
+    def __init__(self, message: str, *, missing: Optional[Sequence[str]] = None) -> None:
+        super().__init__(message)
+        self.missing = list(missing or [])
+
+
+class SelectorsStaleError(ScraperError):
+    """Every candidate place failed to extract -- the page shape has changed.
+
+    This is the error that exists so a total scraping outage cannot be
+    reported as ``{"success": true, "places": []}``. Routers should map it to
+    503: the upstream is present but this service can no longer read it.
+
+    Attributes:
+        attempted: Number of candidate places the scraper tried to extract.
+        extracted: Number it succeeded on (zero, or this is not raised).
+        missing: Union of required fields that failed to match.
+    """
+
+    status_code = 503
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        attempted: int = 0,
+        extracted: int = 0,
+        missing: Optional[Sequence[str]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.attempted = attempted
+        self.extracted = extracted
+        self.missing = list(missing or [])
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Structured payload a router can return alongside a 503."""
+        return {
+            "error": True,
+            "selectors_stale": True,
+            "message": str(self),
+            "attempted": self.attempted,
+            "extracted": self.extracted,
+            "missing_fields": self.missing,
+        }
+
+
+#: A place is worthless without these; if none match, the DOM has changed.
+REQUIRED_PLACE_FIELDS = ("title",)
+
+#: At least one of these must match for a place to be considered fully
+#: extracted. A record with a title scraped out of the URL but no address, no
+#: phone, no website and no rating means the details panel did not parse.
+CORE_PLACE_FIELDS = (
+    "address",
+    "phone",
+    "website",
+    "category",
+    "review_rating",
+    "review_count",
+    "open_hours",
+)
 
 
 class JobStatus(str, Enum):
@@ -27,15 +259,32 @@ class JobStatus(str, Enum):
 
 @dataclass
 class ScrapeJob:
-    """Represents a scraping job."""
+    """Represents a scraping job.
+
+    ``owner`` is the field that makes cross-tenant access impossible rather
+    than merely unlikely: it becomes part of the storage key, so one caller
+    cannot address another caller's job at all. It defaults to empty only so
+    that the dataclass stays keyword-constructible; :class:`JobStore` refuses
+    to persist a job without one rather than quietly filing it under a shared
+    partition.
+    """
     id: str
     name: str
     query: str
+    owner: str = ""
     status: JobStatus = JobStatus.PENDING
     created_at: datetime = field(default_factory=datetime.now)
     completed_at: Optional[datetime] = None
     results: List[Dict[str, Any]] = field(default_factory=list)
     error: Optional[str] = None
+    #: True when the job failed because Google's markup changed rather than
+    #: because of a transient error; routers should surface this as 503.
+    selectors_stale: bool = False
+    #: True when the job completed with zero results that could NOT be
+    #: confirmed as a genuine zero (the results feed rendered but nothing
+    #: inside it matched). The job is not failed, but callers must not treat
+    #: the empty list as authoritative.
+    empty_unverified: bool = False
     progress: int = 0
     total: int = 0
 
@@ -62,6 +311,10 @@ class ScrapeJob:
             "progress": self.progress,
             "total": self.total,
             "error": self.error,
+            # Lets a router turn a markup-rotation failure into a 503 rather
+            # than reporting a job that merely "found nothing".
+            "selectors_stale": self.selectors_stale,
+            "empty_unverified": self.empty_unverified,
             "Data": {
                 "keywords": [self.query],
                 "lang": self.language,
@@ -69,48 +322,112 @@ class ScrapeJob:
             }
         }
 
+    def to_record(self) -> Dict[str, Any]:
+        """Full, lossless payload for the record store.
+
+        Distinct from :meth:`to_dict`, which is the lossy gosom-compatible API
+        shape. Persisting ``to_dict`` would drop ``results``, ``owner`` and the
+        job parameters, so a job reloaded after a restart would come back
+        empty -- exactly the silent data loss this change exists to stop.
+        """
+        payload = asdict(self)
+        payload["status"] = self.status.value
+        payload["created_at"] = self.created_at.isoformat()
+        payload["completed_at"] = (
+            self.completed_at.isoformat() if self.completed_at else None
+        )
+        return payload
+
+    @classmethod
+    def from_record(cls, payload: Dict[str, Any]) -> "ScrapeJob":
+        """Rebuild a job from :meth:`to_record` output."""
+        data = dict(payload)
+        data["status"] = JobStatus(data.get("status", JobStatus.PENDING.value))
+        created_at = data.get("created_at")
+        data["created_at"] = (
+            datetime.fromisoformat(created_at) if created_at else datetime.now()
+        )
+        completed_at = data.get("completed_at")
+        data["completed_at"] = (
+            datetime.fromisoformat(completed_at) if completed_at else None
+        )
+        known = {f for f in cls.__dataclass_fields__}
+        return cls(**{k: v for k, v in data.items() if k in known})
+
 
 class JobStore:
-    """In-memory job storage with thread-safe access."""
+    """Owner-scoped, durable job storage.
 
-    def __init__(self):
-        self._jobs: Dict[str, ScrapeJob] = {}
-        self._lock = asyncio.Lock()
+    Every method takes the owner explicitly (or reads it off the job), and
+    there is deliberately no ``list_all``: the previous implementation had one,
+    and it was the vulnerability -- ``list_jobs``/``delete_job`` authenticated
+    the caller and then operated on the whole keyspace.
+
+    Durability and cross-worker visibility come from
+    :class:`~app.services.record_store.RecordStore`, which uses Redis when it
+    is configured and an explicitly non-durable dict when it is not. The
+    previous in-process dict and its ``asyncio.Lock`` are gone; the record
+    store keeps the equivalent locking for its own memory backend.
+    """
+
+    def __init__(self, store: Optional[RecordStore] = None) -> None:
+        self._store = store if store is not None else get_record_store(JOB_NAMESPACE)
+
+    @staticmethod
+    def _require_owner(job: ScrapeJob) -> str:
+        if not job.owner:
+            raise ValueError(
+                "ScrapeJob.owner is required; derive it with "
+                "owner_id_for_api_key(api_key) before creating a job"
+            )
+        return job.owner
+
+    async def is_durable(self) -> bool:
+        """True when jobs survive a restart and are visible to sibling workers."""
+        return await self._store.is_durable()
 
     async def create(self, job: ScrapeJob) -> ScrapeJob:
-        """Create a new job."""
-        async with self._lock:
-            self._jobs[job.id] = job
-            return job
+        """Create a job. The owner is taken from ``job.owner`` and required."""
+        owner = self._require_owner(job)
+        await self._store.put(owner, job.id, job.to_record())
+        return job
 
-    async def get(self, job_id: str) -> Optional[ScrapeJob]:
-        """Get a job by ID."""
-        async with self._lock:
-            return self._jobs.get(job_id)
+    async def get(self, owner: str, job_id: str) -> Optional[ScrapeJob]:
+        """Return the job only if ``owner`` owns it, else None.
+
+        A job belonging to someone else is indistinguishable from one that does
+        not exist, so a caller cannot probe for other tenants' job ids.
+        """
+        record = await self._store.get(owner, job_id)
+        if record is None:
+            return None
+        return ScrapeJob.from_record(record.data)
 
     async def update(self, job: ScrapeJob) -> ScrapeJob:
-        """Update a job."""
-        async with self._lock:
-            self._jobs[job.id] = job
-            return job
+        """Persist a mutated job under its own owner."""
+        owner = self._require_owner(job)
+        await self._store.put(owner, job.id, job.to_record())
+        return job
 
-    async def delete(self, job_id: str) -> bool:
-        """Delete a job."""
-        async with self._lock:
-            if job_id in self._jobs:
-                del self._jobs[job_id]
-                return True
-            return False
+    async def delete(self, owner: str, job_id: str) -> bool:
+        """Delete one of ``owner``'s jobs. False if they do not have it."""
+        return await self._store.delete(owner, job_id)
 
-    async def list_all(self, status: Optional[str] = None, limit: int = 50, offset: int = 0) -> List[ScrapeJob]:
-        """List all jobs with optional filtering."""
-        async with self._lock:
-            jobs = list(self._jobs.values())
-            if status:
-                jobs = [j for j in jobs if j.status.value == status]
-            # Sort by created_at descending
-            jobs.sort(key=lambda x: x.created_at, reverse=True)
-            return jobs[offset:offset + limit]
+    async def list_for_owner(
+        self,
+        owner: str,
+        status: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[ScrapeJob]:
+        """List ``owner``'s jobs, newest first, optionally filtered by status."""
+        predicate = None
+        if status:
+            predicate = lambda record: record.data.get("status") == status  # noqa: E731
+        records = await self._store.list_for_owner(
+            owner, limit=limit, offset=offset, predicate=predicate
+        )
+        return [ScrapeJob.from_record(r.data) for r in records]
 
 
 class GoogleMapsScraper:
@@ -141,14 +458,74 @@ class GoogleMapsScraper:
         self.headless = headless
         self._browser = None
         self._playwright = None
+        self._semaphore: Optional[asyncio.Semaphore] = None
+        self._init_lock = asyncio.Lock()
+        # Per-search extraction bookkeeping; see _assert_selectors_fresh.
+        self._candidates = 0
+        self._unverified_empty = False
+        self._attempted = 0
+        self._extracted = 0
+        self._partial = 0
+        self._required_misses: List[str] = []
+
+    @contextlib.contextmanager
+    def _optional(self, misses: List[str], field_name: str):
+        """Run an optional-field extraction, recording rather than hiding misses.
+
+        This replaces 23 bare ``except Exception: pass`` blocks. The behaviour
+        for a genuinely absent optional field is unchanged -- extraction
+        continues -- but the miss is appended to ``misses`` and logged, so that
+        "this restaurant has no menu link" and "the menu selector no longer
+        matches anything on any page" stop looking identical.
+        """
+        try:
+            yield
+        except Exception as exc:
+            misses.append(field_name)
+            logger.debug("Optional field %r not extracted: %s", field_name, exc)
 
     async def _init_browser(self):
-        """Initialize Playwright browser."""
+        """Initialize Playwright browser, bounded by the global cap.
+
+        The semaphore is held for the whole life of the browser, not just for
+        the launch call: what has to be bounded is the number of Chromium
+        processes *resident* at once (~100 MB each), not the launch rate. It is
+        released in :meth:`close`, which every acquisition path already calls
+        from a ``finally``.
+        """
         if self._browser is not None:
             return
 
         from playwright.async_api import async_playwright
 
+        # The check-then-acquire below is not atomic across awaits, so two
+        # coroutines sharing one scraper could each take a permit and only one
+        # would ever be released. The instance lock makes initialisation
+        # single-entry.
+        async with self._init_lock:
+            if self._browser is not None or self._semaphore is not None:
+                return
+
+            semaphore = _browser_semaphore()
+            await semaphore.acquire()
+            self._semaphore = semaphore
+            try:
+                await self._launch(async_playwright)
+            except BaseException:
+                # Never leak a permit on a failed launch, or the cap ratchets
+                # down to zero and every later request deadlocks.
+                self._semaphore = None
+                semaphore.release()
+                raise
+
+    def _release_semaphore(self) -> None:
+        """Give back the browser permit, at most once."""
+        semaphore, self._semaphore = self._semaphore, None
+        if semaphore is not None:
+            semaphore.release()
+
+    async def _launch(self, async_playwright):
+        """Start Playwright and launch Chromium with the configured options."""
         self._playwright = await async_playwright().start()
 
         # Browser launch options
@@ -184,14 +561,22 @@ class GoogleMapsScraper:
         logger.info("Browser initialized successfully")
 
     async def close(self):
-        """Close the browser and cleanup."""
-        if self._browser:
-            await self._browser.close()
-            self._browser = None
-        if self._playwright:
-            await self._playwright.stop()
-            self._playwright = None
-        logger.info("Browser closed")
+        """Close the browser and release its concurrency permit.
+
+        The permit is released in a ``finally`` so that a browser that fails to
+        shut down cleanly still frees its slot; otherwise one hung Chromium
+        would permanently shrink the pool.
+        """
+        try:
+            if self._browser:
+                await self._browser.close()
+                self._browser = None
+            if self._playwright:
+                await self._playwright.stop()
+                self._playwright = None
+            logger.info("Browser closed")
+        finally:
+            self._release_semaphore()
 
     async def _create_page(self, language: str = "en"):
         """Create a new browser page with appropriate settings."""
@@ -237,6 +622,16 @@ class GoogleMapsScraper:
         """
         page, context = await self._create_page(language)
         results = []
+        # Reset per-search extraction bookkeeping. ``attempted`` counts places
+        # we found a card/link for and tried to open; ``extracted`` counts the
+        # ones that yielded a usable record. attempted > 0 with extracted == 0
+        # is the fingerprint of a DOM rotation, not of an empty area.
+        self._candidates = 0
+        self._unverified_empty = False
+        self._attempted = 0
+        self._extracted = 0
+        self._partial = 0
+        self._required_misses: List[str] = []
 
         try:
             # Build search URL
@@ -323,12 +718,25 @@ class GoogleMapsScraper:
                     results = await self._extract_from_place_links(page, place_links, max_results)
                 else:
                     # Single place result - extract directly
-                    place_data = await self._extract_place_details(page)
+                    self._candidates += 1
+                    self._attempted += 1
+                    try:
+                        place_data = await self._extract_place_details(page)
+                    except PlaceExtractionError as exc:
+                        self._required_misses.extend(exc.missing)
+                        place_data = None
                     if place_data:
+                        self._extracted += 1
+                        self._partial += bool(place_data.get("partial"))
                         results = [place_data]
 
+            self._assert_selectors_fresh(query, results_loaded)
             logger.info(f"Found {len(results)} places for query: {query}")
 
+        except ScraperError:
+            # Already a precise, non-empty-looking failure. Do not downgrade it
+            # into a logged-and-swallowed empty result.
+            raise
         except Exception as e:
             logger.error(f"Search error: {e}", exc_info=True)
             raise
@@ -337,11 +745,66 @@ class GoogleMapsScraper:
 
         return results
 
+    def _assert_selectors_fresh(self, query: str, results_loaded: bool) -> None:
+        """Raise if this search's emptiness is a parser failure, not a real zero.
+
+        Two distinguishable situations produce zero places:
+
+        * The area genuinely has no matching businesses. Google renders a
+          results container and it is empty, so ``attempted`` is 0 and
+          ``results_loaded`` is True. That is a legitimate ``[]``.
+        * Google changed its markup. Either no results container matched at all
+          (``results_loaded`` False), or cards were found and every single one
+          failed to yield a record (``attempted > 0, extracted == 0``).
+
+        Before this check, both returned ``{"success": true, "places": []}``.
+        """
+        if not results_loaded and self._extracted == 0:
+            raise SelectorsStaleError(
+                f"No results container matched for {query!r}: none of the known "
+                f"result selectors were present, so an empty result cannot be "
+                f"distinguished from a markup change or a block page",
+                attempted=self._attempted,
+                extracted=0,
+                missing=["div[role='feed']", "a[href*='/maps/place/']"],
+            )
+
+        # ``candidates`` rather than ``attempted``: a card that was visible but
+        # never reached extraction -- because its link selector matched
+        # nothing, or clicking it threw -- is still evidence that results exist
+        # and we cannot read them. Keying off ``attempted`` alone would let a
+        # link-selector rotation return a successful empty list.
+        if self._candidates > 0 and self._extracted == 0:
+            raise SelectorsStaleError(
+                f"Found {self._candidates} candidate place(s) for {query!r} but "
+                f"extracted none of them ({self._attempted} reached the details "
+                f"panel); Google Maps markup has likely changed",
+                attempted=self._attempted,
+                extracted=self._extracted,
+                missing=sorted(set(self._required_misses)) or list(REQUIRED_PLACE_FIELDS),
+            )
+
+        # Every place came back title-only. A title is recoverable from the URL
+        # without touching the details panel, so this is a parsed-nothing run
+        # dressed up as a successful one.
+        if self._extracted > 0 and self._partial == self._extracted:
+            raise SelectorsStaleError(
+                f"All {self._extracted} place(s) for {query!r} were extracted "
+                f"without a single core field ({', '.join(CORE_PLACE_FIELDS)}); "
+                f"the place details panel selectors are stale",
+                attempted=self._attempted,
+                extracted=self._extracted,
+                missing=list(CORE_PLACE_FIELDS),
+            )
+
     async def _extract_from_place_links(self, page, place_links, max_results: int) -> List[Dict[str, Any]]:
         """Extract places from direct place links on the page."""
         results = []
         seen_names = set()
         link_count = await place_links.count()
+        # Every link is a candidate; extracting none of them is a stale-selector
+        # signal, not an empty result. See _assert_selectors_fresh.
+        self._candidates = max(self._candidates, min(link_count, max_results))
 
         for i in range(min(link_count, max_results)):
             try:
@@ -357,8 +820,19 @@ class GoogleMapsScraper:
                 await link.click()
                 await asyncio.sleep(1.5)
 
-                place_data = await self._extract_place_details(page)
+                self._attempted += 1
+                try:
+                    place_data = await self._extract_place_details(page)
+                except PlaceExtractionError as exc:
+                    # Recorded, not swallowed: search() turns an all-fail run
+                    # into SelectorsStaleError rather than an empty success.
+                    self._required_misses.extend(exc.missing)
+                    logger.warning("Place link %d failed to extract: %s", i, exc)
+                    place_data = None
+
                 if place_data:
+                    self._extracted += 1
+                    self._partial += bool(place_data.get("partial"))
                     results.append(place_data)
                     logger.debug(f"Extracted: {place_data.get('title', 'Unknown')}")
 
@@ -367,13 +841,19 @@ class GoogleMapsScraper:
                 await asyncio.sleep(1)
 
             except Exception as e:
-                logger.debug(f"Error extracting link {i}: {e}")
+                logger.warning(f"Error extracting link {i}: {e}")
                 continue
 
         return results
 
     async def _extract_search_results(self, page, max_results: int) -> List[Dict[str, Any]]:
-        """Extract places from search results list."""
+        """Extract places from search results list.
+
+        Raises:
+            SelectorsStaleError: The feed rendered and contains place links,
+                but the card selector matched none of them. Returning ``[]``
+                here would report a card-markup change as an empty area.
+        """
         results = []
         seen_names = set()
         scroll_count = 0
@@ -383,6 +863,42 @@ class GoogleMapsScraper:
             # Find all place cards in the feed
             place_cards = page.locator("div[role='feed'] > div > div[jsaction]")
             card_count = await place_cards.count()
+
+            if card_count == 0 and not results:
+                # The feed exists but our card selector sees nothing in it.
+                # Place links are how a result manifests regardless of the
+                # surrounding card markup, so they discriminate the two cases:
+                # links present means our selector went stale; no links means
+                # the area really is empty.
+                stray_links = await page.locator("a[href*='/maps/place/']").count()
+                if stray_links > 0:
+                    raise SelectorsStaleError(
+                        f"The results feed contains {stray_links} place link(s) "
+                        f"but the card selector matched none of them; the "
+                        f"result-card markup has changed",
+                        attempted=0,
+                        extracted=0,
+                        missing=["div[role='feed'] > div > div[jsaction]"],
+                    )
+
+                # Neither cards nor place links matched inside a feed that did
+                # render. This is genuinely ambiguous -- an empty area looks
+                # exactly like a wholesale markup rotation -- so raising would
+                # turn every legitimately empty search into a 503. Instead the
+                # emptiness is labelled as unverified and carried out to the
+                # caller, so it is never presented as a *confirmed* zero.
+                self._unverified_empty = True
+                logger.error(
+                    "Results feed rendered but neither the card selector nor "
+                    "any place link matched; returning an EMPTY result that "
+                    "could not be verified as a genuine zero"
+                )
+                break
+
+            # Candidates are cards we can see. If we can see candidates and
+            # extract nothing from any of them, search() treats that as stale
+            # rather than as an empty result -- see _assert_selectors_fresh.
+            self._candidates = max(self._candidates, card_count)
 
             for i in range(card_count):
                 if len(results) >= max_results:
@@ -411,8 +927,19 @@ class GoogleMapsScraper:
                     await asyncio.sleep(1.5)  # Wait for details panel
 
                     # Extract detailed info
-                    place_data = await self._extract_place_details(page)
+                    self._attempted += 1
+                    try:
+                        place_data = await self._extract_place_details(page)
+                    except PlaceExtractionError as exc:
+                        # Recorded, not swallowed: search() turns an all-fail
+                        # run into SelectorsStaleError, not an empty success.
+                        self._required_misses.extend(exc.missing)
+                        logger.warning("Card %d failed to extract: %s", i, exc)
+                        place_data = None
+
                     if place_data:
+                        self._extracted += 1
+                        self._partial += bool(place_data.get("partial"))
                         results.append(place_data)
                         logger.debug(f"Extracted: {place_data.get('title', 'Unknown')}")
 
@@ -421,7 +948,7 @@ class GoogleMapsScraper:
                     await asyncio.sleep(1)
 
                 except Exception as e:
-                    logger.debug(f"Error extracting card {i}: {e}")
+                    logger.warning(f"Error extracting card {i}: {e}")
                     continue
 
             # Scroll to load more results
@@ -430,26 +957,43 @@ class GoogleMapsScraper:
                 feed = page.locator("div[role='feed']")
                 await feed.evaluate("el => el.scrollTop = el.scrollHeight")
                 await asyncio.sleep(1.5)
-            except Exception:
+            except Exception as exc:
+                # Justified broad catch: a scroll failure means "no more
+                # results to load", which is a legitimate stop condition. It is
+                # logged rather than passed, and it cannot manufacture a
+                # successful empty result -- search() still checks whether the
+                # places already attempted actually extracted.
+                logger.info("Stopped scrolling the results feed: %s", exc)
                 break
 
         return results
 
     async def _extract_place_details(self, page) -> Optional[Dict[str, Any]]:
-        """Extract detailed information from a place page."""
+        """Extract detailed information from a place page.
+
+        Returns:
+            The place dict. It always carries ``partial``, ``selectors_stale``
+            and ``missing_fields`` keys so a caller can tell a thin-but-real
+            record from a parse failure.
+
+        Raises:
+            PlaceExtractionError: No required field (see
+                :data:`REQUIRED_PLACE_FIELDS`) could be extracted. Previously
+                this returned ``None`` and the caller dropped it silently,
+                which is how a total parser failure became an empty success.
+        """
+        misses: List[str] = []
         try:
             # Wait longer for content to fully load
             await asyncio.sleep(2)
 
             # Wait for the main details panel
-            try:
+            with self._optional(misses, "details_panel"):
                 await page.wait_for_selector("div[role='main']", timeout=5000)
-            except Exception:
-                pass
 
             # Scroll down the details panel to load dynamic content
             # (popular times, reviews, related places are loaded on scroll)
-            try:
+            with self._optional(misses, "lazy_load_scroll"):
                 main_panel = page.locator("div[role='main']").first
                 if await main_panel.count() > 0:
                     # Scroll down in steps to trigger lazy loading
@@ -460,8 +1004,6 @@ class GoogleMapsScraper:
                     # Scroll back to top
                     await main_panel.evaluate("el => el.scrollTop = 0")
                     await asyncio.sleep(0.5)
-            except Exception:
-                pass
 
             # Initialize place data with all available fields
             place = {
@@ -521,7 +1063,7 @@ class GoogleMapsScraper:
 
             # Also try to get from the page for a cleaner name
             # Look for the h1 in the details panel (not the search header)
-            try:
+            with self._optional(misses, "title_h1"):
                 # Wait for the place name to appear in the panel
                 await page.wait_for_selector("h1.DUwDvf", timeout=3000)
                 title_el = page.locator("h1.DUwDvf").first
@@ -529,19 +1071,15 @@ class GoogleMapsScraper:
                     page_title = await title_el.text_content()
                     if page_title and page_title.lower() != "results":
                         place["title"] = page_title.strip()
-            except Exception:
-                pass
 
             # Fallback: try generic h1 in main content area
             if not place["title"] or place["title"].lower() == "results":
-                try:
+                with self._optional(misses, "title_h1_fallback"):
                     title_el = page.locator("div[role='main'] h1").first
                     if await title_el.count() > 0:
                         page_title = await title_el.text_content()
                         if page_title and page_title.lower() != "results":
                             place["title"] = page_title.strip()
-                except Exception:
-                    pass
 
             # Extract rating and review count
             rating_el = page.locator("div.F7nice span[aria-hidden='true']").first
@@ -597,7 +1135,7 @@ class GoogleMapsScraper:
                     place["plus_code"] = pc_text.replace("Plus code: ", "")
 
             # Hours - try to click and expand for full schedule
-            try:
+            with self._optional(misses, "hours"):
                 hours_btn = page.locator("button[data-item-id*='oh']").first
                 if await hours_btn.count() > 0:
                     # Check if currently open or closed
@@ -614,7 +1152,7 @@ class GoogleMapsScraper:
                         place["open_hours"] = self._parse_hours_label(hours_label)
 
                     # Try to click to expand full hours table
-                    try:
+                    with self._optional(misses, "hours_expand"):
                         await hours_btn.click()
                         await asyncio.sleep(0.5)
 
@@ -628,13 +1166,9 @@ class GoogleMapsScraper:
                         # Close the expanded view by pressing Escape
                         await page.keyboard.press("Escape")
                         await asyncio.sleep(0.3)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
 
             # Extract photos from the carousel
-            try:
+            with self._optional(misses, "photos"):
                 photo_elements = page.locator("button[jsaction*='heroHeaderImage'] img, div[jsaction*='photo'] img, img.Uf0tqf")
                 photo_count = await photo_elements.count()
                 for i in range(min(photo_count, 10)):  # Limit to 10 photos
@@ -644,35 +1178,27 @@ class GoogleMapsScraper:
                         # Get higher resolution version
                         high_res_src = re.sub(r'=w\d+-h\d+', '=w800-h600', src)
                         place["photos"].append(high_res_src)
-            except Exception:
-                pass
 
             # Menu link
-            try:
+            with self._optional(misses, "menu_link"):
                 menu_el = page.locator("a[data-item-id*='menu'], a[aria-label*='Menu']").first
                 if await menu_el.count() > 0:
                     place["menu_link"] = await menu_el.get_attribute("href")
-            except Exception:
-                pass
 
             # Order online link
-            try:
+            with self._optional(misses, "order_link"):
                 order_el = page.locator("a[data-item-id*='order'], a[aria-label*='Order']").first
                 if await order_el.count() > 0:
                     place["order_link"] = await order_el.get_attribute("href")
-            except Exception:
-                pass
 
             # Reserve table link
-            try:
+            with self._optional(misses, "reserve_link"):
                 reserve_el = page.locator("a[data-item-id*='reserve'], a[aria-label*='Reserve']").first
                 if await reserve_el.count() > 0:
                     place["reserve_link"] = await reserve_el.get_attribute("href")
-            except Exception:
-                pass
 
             # Extract amenities and service options
-            try:
+            with self._optional(misses, "service_options"):
                 # Service options (Dine-in, Takeout, Delivery, etc.)
                 service_els = page.locator("div[aria-label*='Service options'] span, div[data-tooltip*='Service']")
                 service_count = await service_els.count()
@@ -680,10 +1206,8 @@ class GoogleMapsScraper:
                     text = await service_els.nth(i).text_content()
                     if text and text.strip():
                         place["service_options"].append(text.strip())
-            except Exception:
-                pass
 
-            try:
+            with self._optional(misses, "accessibility"):
                 # Accessibility options
                 access_els = page.locator("div[aria-label*='Accessibility'] span, span[aria-label*='Wheelchair']")
                 access_count = await access_els.count()
@@ -691,10 +1215,8 @@ class GoogleMapsScraper:
                     text = await access_els.nth(i).text_content()
                     if text and text.strip():
                         place["accessibility"].append(text.strip())
-            except Exception:
-                pass
 
-            try:
+            with self._optional(misses, "amenities"):
                 # General amenities (from About tab or highlights)
                 amenity_els = page.locator("div[aria-label*='Highlights'] span, div[data-attrid*='highlights'] span")
                 amenity_count = await amenity_els.count()
@@ -702,11 +1224,9 @@ class GoogleMapsScraper:
                     text = await amenity_els.nth(i).text_content()
                     if text and text.strip() and len(text.strip()) < 50:
                         place["amenities"].append(text.strip())
-            except Exception:
-                pass
 
             # Extract description/about from the About region
-            try:
+            with self._optional(misses, "description"):
                 # Look for the About region button which contains the description
                 about_region = page.locator("region[aria-label*='About']")
                 if await about_region.count() > 0:
@@ -723,12 +1243,10 @@ class GoogleMapsScraper:
                             desc_text = desc_text.strip()
                             if desc_text and len(desc_text) > 10:
                                 place["description"] = desc_text
-            except Exception:
-                pass
 
             # Fallback description extraction
             if not place["description"]:
-                try:
+                with self._optional(misses, "description_fallback"):
                     # Try to find description in various common locations
                     desc_selectors = [
                         "div[data-attrid='description'] span",
@@ -746,11 +1264,9 @@ class GoogleMapsScraper:
                                         desc = desc.split(marker)[0]
                                 place["description"] = desc.strip()
                                 break
-                except Exception:
-                    pass
 
             # Extract price per person
-            try:
+            with self._optional(misses, "price_per_person"):
                 price_btn = page.locator("button[aria-label*='per person'], button:has-text('per person')").first
                 if await price_btn.count() > 0:
                     price_text = await price_btn.text_content()
@@ -759,11 +1275,9 @@ class GoogleMapsScraper:
                         price_match = re.search(r'\$[\d,]+[–-]\$?[\d,]+', price_text)
                         if price_match:
                             place["price_per_person"] = price_match.group(0)
-            except Exception:
-                pass
 
             # Extract service options (Dine-in, Drive-through, Delivery, etc.)
-            try:
+            with self._optional(misses, "service_option_groups"):
                 # Look for service option groups with role="group"
                 service_groups = page.locator("[role='group'][aria-label*='Serves'], [role='group'][aria-label*='Has']")
                 service_count = await service_groups.count()
@@ -795,11 +1309,9 @@ class GoogleMapsScraper:
                             for svc in service_texts:
                                 if svc.lower() in about_text.lower():
                                     place["service_options"].append(svc)
-            except Exception:
-                pass
 
             # Extract popular times data
-            try:
+            with self._optional(misses, "popular_times"):
                 popular_times_section = page.locator("region[aria-label*='Popular times'], div:has(heading:has-text('Popular times'))")
                 pt_count = await popular_times_section.count()
 
@@ -834,11 +1346,9 @@ class GoogleMapsScraper:
                                 })
                     if hourly_data:
                         place["popular_times"][current_day] = hourly_data
-            except Exception:
-                pass
 
             # Extract live wait time and current busyness
-            try:
+            with self._optional(misses, "live_busyness"):
                 # Initialize wait time fields
                 place["wait_time_minutes"] = None
                 place["wait_time_raw"] = None
@@ -900,11 +1410,9 @@ class GoogleMapsScraper:
                             place["typical_busyness"] = typical_text.strip()
                             break
 
-            except Exception:
-                pass
 
             # Extract review summary (star breakdown)
-            try:
+            with self._optional(misses, "review_summary"):
                 review_table = page.locator("table img[aria-label*='stars']")
                 table_count = await review_table.count()
 
@@ -926,11 +1434,9 @@ class GoogleMapsScraper:
                                 review_summary[f"{stars}_star"] = int(count)
                     if review_summary:
                         place["review_summary"] = review_summary
-            except Exception:
-                pass
 
             # Extract review topics/keywords
-            try:
+            with self._optional(misses, "review_topics"):
                 # Look for radio buttons in the review filter section
                 topic_radios = page.locator("[role='radio'][aria-label*='mentioned in']")
                 topic_count = await topic_radios.count()
@@ -950,11 +1456,9 @@ class GoogleMapsScraper:
                                 "topic": match.group(1).strip(),
                                 "count": int(match.group(2))
                             })
-            except Exception:
-                pass
 
             # Extract sample reviews (quotes shown at top of reviews section)
-            try:
+            with self._optional(misses, "sample_reviews"):
                 # Look for buttons containing quoted review text
                 all_buttons = page.locator("button")
                 btn_count = await all_buttons.count()
@@ -969,13 +1473,16 @@ class GoogleMapsScraper:
                             clean_text = text.strip('"').strip()
                             if clean_text and clean_text not in place["sample_reviews"]:
                                 place["sample_reviews"].append(clean_text)
-                    except Exception:
+                    except Exception as exc:
+                        # Justified: one detached button out of 50 must not
+                        # abort the scan of the other 49. Sample reviews are an
+                        # optional field, and the enclosing _optional() records
+                        # a wholesale failure of the section.
+                        logger.debug("Sample review button %d unreadable: %s", i, exc)
                         continue
-            except Exception:
-                pass
 
             # Extract related places ("People also search for")
-            try:
+            with self._optional(misses, "related_places"):
                 # Look for links with aria-label containing stars and reviews
                 related_links = page.locator("a[aria-label*='stars'][aria-label*='reviews']")
                 related_count = await related_links.count()
@@ -1001,8 +1508,6 @@ class GoogleMapsScraper:
                                 else:
                                     related["category"] = part
                             place["related_places"].append(related)
-            except Exception:
-                pass
 
             # Clean up empty lists/dicts
             if not place["photos"]:
@@ -1022,42 +1527,103 @@ class GoogleMapsScraper:
             if not place["related_places"]:
                 place["related_places"] = None
 
-            # Only return if we have at least a title
-            if place.get("title"):
-                logger.info(f"Extracted place: {place.get('title')} with {len([v for v in place.values() if v])} fields populated")
-                return place
+            return self._finalise_place(place, misses)
 
-            return None
-
+        except ScraperError:
+            raise
         except Exception as e:
-            logger.debug(f"Error extracting place details: {e}")
-            return None
+            # A hard failure here used to become `return None`, which the
+            # callers turned into an empty-but-successful result set. Surface
+            # it instead; search() decides whether one bad place matters.
+            logger.warning("Error extracting place details: %s", e, exc_info=True)
+            raise PlaceExtractionError(
+                f"Place details extraction raised {type(e).__name__}: {e}",
+                missing=list(REQUIRED_PLACE_FIELDS),
+            ) from e
+
+    def _finalise_place(
+        self, place: Dict[str, Any], misses: List[str]
+    ) -> Dict[str, Any]:
+        """Attach freshness metadata and enforce the required fields.
+
+        Args:
+            place: The partially populated place dict.
+            misses: Optional-field names whose extraction raised.
+
+        Returns:
+            ``place``, with ``missing_fields``, ``partial`` and
+            ``selectors_stale`` set.
+
+        Raises:
+            PlaceExtractionError: When a required field is absent.
+        """
+        missing_required = [f for f in REQUIRED_PLACE_FIELDS if not place.get(f)]
+        if missing_required:
+            raise PlaceExtractionError(
+                "No required field could be extracted "
+                f"(missing: {', '.join(missing_required)}); the place panel "
+                "selectors no longer match",
+                missing=missing_required,
+            )
+
+        # A title is recoverable from the URL alone, so a record carrying a
+        # title and nothing else is evidence that the details panel did not
+        # parse -- not evidence of a business with no address or phone.
+        core_present = [f for f in CORE_PLACE_FIELDS if place.get(f)]
+        place["missing_fields"] = sorted(set(misses))
+        place["partial"] = not core_present
+        place["selectors_stale"] = not core_present
+
+        if not core_present:
+            logger.error(
+                "Place %r extracted with no core field (%s); treating as a "
+                "stale-selector partial result",
+                place.get("title"),
+                ", ".join(CORE_PLACE_FIELDS),
+            )
+        elif misses:
+            logger.info(
+                "Place %r extracted with %d optional field(s) unmatched: %s",
+                place.get("title"),
+                len(set(misses)),
+                ", ".join(sorted(set(misses))),
+            )
+        else:
+            logger.info(
+                "Extracted place: %s with %d fields populated",
+                place.get("title"),
+                len([v for v in place.values() if v]),
+            )
+        return place
 
     async def _extract_expanded_hours(self, page) -> Optional[Dict[str, List[str]]]:
-        """Extract hours from expanded hours table."""
-        try:
-            hours = {}
-            # Look for table rows with day and time info
-            rows = page.locator("table tr, div[role='listitem']")
-            row_count = await rows.count()
+        """Extract hours from expanded hours table.
 
-            days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+        Returns None when no hours row parses -- opening hours are optional and
+        plenty of listings have none. A locator that *raises* is deliberately
+        not caught here: the caller runs this inside :meth:`_optional`, which
+        records the miss, so swallowing it locally would hide it again.
+        """
+        hours = {}
+        # Look for table rows with day and time info
+        rows = page.locator("table tr, div[role='listitem']")
+        row_count = await rows.count()
 
-            for i in range(row_count):
-                row = rows.nth(i)
-                row_text = await row.text_content()
-                if row_text:
-                    for day in days:
-                        if day in row_text:
-                            # Extract time portion
-                            time_match = re.search(r'(\d{1,2}(?::\d{2})?\s*(?:AM|PM)\s*[–-]\s*\d{1,2}(?::\d{2})?\s*(?:AM|PM)|Closed|Open 24 hours)', row_text, re.IGNORECASE)
-                            if time_match:
-                                hours[day] = [time_match.group(0)]
-                            break
+        days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
 
-            return hours if hours else None
-        except Exception:
-            return None
+        for i in range(row_count):
+            row = rows.nth(i)
+            row_text = await row.text_content()
+            if row_text:
+                for day in days:
+                    if day in row_text:
+                        # Extract time portion
+                        time_match = re.search(r'(\d{1,2}(?::\d{2})?\s*(?:AM|PM)\s*[–-]\s*\d{1,2}(?::\d{2})?\s*(?:AM|PM)|Closed|Open 24 hours)', row_text, re.IGNORECASE)
+                        if time_match:
+                            hours[day] = [time_match.group(0)]
+                        break
+
+        return hours if hours else None
 
     def _parse_hours_label(self, label: str) -> Optional[Dict[str, List[str]]]:
         """Parse hours from aria-label into structured format."""
@@ -1083,12 +1649,17 @@ class GoogleMapsScraper:
         return hours if hours else None
 
 
-# Global job store
+# Global job store, backed by the owner-scoped record store.
 _job_store = JobStore()
 
 
 async def get_job_store() -> JobStore:
-    """Get the global job store."""
+    """Get the global job store.
+
+    The accessor signature is unchanged, but the returned store is now
+    owner-scoped: see :class:`JobStore` for the method signatures, which
+    changed (``get``/``delete`` take an owner, ``list_all`` is gone).
+    """
     return _job_store
 
 
@@ -1100,8 +1671,13 @@ async def run_scrape_job(
     Run a scrape job in the background.
 
     Args:
-        job: The job to run
+        job: The job to run. ``job.owner`` must be set.
         proxy: Optional proxy URL
+
+    A scraping failure -- including a stale-selector failure, where Google's
+    markup changed and nothing could be parsed -- marks the job FAILED with the
+    real error. It must never complete with an empty result list, because a
+    caller cannot tell that apart from a genuinely empty area.
     """
     store = await get_job_store()
     scraper = GoogleMapsScraper(proxy=proxy, headless=True)
@@ -1127,17 +1703,32 @@ async def run_scrape_job(
         job.completed_at = datetime.now()
         job.total = len(results)
         job.progress = len(results)
+        # An empty result the scraper could not verify is reported as such
+        # rather than as a confirmed zero.
+        job.empty_unverified = bool(scraper._unverified_empty and not results)
         await store.update(job)
 
         logger.info(f"Job {job.id} completed with {len(results)} results")
 
+    except SelectorsStaleError as e:
+        job.status = JobStatus.FAILED
+        job.error = str(e)
+        job.selectors_stale = True
+        job.completed_at = datetime.now()
+        await store.update(job)
+        logger.error(
+            "Job %s failed: Google Maps selectors are stale (%d attempted, "
+            "%d extracted): %s",
+            job.id, e.attempted, e.extracted, e,
+        )
+
     except Exception as e:
         # Handle failure
         job.status = JobStatus.FAILED
-        job.error = str(e)
+        job.error = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
         job.completed_at = datetime.now()
         await store.update(job)
-        logger.error(f"Job {job.id} failed: {e}")
+        logger.error(f"Job {job.id} failed: {e}", exc_info=True)
 
     finally:
         await scraper.close()
