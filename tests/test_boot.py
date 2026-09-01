@@ -174,6 +174,87 @@ class TestBootFromDocumentedConfig:
             get_settings.cache_clear()
 
 
+class TestPlaceholderCredentialGuard:
+    """
+    The example file must not become a working production credential.
+
+    .env.example ships a usable placeholder so `cp .env.example .env` boots.
+    That is only safe because Settings refuses to run outside development
+    while a placeholder is still in place.
+    """
+
+    def test_placeholder_key_rejected_outside_development(self, monkeypatch):
+        """ENVIRONMENT=production with the example key must refuse to load."""
+        from app.core.config import SettingsError, get_settings
+
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("API_KEYS", EXAMPLE_API_KEY)
+        monkeypatch.setenv("SECRET_KEY", "a-real-generated-production-secret")
+        get_settings.cache_clear()
+        try:
+            with pytest.raises(SettingsError) as exc_info:
+                get_settings()
+            assert "API_KEYS" in str(exc_info.value)
+        finally:
+            get_settings.cache_clear()
+
+    def test_placeholder_secret_rejected_outside_development(self, monkeypatch):
+        """ENVIRONMENT=production with the example SECRET_KEY must refuse."""
+        from app.core.config import SettingsError, get_settings
+
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("API_KEYS", "a-real-generated-api-key")
+        monkeypatch.setenv(
+            "SECRET_KEY", EXAMPLE_ENV["SECRET_KEY"]
+        )
+        get_settings.cache_clear()
+        try:
+            with pytest.raises(SettingsError):
+                get_settings()
+        finally:
+            get_settings.cache_clear()
+
+    def test_real_credentials_accepted_in_production(self, monkeypatch):
+        """Real generated secrets must boot in production."""
+        from app.core.config import get_settings
+
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("API_KEYS", "a-real-generated-api-key")
+        monkeypatch.setenv("SECRET_KEY", "a-real-generated-production-secret")
+        get_settings.cache_clear()
+        try:
+            assert get_settings().API_KEYS == ["a-real-generated-api-key"]
+        finally:
+            get_settings.cache_clear()
+
+    def test_placeholder_allowed_in_development(self, env_example_dir, monkeypatch):
+        """The documented quickstart must still work as documented."""
+        from app.core.config import Settings
+
+        # os.environ wins over the .env file, and other test modules set
+        # ENVIRONMENT without cleaning up; scrub it so this reads the file.
+        for field_name in Settings.model_fields:
+            monkeypatch.delenv(field_name, raising=False)
+            monkeypatch.delenv(field_name.lower(), raising=False)
+
+        settings = Settings(_env_file=str(env_example_dir / ".env"))
+        assert settings.ENVIRONMENT == "development"
+        assert settings.API_KEYS == [EXAMPLE_API_KEY]
+
+    def test_installer_env_is_not_a_placeholder(self):
+        """
+        scripts/install.sh must generate real secrets, not copy the example.
+
+        The installer sets ENVIRONMENT=production, so shipping a placeholder
+        there would make every install fail to boot.
+        """
+        install_sh = (REPO_ROOT / "scripts" / "install.sh").read_text()
+        assert "ENVIRONMENT=production" in install_sh
+        assert "API_KEYS=${API_KEY}" in install_sh
+        for placeholder in ("your-secure-api-key-here", "your-secure-secret-key"):
+            assert placeholder not in install_sh
+
+
 class TestListSettingsRoundTrip:
     """CRT-2: comma and JSON forms must both parse, for every list field."""
 

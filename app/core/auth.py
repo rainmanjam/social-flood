@@ -13,9 +13,25 @@ authenticated request failed. Read keys from ``get_settings()`` only.
 """
 from fastapi import Security, HTTPException, status, Depends, Request
 from fastapi.security.api_key import APIKeyHeader
-from typing import Optional, Dict, Set
+from typing import Dict, FrozenSet, NamedTuple, Optional, Set
 
 from app.core.config import Settings, get_settings
+
+
+class _AuthState(NamedTuple):
+    """
+    One immutable snapshot of everything an auth decision depends on.
+
+    Auth mode and the accepted key set must come from the SAME Settings
+    instance. Kept as a single tuple, replaced by one atomic rebind, so a
+    settings reload concurrent with an in-flight request can never make that
+    request apply one config's ENABLE_API_KEY_AUTH against another config's
+    keys.
+    """
+
+    settings: Optional[Settings]
+    keys: FrozenSet[str]
+    metadata: Dict[str, Dict]
 
 # Create API Key header schema.
 #
@@ -25,16 +41,9 @@ from app.core.config import Settings, get_settings
 # "auth disabled" inverted into "auth required, and any non-empty key passes".
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-# Set of accepted API keys, derived from Settings. A set for O(1) lookups.
-_api_keys_set: Set[str] = set()
-
-# API key to metadata mapping (for future use)
-_api_key_metadata: Dict[str, Dict] = {}
-
-# The Settings instance _api_keys_set was last derived from. Used to detect
-# that settings were reloaded (get_settings.cache_clear()) so the key set is
-# refreshed instead of serving a stale snapshot taken at import time.
-_keys_loaded_from: Optional[Settings] = None
+# The single source of truth for auth decisions. Replaced wholesale, never
+# mutated in place.
+_auth_state = _AuthState(settings=None, keys=frozenset(), metadata={})
 
 
 def initialize_api_keys(settings: Optional[Settings] = None) -> Set[str]:
@@ -51,7 +60,7 @@ def initialize_api_keys(settings: Optional[Settings] = None) -> Set[str]:
     Returns:
         Set[str]: The set of accepted API keys.
     """
-    global _api_keys_set, _api_key_metadata, _keys_loaded_from
+    global _auth_state
 
     settings = settings if settings is not None else get_settings()
 
@@ -68,30 +77,38 @@ def initialize_api_keys(settings: Optional[Settings] = None) -> Set[str]:
             keys.add(stripped)
             metadata[stripped] = {"source": "settings"}
 
-    _api_keys_set = keys
-    _api_key_metadata = metadata
-    _keys_loaded_from = settings
+    # One atomic rebind: any concurrent reader sees either the whole old
+    # snapshot or the whole new one, never a mix.
+    _auth_state = _AuthState(
+        settings=settings, keys=frozenset(keys), metadata=metadata
+    )
 
-    if not _api_keys_set and settings.ENABLE_API_KEY_AUTH:
+    if not keys and settings.ENABLE_API_KEY_AUTH:
         print(
             "WARNING: No API keys configured. API key authentication is "
             "enabled but will reject all requests."
         )
 
-    return _api_keys_set
+    return set(keys)
 
 
-def _current_settings() -> Settings:
+def _auth_snapshot() -> _AuthState:
     """
-    Return the active settings, refreshing the key set if they were reloaded.
+    Return the current auth snapshot, rebuilding it if settings were reloaded.
+
+    Every public entry point in this module goes through here, so
+    ``reload_settings()`` (or any ``get_settings.cache_clear()``) takes effect
+    immediately rather than only on the next authenticated request.
 
     Returns:
-        Settings: The current application settings.
+        _AuthState: A consistent (settings, keys, metadata) triple.
     """
     settings = get_settings()
-    if _keys_loaded_from is not settings:
+    state = _auth_state
+    if state.settings is not settings:
         initialize_api_keys(settings)
-    return settings
+        state = _auth_state
+    return state
 
 
 # Initialize API keys on module import.
@@ -110,7 +127,7 @@ def validate_api_key(api_key: Optional[str]) -> bool:
     """
     if not api_key:
         return False
-    return api_key in _api_keys_set
+    return api_key in _auth_snapshot().keys
 
 
 def get_api_key_metadata(api_key: str) -> Optional[Dict]:
@@ -123,7 +140,7 @@ def get_api_key_metadata(api_key: str) -> Optional[Dict]:
     Returns:
         Optional[Dict]: Metadata for the API key, or None if the key is invalid
     """
-    return _api_key_metadata.get(api_key)
+    return _auth_snapshot().metadata.get(api_key)
 
 
 async def get_api_key(api_key_header: Optional[str] = Security(api_key_header)) -> str:
@@ -165,12 +182,14 @@ async def authenticate_api_key(
         HTTPException: 401 if the key is missing or invalid; 500 if key
             authentication is enabled but no keys are configured.
     """
-    settings = _current_settings()
+    # Take ONE snapshot and decide entirely from it, so auth mode and the
+    # accepted keys always come from the same configuration.
+    state = _auth_snapshot()
 
     # Authentication explicitly disabled: allow the request through with no
     # header at all. Reachable only because api_key_header uses
     # auto_error=False.
-    if not settings.ENABLE_API_KEY_AUTH:
+    if not state.settings.ENABLE_API_KEY_AUTH:
         return "authentication-disabled"
 
     # No header sent (or sent empty) -> unauthenticated, not a server error.
@@ -182,14 +201,14 @@ async def authenticate_api_key(
         )
 
     # Fail closed: auth is on but nothing was configured to accept.
-    if not _api_keys_set:
+    if not state.keys:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="API key authentication is enabled but no API keys are configured."
         )
 
     # Validate the API key
-    if not validate_api_key(api_key_header):
+    if api_key_header not in state.keys:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key provided.",

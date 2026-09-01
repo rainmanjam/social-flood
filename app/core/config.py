@@ -6,9 +6,30 @@ from environment variables using Pydantic's BaseSettings.
 """
 import json
 from typing import Annotated, List, Optional, Union
-from pydantic import PostgresDsn, RedisDsn, ValidationError, field_validator
+from pydantic import (
+    PostgresDsn,
+    RedisDsn,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, NoDecode
 from functools import lru_cache
+
+# Placeholder credentials shipped in .env.example. Usable in development so
+# `cp .env.example .env` boots, rejected everywhere else -- otherwise a
+# deployment that copies the file unchanged would run behind a credential
+# published in this repository. Compared lowercase.
+PLACEHOLDER_CREDENTIALS = frozenset({
+    "your-secure-api-key-here",
+    "your-secure-secret-key-minimum-32-characters-here",
+    "development-secret-key-change-in-production",
+    "changeme",
+    "change-me",
+})
+
+# Environments where placeholder credentials are tolerated.
+_NON_PRODUCTION_ENVIRONMENTS = frozenset({"development", "dev", "local", "test", "testing"})
 
 # Fields that are parsed from a delimited string rather than JSON.
 # ``NoDecode`` disables pydantic-settings' built-in JSON decoding for complex
@@ -178,6 +199,46 @@ class Settings(BaseSettings):
         """
         return _parse_delimited_list(v)
 
+    @model_validator(mode="after")
+    def reject_placeholder_credentials(self) -> "Settings":
+        """
+        Refuse to run outside development with the .env.example placeholders.
+
+        ``.env.example`` ships working-looking placeholder credentials so that
+        `cp .env.example .env` boots. Without this guard, a deployment that
+        copies the file and forgets to edit it would expose the API behind a
+        credential printed in the public repository. Development and test
+        environments are exempt so the documented quickstart still works.
+
+        Returns:
+            Settings: self, when the configuration is acceptable.
+
+        Raises:
+            ValueError: If a placeholder credential is in use outside a
+                development or test environment.
+        """
+        if (self.ENVIRONMENT or "").strip().lower() in _NON_PRODUCTION_ENVIRONMENTS:
+            return self
+
+        offenders = []
+        for key in self.API_KEYS:
+            if key.strip().lower() in PLACEHOLDER_CREDENTIALS:
+                offenders.append("API_KEYS")
+                break
+        if self.API_KEY and self.API_KEY.strip().lower() in PLACEHOLDER_CREDENTIALS:
+            offenders.append("API_KEY")
+        if self.SECRET_KEY.strip().lower() in PLACEHOLDER_CREDENTIALS:
+            offenders.append("SECRET_KEY")
+
+        if offenders:
+            raise ValueError(
+                f"{', '.join(offenders)} still holds the placeholder value "
+                f"shipped in .env.example, and ENVIRONMENT is "
+                f"'{self.ENVIRONMENT}'. Generate real secrets before running "
+                "outside development."
+            )
+        return self
+
     model_config = {
         "env_file": ".env",
         "case_sensitive": False,
@@ -218,8 +279,16 @@ def _build_settings() -> Settings:
     except ValidationError as exc:
         problems = []
         for error in exc.errors():
-            location = ".".join(str(part) for part in error.get("loc", ())) or "<root>"
-            problems.append(f"{location} ({error.get('type', 'invalid')})")
+            location = ".".join(str(part) for part in error.get("loc", ()))
+            if location:
+                # Field-level failure: name the field and the error type only.
+                # The rejected value stays out -- that is the whole point.
+                problems.append(f"{location} ({error.get('type', 'invalid')})")
+            else:
+                # Model-level (@model_validator) failure. The message is ours,
+                # written not to contain any credential, so it is safe to show
+                # and is the only thing identifying what went wrong.
+                problems.append(error.get("msg", "invalid configuration"))
         raise SettingsError(
             "Invalid application configuration; "
             f"{len(problems)} setting(s) failed validation: {', '.join(problems)}. "

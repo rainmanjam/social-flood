@@ -28,9 +28,7 @@ from app.core.auth import (
     authenticate_api_key,
     get_current_api_key,
 
-    # Global variables
-    _api_keys_set,
-    _api_key_metadata,
+    _auth_snapshot,
 )
 from app.core.config import Settings, get_settings
 
@@ -95,19 +93,19 @@ class TestAPIKeyValidation:
 
     def setup_method(self):
         """Reset global state before each test."""
-        self.original_keys = app.core.auth._api_keys_set.copy()
-        self.original_metadata = app.core.auth._api_key_metadata.copy()
-
-        app.core.auth._api_keys_set = {"valid_key1", "valid_key2"}
-        app.core.auth._api_key_metadata = {
-            "valid_key1": {"source": "settings"},
-            "valid_key2": {"source": "settings"}
-        }
+        self.original_state = app.core.auth._auth_state
+        app.core.auth._auth_state = app.core.auth._AuthState(
+            settings=get_settings(),
+            keys=frozenset({"valid_key1", "valid_key2"}),
+            metadata={
+                "valid_key1": {"source": "settings"},
+                "valid_key2": {"source": "settings"},
+            },
+        )
 
     def teardown_method(self):
         """Restore global state after each test."""
-        app.core.auth._api_keys_set = self.original_keys
-        app.core.auth._api_key_metadata = self.original_metadata
+        app.core.auth._auth_state = self.original_state
 
     def test_validate_api_key_valid(self):
         """Test validating a valid API key."""
@@ -142,18 +140,19 @@ class TestAuthenticationDependencies:
         # monkeypatch restores os.environ after the test body, so a cache
         # refilled inside that body would otherwise leak stale values here.
         get_settings.cache_clear()
-        self.original_keys = app.core.auth._api_keys_set.copy()
-        self.original_loaded_from = app.core.auth._keys_loaded_from
-        app.core.auth._api_keys_set = {"test_key"}
-        # Pin the "loaded from" marker to the live settings object so
-        # _current_settings() does not rebuild (and discard) the set above.
-        app.core.auth._keys_loaded_from = get_settings()
+        self.original_state = app.core.auth._auth_state
+        # Pin the snapshot's settings to the live object so _auth_snapshot()
+        # does not rebuild (and discard) the key set below.
+        app.core.auth._auth_state = app.core.auth._AuthState(
+            settings=get_settings(),
+            keys=frozenset({"test_key"}),
+            metadata={"test_key": {"source": "settings"}},
+        )
 
     def teardown_method(self):
         """Restore global state after each test."""
         get_settings.cache_clear()
-        app.core.auth._api_keys_set = self.original_keys
-        app.core.auth._keys_loaded_from = self.original_loaded_from
+        app.core.auth._auth_state = self.original_state
 
     @pytest.mark.asyncio
     async def test_authenticate_api_key_valid(self):
@@ -206,7 +205,9 @@ class TestAuthenticationDependencies:
         """Auth enabled but no keys configured must still reject."""
         from fastapi import HTTPException
 
-        app.core.auth._api_keys_set = set()
+        app.core.auth._auth_state = app.core.auth._auth_state._replace(
+            keys=frozenset()
+        )
         with pytest.raises(HTTPException) as exc_info:
             await authenticate_api_key("anything")
         assert exc_info.value.status_code == 500
@@ -240,9 +241,24 @@ class TestGlobalState:
     """Test global state management."""
 
     def test_global_variables_initialized(self):
-        """Test that global variables are properly initialized."""
-        assert isinstance(_api_keys_set, set)
-        assert isinstance(_api_key_metadata, dict)
+        """Test that the auth snapshot is properly initialized."""
+        state = _auth_snapshot()
+        assert isinstance(state.keys, frozenset)
+        assert isinstance(state.metadata, dict)
+
+    def test_auth_state_is_a_single_snapshot(self):
+        """
+        Auth mode and accepted keys must live in ONE object.
+
+        Reading them from separate globals lets a settings reload concurrent
+        with a request mix one config's ENABLE_API_KEY_AUTH with another
+        config's key set.
+        """
+        state = _auth_snapshot()
+        assert state.settings is get_settings()
+        assert state.keys == frozenset(
+            k for k in (list(state.settings.API_KEYS) + [state.settings.API_KEY]) if k
+        )
 
     def test_initialize_api_keys_reads_settings(self, monkeypatch):
         """initialize_api_keys() merges API_KEYS and API_KEY from Settings."""
@@ -266,9 +282,10 @@ class TestGlobalState:
         monkeypatch.setenv("API_KEYS", "rotated-key")
         get_settings.cache_clear()
         try:
-            settings = app.core.auth._current_settings()
-            assert settings.API_KEYS == ["rotated-key"]
+            # validate_api_key must see the reload on its own, with no
+            # authenticated request needed to trigger a refresh first.
             assert validate_api_key("rotated-key") is True
+            assert app.core.auth._auth_snapshot().settings.API_KEYS == ["rotated-key"]
         finally:
             get_settings.cache_clear()
             initialize_api_keys(get_settings())
@@ -279,18 +296,22 @@ class TestBasicFunctionality:
 
     def test_validate_api_key_with_empty_set(self):
         """Validation against an empty key set rejects everything."""
-        original_keys = app.core.auth._api_keys_set.copy()
-        app.core.auth._api_keys_set = set()
+        original = app.core.auth._auth_state
+        app.core.auth._auth_state = original._replace(
+            settings=get_settings(), keys=frozenset()
+        )
         try:
             assert validate_api_key("any_key") is False
         finally:
-            app.core.auth._api_keys_set = original_keys
+            app.core.auth._auth_state = original
 
     def test_get_api_key_metadata_with_empty_mapping(self):
         """Metadata lookup against an empty mapping returns None."""
-        original_metadata = app.core.auth._api_key_metadata.copy()
-        app.core.auth._api_key_metadata = {}
+        original = app.core.auth._auth_state
+        app.core.auth._auth_state = original._replace(
+            settings=get_settings(), metadata={}
+        )
         try:
             assert get_api_key_metadata("any_key") is None
         finally:
-            app.core.auth._api_key_metadata = original_metadata
+            app.core.auth._auth_state = original

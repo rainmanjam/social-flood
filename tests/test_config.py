@@ -135,7 +135,11 @@ class TestSettingsEnvironmentLoading:
         "ENABLE_API_KEY_AUTH": "false",
         "RATE_LIMIT_REQUESTS": "50",
         "DEBUG": "true",
-        "ENVIRONMENT": "production"
+        "ENVIRONMENT": "production",
+        # A production environment must supply a real secret: Settings now
+        # refuses to boot outside development while a credential still holds
+        # the placeholder value published in .env.example / config.py.
+        "SECRET_KEY": "a-real-generated-production-secret-key-value"
     })
     def test_settings_from_env_basic(self):
         """Test loading basic settings from environment."""
@@ -245,7 +249,11 @@ class TestSettingsValidation:
 
     def test_settings_case_insensitive_env(self):
         """Test that environment variables are case insensitive."""
-        with patch.dict(os.environ, {"debug": "true", "environment": "production"}):
+        with patch.dict(os.environ, {
+            "debug": "true",
+            "environment": "production",
+            "secret_key": "a-real-generated-production-secret-key-value",
+        }):
             test_settings = Settings()
             assert test_settings.DEBUG is True
             assert test_settings.ENVIRONMENT == "production"
@@ -316,6 +324,7 @@ class TestSettingsIntegration:
         "RATE_LIMIT_REQUESTS": "200",
         "DEBUG": "false",
         "ENVIRONMENT": "production",
+        "SECRET_KEY": "a-real-generated-production-secret-key-value",
         "REDIS_URL": "redis://prod-redis:6379",
         "DATABASE_URL": "postgresql://prod-user:test-pass@prod-db/prod_db"
     })

@@ -108,18 +108,18 @@ class TestApiKeyAuthentication:
     def test_valid_api_key_in_header(self, auth_client):
         """Test that valid API key in header is accepted."""
         response = auth_client.get(
-            "/api-config",
+            PROTECTED_PROBE,
             headers={"X-API-Key": "valid-test-key-123"}
         )
-        assert response.status_code == 200
+        assert response.status_code == 200, response.text
 
     def test_another_valid_api_key(self, auth_client):
         """Test that another valid API key is accepted."""
         response = auth_client.get(
-            "/api-config",
+            PROTECTED_PROBE,
             headers={"X-API-Key": "another-valid-key-456"}
         )
-        assert response.status_code == 200
+        assert response.status_code == 200, response.text
 
     def test_invalid_api_key_rejected(self, auth_client):
         """Test that invalid API key is rejected on a protected route."""
@@ -163,15 +163,15 @@ class TestApiKeyAuthentication:
         """Test that header name is handled correctly."""
         # Standard header name
         response = auth_client.get(
-            "/api-config",
+            PROTECTED_PROBE,
             headers={"X-API-Key": "valid-test-key-123"}
         )
-        assert response.status_code == 200
+        assert response.status_code == 200, response.text
 
     def test_whitespace_in_api_key_handled(self, auth_client):
         """Test that whitespace around API key is handled."""
         response = auth_client.get(
-            "/api-config",
+            PROTECTED_PROBE,
             headers={"X-API-Key": " valid-test-key-123 "}
         )
         # Depends on implementation - might strip whitespace or reject
