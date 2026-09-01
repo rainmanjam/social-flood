@@ -308,16 +308,33 @@ _http_client_manager: Optional[HTTPClientManager] = None
 
 
 def get_http_client_manager() -> HTTPClientManager:
-    """Get the global HTTP client manager instance."""
+    """
+    Get the global HTTP client manager instance.
+
+    The manager owns the shared httpx connection pools, so exactly one
+    instance must exist for the life of the process. Previously this
+    function built (and leaked) a brand new manager on every call, which
+    meant ``close_all_clients()`` at shutdown only ever closed one of the
+    many pools that had been created.
+    """
+    global _http_client_manager
     if _http_client_manager is None:
-        return HTTPClientManager()
+        _http_client_manager = HTTPClientManager()
     return _http_client_manager
 
 
-def set_http_client_manager(manager: HTTPClientManager):
-    """Set the global HTTP client manager instance (for testing)."""
-    # Use object.__setattr__ to avoid global statement
-    globals()['_http_client_manager'] = manager
+def set_http_client_manager(manager: Optional[HTTPClientManager]) -> None:
+    """Set (or clear, with ``None``) the global HTTP client manager instance."""
+    global _http_client_manager
+    _http_client_manager = manager
+
+
+async def shutdown_http_client_manager() -> None:
+    """Close the global HTTP client manager and drop the reference."""
+    global _http_client_manager
+    if _http_client_manager is not None:
+        await _http_client_manager.close_all_clients()
+        _http_client_manager = None
 
 
 @asynccontextmanager
@@ -327,4 +344,4 @@ async def lifespan_manager():
     try:
         yield manager
     finally:
-        await manager.close_all_clients()
+        await shutdown_http_client_manager()

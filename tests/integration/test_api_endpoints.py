@@ -19,6 +19,12 @@ def app():
     os.environ.setdefault("ENABLE_API_KEY_AUTH", "false")
     os.environ.setdefault("RATE_LIMIT_ENABLED", "false")
 
+    # The env vars above are only honoured if the settings cache is dropped;
+    # otherwise get_settings() keeps whatever was resolved at first import and
+    # the fixture silently tests a different configuration than it declares.
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+
     from main import create_application
     return create_application()
 
@@ -56,15 +62,22 @@ class TestHealthEndpoints:
         assert response.status_code == 200
 
     def test_health_endpoint_response_structure(self, client):
-        """Test /health endpoint response has correct structure."""
+        """
+        /health is the unauthenticated liveness probe and must disclose
+        nothing beyond liveness.
+
+        This test previously asserted that version and environment WERE
+        present. That is the information-disclosure bug, not the contract:
+        an unauthenticated caller learning the exact running version learns
+        which CVEs to try. Build details now live on the authenticated
+        /status endpoint.
+        """
         response = client.get("/health")
         data = response.json()
 
-        assert "status" in data
-        assert data["status"] == "healthy"
-        assert "version" in data
-        assert "environment" in data
-        assert "timestamp" in data
+        assert data == {"status": "healthy"}
+        assert "version" not in data
+        assert "environment" not in data
 
     def test_ping_endpoint(self, client):
         """Test /ping endpoint returns pong."""
