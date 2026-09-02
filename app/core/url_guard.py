@@ -209,7 +209,10 @@ def _resolve(host: str, port: int) -> tuple[str, ...]:
         # leaks whether an internal name exists.
         raise UrlNotAllowed(f"DNS resolution failed for {host!r}: {exc}") from exc
 
-    addresses = {info[4][0] for info in infos}
+    # info[4] is a sockaddr: (host, port) for IPv4, (host, port, flow, scope)
+    # for IPv6. Element 0 is always the address string; annotate so the set is
+    # not inferred as set[str | int] from the heterogeneous tuple.
+    addresses: set[str] = {str(info[4][0]) for info in infos}
     if not addresses:
         raise UrlNotAllowed(f"{host!r} resolved to no addresses")
     return tuple(sorted(addresses))

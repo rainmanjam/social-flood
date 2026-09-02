@@ -145,3 +145,11 @@ skips = [
     "B101",  # assert_used
     "B601",  # paramiko calls - not used here
 ]
+
+
+[tool.mypy]
+# The pydantic plugin is required for useful output on this codebase: without
+# it mypy cannot see that Field(None) supplies a default, and reports every
+# optional model field as a missing required argument at each construction
+# site. Those were false positives, verified at runtime.
+plugins = ["pydantic.mypy"]
