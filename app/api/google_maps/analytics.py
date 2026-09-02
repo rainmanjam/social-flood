@@ -19,6 +19,7 @@ from app.api.google_maps.schemas import (
 from app.core.auth import get_api_key
 from app.core.rate_limiter import rate_limit
 from app.services.google_maps_service import google_maps_service
+from app.core.log_safety import scrub
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,7 @@ async def get_review_analytics(
     - `year` - Last 365 days
     - `all` - All time (default)
     """
-    logger.info(f"Get analytics for place: {place_id}")
+    logger.info("Get analytics for place: %s", scrub(place_id))
 
     try:
         result = await google_maps_service.get_review_analytics(

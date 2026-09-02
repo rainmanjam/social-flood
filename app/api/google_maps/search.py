@@ -28,6 +28,7 @@ from app.core.auth import get_api_key
 from app.core.rate_limiter import rate_limit
 from app.services.google_maps_service import google_maps_service
 from app.services.record_store import owner_id_for_api_key
+from app.core.log_safety import scrub
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +87,7 @@ async def search_places(
     - `{"query": "hotels in Paris", "email_extraction": true}` - With email extraction
     - `{"query": "Starbucks Portland Oregon", "max_results": 5}` - Specific business search
     """
-    logger.info(f"Google Maps search: {request.query}")
+    logger.info("Google Maps search: %s", scrub(request.query))
 
     # Check service health first
     health = await google_maps_service.health_check()

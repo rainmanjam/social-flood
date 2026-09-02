@@ -23,6 +23,7 @@ from app.core.constants import USER_AGENTS
 from app.core.url_guard import NEWS_ALLOWED_HOSTS, UrlNotAllowed, validate_outbound_url
 import hashlib
 from typing import Any, Callable, Iterable, Tuple
+from app.core.log_safety import scrub
 
 # Initialize NLTK asynchronously at module level
 async def setup_nltk():
@@ -284,14 +285,14 @@ async def get_cached_or_fetch(
 
     cached = await cache_manager.get(cache_key, namespace=CACHE_NAMESPACE)
     if cached is not None:
-        logger.debug("Cache hit for %s", cache_key)
+        logger.debug("Cache hit for %s", scrub(cache_key))
         return cached
 
     data = await fetch_func()
     if should_cache(data):
         await cache_manager.set(cache_key, data, ttl=ttl, namespace=CACHE_NAMESPACE)
     else:
-        logger.info("Not caching a partial result for %s", cache_key)
+        logger.info("Not caching a partial result for %s", scrub(cache_key))
     return data
 
 

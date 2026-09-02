@@ -31,6 +31,7 @@ from app.core.middleware import setup_middleware
 from app.core.health_checks import check_health
 from app.core.auth import get_api_key
 from app.core.http_client import shutdown_http_client_manager
+from app.core.log_safety import install_log_injection_filter
 from app.core.rate_limiter import (
     RateLimitMiddleware,
     shutdown_rate_limiting,
@@ -53,6 +54,14 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
+
+# Blanket protection against log forging. Call sites wrap untrusted values with
+# log_safety.scrub(), but this catches the ones nobody remembered -- and values
+# logged by third-party libraries that we handed caller-controlled strings.
+# Without it, a place_id containing a newline appends a fabricated line to the
+# log, which anything parsing those logs then treats as a real event.
+install_log_injection_filter()
+
 logger = logging.getLogger(__name__)
 
 # Get application settings

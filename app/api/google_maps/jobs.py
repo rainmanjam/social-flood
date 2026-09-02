@@ -30,6 +30,7 @@ from app.core.auth import get_api_key
 from app.core.rate_limiter import rate_limit
 from app.services.google_maps_service import google_maps_service
 from app.services.record_store import owner_id_for_api_key
+from app.core.log_safety import scrub
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +168,10 @@ async def get_job_results(
         # already consumed by the check above, so the branch is only reached
         # when the key is absent. Made explicit, and the reason -- which names
         # browser paths and proxy hosts -- is logged rather than returned.
-        logger.warning("Job %s reported status 'failed': %s", job_id, status_result)
+        logger.warning(
+                "Job %s reported status 'failed': %s",
+                scrub(job_id), scrub(status_result),
+            )
         raise HTTPException(status_code=500, detail="Job failed.")
 
     # Get results
@@ -258,7 +262,7 @@ async def export_job_results(
 
     For CSV and Excel, complex fields (like hours, reviews) are serialized as JSON strings.
     """
-    logger.info(f"Export job {job_id} as {format.value}")
+    logger.info("Export job %s as %s", scrub(job_id), scrub(format.value))
 
     try:
         # Get job results

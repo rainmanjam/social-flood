@@ -20,6 +20,7 @@ from datetime import datetime
 
 from app.core.config import get_settings
 from app.core.proxy import ENABLE_PROXY, get_proxy
+from app.core.log_safety import scrub
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +149,7 @@ class GoogleMapsService:
                 self._scraper_module.run_scrape_job(job, proxy=proxy)
             )
 
-            logger.info(f"Created job {job_id} for query: {query}")
+            logger.info("Created job %s for query: %s", scrub(job_id), scrub(query))
 
             return {
                 "job_id": job_id,
@@ -777,7 +778,10 @@ class GoogleMapsService:
             grid_data = []
             failed_points = 0
 
-            logger.info(f"Starting grid search: {query} with {len(grid_coords)} grid points")
+            logger.info(
+                    "Starting grid search: %s with %d grid points",
+                    scrub(query), len(grid_coords),
+                )
 
             for idx, (lat, lng) in enumerate(grid_coords):
                 try:
@@ -1247,7 +1251,10 @@ class GoogleMapsService:
             finally:
                 await context.close()
         except Exception as e:
-            logger.error(f"Q&A scrape failed for {place_id}: {e}", exc_info=True)
+            logger.error(
+                    "Q&A scrape failed for %s: %s", scrub(place_id), scrub(e),
+                    exc_info=True,
+                )
             return {
                 "error": True,
                 "status_code": 502,
@@ -2116,7 +2123,10 @@ class GoogleMapsService:
             finally:
                 await context.close()
         except Exception as e:
-            logger.error(f"Menu scrape failed for {place_id}: {e}", exc_info=True)
+            logger.error(
+                    "Menu scrape failed for %s: %s", scrub(place_id), scrub(e),
+                    exc_info=True,
+                )
             return {
                 "error": True,
                 "status_code": 502,
@@ -2430,7 +2440,10 @@ class GoogleMapsService:
             finally:
                 await context.close()
         except Exception as e:
-            logger.error(f"Availability scrape failed for {place_id}: {e}", exc_info=True)
+            logger.error(
+                    "Availability scrape failed for %s: %s", scrub(place_id), scrub(e),
+                    exc_info=True,
+                )
             return {
                 "error": True,
                 "status_code": 502,

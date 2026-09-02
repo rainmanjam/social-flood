@@ -21,6 +21,7 @@ from uuid import UUID
 
 from app.core.config import get_settings, Settings
 from app.core.redis_manager import RedisManager
+from app.core.log_safety import scrub
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -310,7 +311,7 @@ class CacheManager:
             serialized = self._serialize(value)
         except CacheSerializationError as exc:
             logger.error(
-                "Refusing to cache key %s: %s", full_key, exc
+                "Refusing to cache key %s: %s", scrub(full_key), scrub(exc)
             )
             return False
 

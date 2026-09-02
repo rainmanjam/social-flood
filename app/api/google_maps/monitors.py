@@ -21,6 +21,7 @@ from app.api.google_maps.schemas import (
 from app.core.auth import get_api_key
 from app.core.rate_limiter import rate_limit
 from app.services.google_maps_service import google_maps_service
+from app.core.log_safety import scrub
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,9 @@ async def create_monitor(
             detail="Either 'place_id' or 'url' must be provided"
         )
 
-    logger.info(f"Create monitor for place: {request.place_id or request.url}")
+    logger.info(
+        "Create monitor for place: %s", scrub(request.place_id or request.url)
+    )
 
     try:
         result = await google_maps_service.create_monitor(
@@ -241,7 +244,7 @@ async def register_webhook(
     }
     ```
     """
-    logger.info(f"Register webhook: {request.url}")
+    logger.info("Register webhook: %s", scrub(request.url))
 
     try:
         result = await google_maps_service.register_webhook(

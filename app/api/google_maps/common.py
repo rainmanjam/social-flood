@@ -15,6 +15,7 @@ from fastapi.routing import APIRoute
 
 from app.core.url_guard import MAPS_ALLOWED_HOSTS, UrlNotAllowed, validate_outbound_url
 from app.services.google_maps_service import google_maps_service
+from app.core.log_safety import scrub
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +105,7 @@ def places_from_result(result: Dict[str, Any], context: str) -> List[Dict[str, A
     raw_places = result.get("results") or result.get("data") or result.get("places") or []
     if not isinstance(raw_places, list):
         logger.error(
-            "%s: expected a list of places, got %s", context, type(raw_places).__name__
+            "%s: expected a list of places, got %s", scrub(context), type(raw_places).__name__
         )
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
     return google_maps_service.process_place_data(raw_places)

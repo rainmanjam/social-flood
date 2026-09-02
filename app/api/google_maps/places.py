@@ -21,6 +21,7 @@ from app.api.google_maps.schemas import (
 from app.core.auth import get_api_key
 from app.core.rate_limiter import rate_limit
 from app.services.google_maps_service import google_maps_service
+from app.core.log_safety import scrub
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ async def get_place_by_id(
 
     Returns comprehensive place data including reviews, hours, service options, and more.
     """
-    logger.info(f"Place lookup by ID: {place_id}")
+    logger.info("Place lookup by ID: %s", scrub(place_id))
 
     try:
         result = await google_maps_service.get_place_by_id(place_id)
@@ -145,7 +146,7 @@ async def get_place_reviews(
 
     Returns paginated reviews with full text, ratings, timestamps, and optional owner responses.
     """
-    logger.info(f"Get reviews for place: {place_id}")
+    logger.info("Get reviews for place: %s", scrub(place_id))
 
     try:
         result = await google_maps_service.get_place_reviews(
@@ -212,7 +213,7 @@ async def get_place_photos(
 
     Returns photo URLs with contributor information when available.
     """
-    logger.info(f"Get photos for place: {place_id}")
+    logger.info("Get photos for place: %s", scrub(place_id))
 
     try:
         result = await google_maps_service.get_place_photos(
@@ -260,7 +261,7 @@ async def get_place_qa(
     - Answers from the business owner and community
     - Answer counts and timestamps
     """
-    logger.info(f"Get Q&A for place: {place_id}")
+    logger.info("Get Q&A for place: %s", scrub(place_id))
 
     try:
         result = await google_maps_service.get_place_qa(
@@ -312,7 +313,7 @@ async def extract_menu(
 
     Note: Menu availability depends on whether the business has uploaded menu data.
     """
-    logger.info(f"Extract menu for place: {place_id}")
+    logger.info("Extract menu for place: %s", scrub(place_id))
 
     try:
         result = await google_maps_service.extract_menu(
@@ -363,7 +364,7 @@ async def get_place_attributes(
     - **Crowd:** Typical crowd information
     - **Planning:** Reservation requirements, wait times
     """
-    logger.info(f"Get attributes for place: {place_id}")
+    logger.info("Get attributes for place: %s", scrub(place_id))
 
     try:
         result = await google_maps_service.get_place_attributes(
@@ -413,7 +414,7 @@ async def get_place_history(
 
     Returns timestamped snapshots of the tracked fields.
     """
-    logger.info(f"Get history for place: {place_id}")
+    logger.info("Get history for place: %s", scrub(place_id))
 
     try:
         result = await google_maps_service.get_place_history(
@@ -462,7 +463,7 @@ async def check_availability(
 
     Returns available time slots for the specified date and party size.
     """
-    logger.info(f"Check availability for place: {place_id} on {date}")
+    logger.info("Check availability for place: %s on %s", scrub(place_id), scrub(date))
 
     try:
         result = await google_maps_service.check_availability(
