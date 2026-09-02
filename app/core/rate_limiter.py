@@ -51,7 +51,6 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
 import contextlib
-import hashlib
 import json
 import os
 import sys
@@ -392,10 +391,14 @@ def _hash_identity(value: str) -> str:
     Hash an identity before it becomes part of a storage key.
 
     Rate limit keys end up in Redis and in debug logs; API keys are secrets, so
-    only a digest of the key is stored.  Truncated to 32 hex chars: still 128
-    bits, which is far beyond collision range for a key namespace.
+    only a digest of the key is stored. The digest is KEYED (see
+    app.core.identity): a bare sha256 of a short, human-chosen API key is
+    recoverable from a leaked Redis dump by hashing a wordlist. A slow password
+    KDF would be the wrong fix here -- this runs on every request.
     """
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+    from app.core.identity import keyed_digest
+
+    return keyed_digest(value)
 
 
 def client_host(request: Request) -> str:

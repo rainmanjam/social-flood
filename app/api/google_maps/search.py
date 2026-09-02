@@ -240,7 +240,11 @@ async def nearby_search(
     }
     ```
     """
-    logger.info(f"Nearby search at {request.latitude},{request.longitude} radius={request.radius_meters}m")
+    # Coordinates rounded to ~11 km in logs; see analytics.py for rationale.
+    logger.info(
+        "Nearby search near %.1f,%.1f radius=%sm",
+        request.latitude, request.longitude, request.radius_meters,
+    )
 
     try:
         result = await google_maps_service.nearby_search(

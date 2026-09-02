@@ -31,8 +31,6 @@ human-chosen. Without ``SECRET_KEY`` the digest cannot be precomputed.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import json
 import logging
 import time
@@ -63,23 +61,12 @@ def owner_id_for_api_key(api_key: Optional[str]) -> str:
     if not api_key:
         return "anonymous"
 
-    try:  # Imported lazily: config construction can fail at import time.
-        from app.core.config import get_settings
+    # Always keyed -- see app.core.identity. The previous unkeyed sha256
+    # fallback was brute-forceable from a leaked store against a wordlist,
+    # because API keys are short and often human-chosen.
+    from app.core.identity import keyed_digest
 
-        secret = (get_settings().SECRET_KEY or "").encode()
-    except Exception:  # pragma: no cover - defensive
-        secret = b""
-
-    if not secret:
-        # No secret configured. Still hash (never store the raw key), but say
-        # so, because the digest is then precomputable from a key wordlist.
-        logger.warning(
-            "SECRET_KEY is not configured; owner ids fall back to an unkeyed "
-            "digest and are brute-forceable if the store is exposed."
-        )
-        return hashlib.sha256(api_key.encode()).hexdigest()[:32]
-
-    return hmac.new(secret, api_key.encode(), hashlib.sha256).hexdigest()[:32]
+    return keyed_digest(api_key)
 
 
 @dataclass
@@ -220,7 +207,11 @@ class RecordStore:
             try:
                 return StoredRecord.from_json(raw)
             except (ValueError, KeyError) as exc:
-                logger.error("Corrupt record %s/%s: %s", owner, record_id, exc)
+                # Log an owner PREFIX, not the full identity token: log
+                # aggregation is a different trust boundary from Redis.
+                logger.error(
+                    "Corrupt record %s…/%s: %s", owner[:8], record_id, exc
+                )
                 return None
 
         async with self._lock:
