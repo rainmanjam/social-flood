@@ -20,7 +20,6 @@ from app.api.google_maps.schemas import (
 from app.core.auth import get_api_key
 from app.core.rate_limiter import rate_limit
 from app.services.google_maps_service import google_maps_service
-from app.core.log_safety import scrub
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +52,10 @@ async def get_directions(
 
     Returns route with step-by-step directions, distance, and duration.
     """
-    # Coordinates rounded in logs; see analytics.py for rationale.
-    logger.info(
-        "Get directions: %.1f,%.1f to %.1f,%.1f",
-        request.origin_lat, request.origin_lng,
-        request.destination_lat, request.destination_lng,
-    )
+    # Caller coordinates are deliberately NOT logged; see analytics.py. An
+    # origin/destination pair is a movement record -- more sensitive than a
+    # single point, not less.
+    logger.info("Get directions requested")
 
     try:
         result = await google_maps_service.get_directions(

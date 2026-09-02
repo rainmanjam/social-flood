@@ -52,6 +52,24 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+# Declared explicitly so the re-export above is machine-readable intent rather
+# than something a linter has to be told to ignore: `owner_id_for_api_key` is
+# part of this module's public surface on purpose.
+__all__ = [
+    "JobStatus",
+    "ScrapeJob",
+    "JobStore",
+    "GoogleMapsScraper",
+    "get_job_store",
+    "run_scrape_job",
+    "owner_id_for_api_key",
+    "cap_fanout",
+    "ScraperError",
+    "SelectorsStaleError",
+    "PlaceExtractionError",
+    "JOB_NAMESPACE",
+]
+
 #: Namespace for scrape jobs in the owner-scoped record store.
 JOB_NAMESPACE = "maps:jobs"
 

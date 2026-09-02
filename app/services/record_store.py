@@ -35,7 +35,8 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Optional
+from app.core.log_safety import scrub
 
 logger = logging.getLogger(__name__)
 
@@ -207,11 +208,11 @@ class RecordStore:
             try:
                 return StoredRecord.from_json(raw)
             except (ValueError, KeyError) as exc:
-                # Log an owner PREFIX, not the full identity token: log
-                # aggregation is a different trust boundary from Redis.
-                logger.error(
-                    "Corrupt record %s…/%s: %s", owner[:8], record_id, exc
-                )
+                # The owner is intentionally absent: it derives from the
+                # caller's API key, and record_id alone identifies the row for
+                # diagnosis. Log aggregation is a different trust boundary
+                # from Redis.
+                logger.error("Corrupt record %s: %s", scrub(record_id), scrub(exc))
                 return None
 
         async with self._lock:

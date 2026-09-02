@@ -117,12 +117,10 @@ async def analyze_competitors(
     }
     ```
     """
-    # Coordinates are rounded in logs: 1 dp is ~11 km, enough to see regional
-    # traffic patterns without recording a caller's precise location.
-    logger.info(
-        "Competitor analysis near %.1f,%.1f for category=%r",
-        request.latitude, request.longitude, request.category,
-    )
+    # Caller coordinates are deliberately NOT logged. Rounding them was not
+    # enough: a location is personal data, and the endpoint name plus the
+    # category already give the operational signal we actually use.
+    logger.info("Competitor analysis for category=%s", scrub(request.category))
 
     try:
         result = await google_maps_service.analyze_competitors(

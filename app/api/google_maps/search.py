@@ -241,11 +241,8 @@ async def nearby_search(
     }
     ```
     """
-    # Coordinates rounded to ~11 km in logs; see analytics.py for rationale.
-    logger.info(
-        "Nearby search near %.1f,%.1f radius=%sm",
-        request.latitude, request.longitude, request.radius_meters,
-    )
+    # Caller coordinates are deliberately NOT logged; see analytics.py.
+    logger.info("Nearby search radius=%sm", scrub(request.radius_meters))
 
     try:
         result = await google_maps_service.nearby_search(
@@ -588,7 +585,7 @@ async def autocomplete(
 
     Returns suggestions with place IDs for further lookup.
     """
-    logger.info(f"Autocomplete: {input}")
+    logger.info("Autocomplete: %s", scrub(input))
 
     try:
         result = await google_maps_service.autocomplete(
