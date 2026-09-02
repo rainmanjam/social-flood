@@ -41,13 +41,10 @@ youtube-transcript-api==1.2.4
 playwright==1.62.0
 
 # Caching
-# HELD at 7.x deliberately. redis-py 8.x changes DEFAULT_RESP_VERSION from 2
-# to 3, so clients negotiate RESP3 by default and fail against Redis servers
-# older than 6. app/core/redis_manager.py:72 calls aioredis.from_url() without
-# protocol=, and the suite runs with REDIS_URL=None, so nothing here would
-# catch it. There are no advisories against 7.1.0, so the bump buys nothing.
-# Unblock by passing protocol=2 in redis_manager.py, then move to 8.x.
-redis[hiredis]==7.1.0
+# redis-py 8.x flips DEFAULT_RESP_VERSION from 2 to 3 (verified: it is 3 on
+# 8.1.0, 2 on 7.1.0). app/core/redis_manager.py pins protocol=2 explicitly,
+# so the reply types this client sees are unchanged by the bump.
+redis[hiredis]==8.1.0
 
 # PostgreSQL driver. The async DB layer (app/core/database.py) was removed;
 # this remains only for scripts/check_env.py's optional connectivity probe and
