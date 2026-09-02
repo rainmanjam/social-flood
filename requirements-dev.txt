@@ -25,3 +25,10 @@ pip-audit==2.10.1
 # httpie was removed: 3.2.4 is the latest release and still carries
 # PYSEC-2023-242 with no fix available. Use curl/httpx instead.
 watchfiles==1.2.0
+
+# PostgreSQL driver, DEV ONLY. The async DB layer (app/core/database.py) was
+# deleted; the sole remaining reference is an optional `try: import psycopg2`
+# in scripts/check_env.py's connectivity probe. It was a production pin, so a
+# ~10 MB binary wheel shipped in every image for a dev script that degrades
+# gracefully without it.
+psycopg2-binary==2.9.12

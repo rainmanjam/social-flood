@@ -46,11 +46,6 @@ playwright==1.62.0
 # so the reply types this client sees are unchanged by the bump.
 redis[hiredis]==8.1.0
 
-# PostgreSQL driver. The async DB layer (app/core/database.py) was removed;
-# this remains only for scripts/check_env.py's optional connectivity probe and
-# should be dropped once Settings.DATABASE_URL goes away.
-psycopg2-binary==2.9.12
-
 # NOTE: slowapi is deliberately NOT a dependency. main.py used to import it
 # behind a try/except and build a Limiter keyed by remote address; that path
 # was dead in every deployment, and had it been live it would have keyed
