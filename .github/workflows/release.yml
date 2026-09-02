@@ -133,6 +133,12 @@ jobs:
     needs: [ verify, bump-version ]
     if: needs.bump-version.outputs.changed == 'true'
     runs-on: ubuntu-latest
+    # DOCKERHUB_USERNAME / DOCKERHUB_TOKEN are ENVIRONMENT secrets on
+    # "production", not repository secrets. A job that does not declare the
+    # environment cannot see them: `secrets.DOCKERHUB_USERNAME` would resolve
+    # to an empty string and docker/login-action would fail with a confusing
+    # auth error rather than a missing-secret one.
+    environment: production
     permissions:
       contents: write
       packages: write
