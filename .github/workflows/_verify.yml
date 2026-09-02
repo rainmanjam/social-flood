@@ -233,10 +233,16 @@ jobs:
                   name, _, version = line.partition("==")
                   frozen[norm(name)] = version.strip()
 
+          # Only flag VERSION MISMATCHES, not absences. requirements.lock is
+          # compiled with `uv pip compile --universal`, so it carries entries
+          # that apply to other platforms -- colorama, tzdata and
+          # win32-setctime are Windows-only and are correctly absent on the
+          # Linux runner. Treating "missing" as drift makes a universal lock
+          # unusable; a wrong VERSION is the failure this check exists for.
           drift = {
-              name: (want, frozen.get(name))
+              name: (want, frozen[name])
               for name, want in locked.items()
-              if frozen.get(name) != want
+              if name in frozen and frozen[name] != want
           }
           if drift:
               print("::error::Installed packages drifted from requirements.lock")

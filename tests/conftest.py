@@ -114,6 +114,16 @@ def _isolate_settings() -> None:
 
     app_config.Settings.model_config["env_file"] = str(_EMPTY_ENV_FILE)
 
+    # app/core/config.py ends with `settings = get_settings()`, so importing it
+    # above ALREADY built a Settings instance from the developer's real .env --
+    # before the repoint on the line above could take effect. Repointing
+    # env_file alone therefore isolated future constructions while leaving the
+    # module-level global (and the lru_cache behind get_settings) holding the
+    # leaked values. Clear the cache and rebuild the global so every access
+    # path sees the isolated file.
+    app_config.get_settings.cache_clear()
+    app_config.settings = app_config.get_settings()
+
 
 def pytest_configure(config: pytest.Config) -> None:
     """Runs before collection, so before any test module imports ``Settings``."""

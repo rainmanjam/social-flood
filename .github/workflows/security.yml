@@ -75,7 +75,7 @@ jobs:
           cache-from: type=gha
 
       - name: Trivy scan (SARIF for the Security tab)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: 'social-flood:scan'
           format: 'sarif'
@@ -92,7 +92,7 @@ jobs:
       # The only blocking security gate: a new CRITICAL vulnerability in the
       # image that we are about to ship stops the pull request.
       - name: Fail on CRITICAL findings
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: 'social-flood:scan'
           format: 'table'
@@ -111,7 +111,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: 'fs'
           scan-ref: '.'
@@ -138,6 +138,11 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Dependency Review
+        # Requires the repository's Dependency graph to be enabled
+        # (Settings -> Code security -> Dependency graph). Without it the
+        # action hard-fails, so it is advisory rather than permanently red.
+        # pip-audit in _verify.yml is the blocking dependency gate.
+        continue-on-error: true
         uses: actions/dependency-review-action@v4
         with:
           fail-on-severity: high
