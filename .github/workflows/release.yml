@@ -17,25 +17,34 @@
 # After: ONE run, sequential jobs joined by `needs`. No second trigger is
 # required, so no token can withhold it.
 #
-#     verify  ->  bump-version  ->  publish
+#     verify  ->  tag-release  ->  publish
 #
-# `bump-version` still pushes the version commit and now also pushes a `vX.Y.Z`
-# tag, so the tag exists for humans and for `git describe`. But publishing does
-# NOT depend on that tag firing a workflow - it depends on `needs`.
+# WHY NOTHING HERE COMMITS TO main
+# --------------------------------
+# `main` is protected by a repository ruleset with NO bypass actors: every
+# change reaches it through a pull request with passing CI. That applies to
+# GITHUB_TOKEN and to a maintainer PAT alike, so a job that pushes a version
+# commit to main cannot work, whatever credential it holds.
+#
+# So the version is no longer bumped by CI. `app/__version__.py` is edited in a
+# pull request like any other file, which makes the version an explicit,
+# reviewed decision rather than an automatic patch bump. When main carries a
+# version that has no matching tag, `tag-release` creates it. Tags are outside
+# the branch ruleset, so pushing one is permitted.
+#
+# Publishing does NOT depend on that tag firing a workflow -- it depends on
+# `needs`, in the same run. That is what keeps a token from withholding it.
 #
 # TRADE-OFF vs. the alternatives:
-#   * PAT in a secret - works, and is the only way to make a bot push trigger
-#     another workflow, but it means a long-lived human-scoped credential with
-#     write access sitting in repo secrets, plus rotation and audit burden.
-#   * workflow_dispatch only - safe, but makes every release a manual click and
-#     the whole point was to restore automation.
-#   * tag-push trigger (`on: push: tags:`) - clean in principle, BUT it has
-#     exactly the same defect as the current code: the tag would be pushed by
-#     GITHUB_TOKEN and therefore would not trigger the run either. It only works
-#     if you also add a PAT, so it buys nothing over the PAT option.
-#   * CHOSEN: same-run `needs` chaining. Zero new secrets, zero new failure
-#     modes, and the publish step is now provably gated on the verify jobs
-#     because they are in the same run's dependency graph.
+#   * PAT in a secret - no longer helps: with no bypass actors, a ruleset
+#     applies to a human PAT exactly as it applies to GITHUB_TOKEN.
+#   * Bypass actor for the Actions app - not available on a user-owned repo;
+#     GitHub requires the app to belong to an owning organisation.
+#   * Auto-bump via a PR opened by CI - possible, but it makes every release a
+#     two-merge dance for no real gain over editing the version in the PR that
+#     is being released.
+#   * CHOSEN: version lives in main, CI only tags it. Zero secrets, zero
+#     bypasses, and the release is gated on the same CI everything else is.
 name: Release
 
 on:
@@ -61,28 +70,28 @@ jobs:
     permissions:
       contents: read
 
-  bump-version:
-    name: Bump Version
+  tag-release:
+    name: Tag Release
     needs: [ verify ]
     runs-on: ubuntu-latest
-    # Two guards:
-    #   * `github.ref == 'refs/heads/main'` - without it, anyone able to run
-    #     workflow_dispatch could pick a feature branch or a tag from the ref
-    #     picker and publish unmerged code as a release. (A dispatch from a tag
-    #     would also fail at `git push origin HEAD:$GITHUB_REF`.)
-    #   * the head-commit check - skip if the head commit is itself a bump
-    #     commit. Pushes made with GITHUB_TOKEN do not re-trigger this workflow,
-    #     but a maintainer pushing a bump commit by hand (or with a PAT) would.
-    if: >-
-      github.ref == 'refs/heads/main' &&
-      (github.event_name == 'workflow_dispatch' ||
-       !startsWith(github.event.head_commit.message, 'chore: bump version to'))
+    # `main` is protected by a repository ruleset with NO bypass actors, so
+    # nothing -- not GITHUB_TOKEN, not a maintainer PAT -- can push a commit
+    # straight to it. This job therefore does NOT bump or commit anything.
+    #
+    # The version is whatever `app/__version__.py` says on main, which means it
+    # changes in a reviewed pull request like any other code. When main carries
+    # a version with no matching tag, this job creates that tag. Tags are not
+    # covered by the branch ruleset, so pushing one is allowed.
+    #
+    # The ref guard stays: without it a workflow_dispatch against a feature
+    # branch could tag and publish unmerged code as a release.
+    if: github.ref == 'refs/heads/main'
     permissions:
       contents: write
     outputs:
-      version: ${{ steps.new-version.outputs.version }}
-      changed: ${{ steps.commit.outputs.changed }}
-      tag: ${{ steps.commit.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      changed: ${{ steps.release.outputs.changed }}
+      tag: ${{ steps.release.outputs.tag }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -94,44 +103,33 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Increment version
-        run: python scripts/increment_version.py patch
-
-      - name: Read new version
-        id: new-version
-        run: |
-          VERSION=$(python -c "from app.__version__ import __version__; print(__version__)")
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Version bumped to $VERSION"
-
-      - name: Commit and tag version bump
-        id: commit
+      - name: Tag this version if it is new
+        id: release
         run: |
           set -euo pipefail
-          VERSION='${{ steps.new-version.outputs.version }}'
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add app/__version__.py
-          if git diff --cached --quiet; then
-            echo "No version change; nothing to release."
+          VERSION=$(python -c "from app.__version__ import __version__; print(__version__)")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version on main: $VERSION"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+            echo "Tag v${VERSION} already exists; nothing to release."
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" >/dev/null 2>&1; then
-            echo "::error::Tag v${VERSION} already exists on origin"
-            exit 1
-          fi
-          git commit -m "chore: bump version to v${VERSION}"
+
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
           git tag -a "v${VERSION}" -m "Release v${VERSION}"
-          git push origin "HEAD:${GITHUB_REF}"
           git push origin "refs/tags/v${VERSION}"
+
           echo "changed=true" >> "$GITHUB_OUTPUT"
           echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Tagged v${VERSION}"
 
   publish:
     name: Publish Release
-    needs: [ verify, bump-version ]
-    if: needs.bump-version.outputs.changed == 'true'
+    needs: [ verify, tag-release ]
+    if: needs.tag-release.outputs.changed == 'true'
     runs-on: ubuntu-latest
     # DOCKERHUB_USERNAME / DOCKERHUB_TOKEN are ENVIRONMENT secrets on
     # "production", not repository secrets. A job that does not declare the
@@ -144,8 +142,8 @@ jobs:
       packages: write
       id-token: write   # required for keyless cosign signing
     env:
-      VERSION: ${{ needs.bump-version.outputs.version }}
-      TAG: ${{ needs.bump-version.outputs.tag }}
+      VERSION: ${{ needs.tag-release.outputs.version }}
+      TAG: ${{ needs.tag-release.outputs.tag }}
     steps:
       # Check out the TAG the bump job just pushed, not the pre-bump SHA that
       # triggered this run - otherwise the published image would not contain the
@@ -153,7 +151,7 @@ jobs:
       - name: Checkout the tagged commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.bump-version.outputs.tag }}
+          ref: ${{ needs.tag-release.outputs.tag }}
           fetch-depth: 0
 
       - name: Set up Docker Buildx
