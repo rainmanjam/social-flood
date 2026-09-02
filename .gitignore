@@ -112,3 +112,10 @@ nltk_data/
 
 # Scratch output
 test_output.txt
+
+# Agent / code-intelligence tool output (session-local, not project state)
+.claude/
+.serena/
+.gitnexus/
+graphify-out/
+AGENTS.md
