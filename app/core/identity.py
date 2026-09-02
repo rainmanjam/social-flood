@@ -18,16 +18,16 @@ secret the attacker does not have is both fast and not precomputable, which is
 exactly the property needed.
 
 If ``SECRET_KEY`` is unset, this falls back to a **process-random** salt rather
-than to an unkeyed digest, so there is never a brute-forceable path.
+than to an unkeyed digest, so there is never a brute-forceable path. The
+trade-off is that identifiers are then not stable across restarts. That is
+acceptable because it only arises in development: the application refuses to
+start in production on a missing or default ``SECRET_KEY``.
 
 CodeQL alert 513 (``py/weak-sensitive-data-hashing``) flags the HMAC call below
 and is dismissed as "won't fix" for the reason above: that rule targets
 password *storage*, where slowness is the defence. Revisit that decision if
 this function is ever used to store a user-chosen password -- there a KDF
-would be the correct tool. The
-trade-off is that identifiers are then not stable across restarts. That is
-acceptable because it only arises in development: the application refuses to
-start in production on a missing or default ``SECRET_KEY``.
+would be the correct tool.
 """
 
 from __future__ import annotations
