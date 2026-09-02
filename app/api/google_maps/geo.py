@@ -193,17 +193,24 @@ async def geocode_get(
         rate_limit_check=rate_limit_check
     )
 
-    if result.get("results"):
+    # batch_geocode returns one entry PER ADDRESS, and a failed address is
+    # still an entry -- so `result["results"]` is truthy even when the single
+    # address failed. Checking only for the list's presence reported
+    # "success": True while wrapping {"success": False, "error": ...}.
+    entries = result.get("results") or []
+    first = entries[0] if entries else None
+
+    if first is not None and first.get("success", True):
         return {
             "success": True,
             "address": address,
-            "result": result["results"][0],
+            "result": first,
             "timestamp": datetime.now().isoformat()
         }
     else:
         return {
             "success": False,
             "address": address,
-            "error": "Geocoding failed",
+            "error": (first or {}).get("error", "Geocoding failed"),
             "timestamp": datetime.now().isoformat()
         }

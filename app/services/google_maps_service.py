@@ -761,6 +761,7 @@ class GoogleMapsService:
 
             all_results = {}
             grid_data = []
+            failed_points = 0
 
             logger.info(f"Starting grid search: {query} with {len(grid_coords)} grid points")
 
@@ -779,9 +780,28 @@ class GoogleMapsService:
                     )
 
                     results_count = 0
-                    if not result.get("error"):
+                    point = {
+                        "grid_index": idx,
+                        "lat": lat,
+                        "lng": lng,
+                        "results_count": 0,
+                    }
+
+                    if result.get("error"):
+                        # A failing point used to leave results_count at 0 with
+                        # nothing recorded, so a grid where every point failed
+                        # was indistinguishable from a grid that genuinely
+                        # found nothing.
+                        failed_points += 1
+                        point["error"] = "search failed for this grid point"
+                        logger.warning(
+                            "Grid point %s (%s, %s) returned an error: %s",
+                            idx, lat, lng, result.get("message", "unknown"),
+                        )
+                    else:
                         places = result.get("results", [])
                         results_count = len(places)
+                        point["results_count"] = results_count
 
                         # Dedupe by place_id
                         for place in places:
@@ -792,14 +812,10 @@ class GoogleMapsService:
                             elif place_id:
                                 all_results[place_id]["grid_positions"].append(idx)
 
-                    grid_data.append({
-                        "grid_index": idx,
-                        "lat": lat,
-                        "lng": lng,
-                        "results_count": results_count
-                    })
+                    grid_data.append(point)
 
                 except Exception as e:
+                    failed_points += 1
                     logger.warning(f"Grid point {idx} ({lat}, {lng}) failed: {e}")
                     grid_data.append({
                         "grid_index": idx,
@@ -809,8 +825,25 @@ class GoogleMapsService:
                         "error": str(e)
                     })
 
+            # Every point failing is an outage, not an empty neighbourhood.
+            # Returning success with places: [] here is the same class of bug
+            # as the fabricated Maps endpoints: a total failure that looks like
+            # a valid negative answer.
+            if grid_coords and failed_points == len(grid_coords):
+                return {
+                    "error": True,
+                    "status_code": 502,
+                    "message": (
+                        f"All {failed_points} grid points failed; no result is "
+                        "available for this area."
+                    ),
+                    "grid_metadata": grid_data,
+                }
+
             return {
                 "success": True,
+                "partial": failed_points > 0,
+                "failed_grid_points": failed_points,
                 "query": query,
                 "center": {"lat": center_lat, "lng": center_lng},
                 "radius_km": radius_km,
