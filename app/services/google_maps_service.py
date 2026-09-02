@@ -88,6 +88,7 @@ class GoogleMapsService:
     async def create_search_job(
         self,
         query: str,
+        owner: str = "anonymous",
         language: str = "en",
         max_results: int = 20,
         depth: int = 1,
@@ -127,7 +128,8 @@ class GoogleMapsService:
                 max_results=max_results,
                 zoom=zoom,
                 geo_coordinates=geo_coordinates,
-                email_extraction=email_extraction
+                email_extraction=email_extraction,
+                owner=owner,
             )
 
             # Store job
@@ -162,7 +164,7 @@ class GoogleMapsService:
                 "message": str(e)
             }
 
-    async def get_job_status(self, job_id: str) -> Dict[str, Any]:
+    async def get_job_status(self, job_id: str, owner: str) -> Dict[str, Any]:
         """
         Get the status of a scraping job.
 
@@ -176,7 +178,10 @@ class GoogleMapsService:
             await self._ensure_initialized()
 
             store = await self._scraper_module.get_job_store()
-            job = await store.get(job_id)
+            # Owner is part of the key: another caller's job is not merely
+            # filtered out, it is unreachable, and reports as 404 rather than
+            # 403 so job ids cannot be enumerated.
+            job = await store.get(owner, job_id)
 
             if not job:
                 return {
@@ -213,6 +218,7 @@ class GoogleMapsService:
     async def get_job_results(
         self,
         job_id: str,
+        owner: str,
         format: str = "json"
     ) -> Dict[str, Any]:
         """
@@ -229,7 +235,7 @@ class GoogleMapsService:
             await self._ensure_initialized()
 
             store = await self._scraper_module.get_job_store()
-            job = await store.get(job_id)
+            job = await store.get(owner, job_id)
 
             if not job:
                 return {
@@ -272,6 +278,7 @@ class GoogleMapsService:
 
     async def list_jobs(
         self,
+        owner: str,
         status: Optional[str] = None,
         limit: int = 50,
         offset: int = 0
@@ -291,7 +298,12 @@ class GoogleMapsService:
             await self._ensure_initialized()
 
             store = await self._scraper_module.get_job_store()
-            jobs = await store.list_all(status=status, limit=limit, offset=offset)
+            # list_all() was deliberately removed from the store: it returned
+            # every tenant's jobs regardless of caller, which was the
+            # vulnerability. Only an owner-scoped listing exists now.
+            jobs = await store.list_for_owner(
+                owner, status=status, limit=limit, offset=offset
+            )
 
             # Return in gosom-compatible format
             return [job.to_dict() for job in jobs]
@@ -303,7 +315,7 @@ class GoogleMapsService:
                 "message": str(e)
             }
 
-    async def delete_job(self, job_id: str) -> Dict[str, Any]:
+    async def delete_job(self, job_id: str, owner: str) -> Dict[str, Any]:
         """
         Delete a job and its results.
 
@@ -317,7 +329,7 @@ class GoogleMapsService:
             await self._ensure_initialized()
 
             store = await self._scraper_module.get_job_store()
-            deleted = await store.delete(job_id)
+            deleted = await store.delete(owner, job_id)
 
             if deleted:
                 return {"success": True, "job_id": job_id}
@@ -338,6 +350,7 @@ class GoogleMapsService:
     async def search_and_wait(
         self,
         query: str,
+        owner: str = "anonymous",
         language: str = "en",
         max_results: int = 20,
         depth: int = 1,
@@ -370,6 +383,7 @@ class GoogleMapsService:
         # Create the job
         job_response = await self.create_search_job(
             query=query,
+            owner=owner,
             language=language,
             max_results=max_results,
             depth=depth,
@@ -392,7 +406,7 @@ class GoogleMapsService:
         # Poll for completion
         elapsed = 0
         while elapsed < timeout:
-            status_response = await self.get_job_status(job_id)
+            status_response = await self.get_job_status(job_id, owner=owner)
 
             if status_response.get("error"):
                 # If it's a real error (not just job not found during creation)
@@ -403,7 +417,7 @@ class GoogleMapsService:
 
             if status == "completed":
                 # Get results
-                return await self.get_job_results(job_id)
+                return await self.get_job_results(job_id, owner=owner)
             elif status == "failed":
                 return {
                     "error": True,
