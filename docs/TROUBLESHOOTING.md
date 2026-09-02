@@ -587,7 +587,7 @@ docker-compose exec db psql -U user -d socialflood -c "SELECT version();"
 
    # Test with different header names
    curl -H "X-API-Key: your_api_key" http://localhost:8000/api/v1/google-news/search?q=test
-   curl -H "Authorization: Bearer your_api_key" http://localhost:8000/api/v1/google-news/search?q=test
+   curl -H "X-API-Key: your_api_key" http://localhost:8000/api/v1/google-news/search?q=test
    ```
 
 3. **Verify API Key Storage**

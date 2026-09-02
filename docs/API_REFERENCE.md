@@ -17,7 +17,7 @@ This document provides comprehensive documentation for all Social Flood API endp
 All API endpoints require authentication using an API key. Include your API key in the request headers:
 
 ```bash
-Authorization: Bearer YOUR_API_KEY
+X-API-Key: YOUR_API_KEY
 ```
 
 ### Obtaining an API Key
@@ -59,7 +59,7 @@ Search for news articles based on keywords, with support for advanced filtering 
 
 ```bash
 curl -X GET "https://api.socialflood.com/api/v1/google-news/search?q=artificial+intelligence&max=20&sort_by=date" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 **Response:**
@@ -99,7 +99,7 @@ Retrieve top news headlines from various categories.
 
 ```bash
 curl -X GET "https://api.socialflood.com/api/v1/google-news/top?category=technology&max=15" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 #### 3. Get News by Topic
@@ -118,7 +118,7 @@ Retrieve news articles filtered by specific topics.
 
 ```bash
 curl -X GET "https://api.socialflood.com/api/v1/google-news/topic?topic=technology&max=20" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 #### 4. Get News by Location
@@ -137,7 +137,7 @@ Retrieve news articles from specific geographic locations.
 
 ```bash
 curl -X GET "https://api.socialflood.com/api/v1/google-news/location?location=united-states&max=15" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 #### 5. Get News by Source
@@ -156,7 +156,7 @@ Retrieve news articles from specific news sources.
 
 ```bash
 curl -X GET "https://api.socialflood.com/api/v1/google-news/source?source=cnn&max=20" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 #### 6. Get Article Details
@@ -174,7 +174,7 @@ Retrieve detailed information about a specific news article.
 
 ```bash
 curl -X GET "https://api.socialflood.com/api/v1/google-news/article-details?url=https://example.com/article" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 ## Google Autocomplete API
@@ -212,7 +212,7 @@ Get Google autocomplete suggestions with support for all available parameters.
 
 ```bash
 curl -X GET "https://api.socialflood.com/api/v1/google-autocomplete/autocomplete?q=python+tutorial&output=chrome&variations=true" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 **Response (Standard Mode):**
@@ -289,7 +289,7 @@ Get interest over time data for specified keywords.
 
 ```bash
 curl -X GET "https://api.socialflood.com/api/v1/google-trends/interest-over-time?keywords=python,javascript&timeframe=today+3-m" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 **Response:**
@@ -325,7 +325,7 @@ Get regional interest data for a keyword.
 
 ```bash
 curl -X GET "https://api.socialflood.com/api/v1/google-trends/interest-by-region?keyword=python&resolution=COUNTRY" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 #### 3. Related Queries
@@ -346,7 +346,7 @@ Get queries related to a keyword.
 
 ```bash
 curl -X GET "https://api.socialflood.com/api/v1/google-trends/related-queries?keyword=python" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 #### 4. Related Topics
@@ -367,7 +367,7 @@ Get topics related to a keyword.
 
 ```bash
 curl -X GET "https://api.socialflood.com/api/v1/google-trends/related-topics?keyword=python" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 #### 5. Trending Now
@@ -384,7 +384,7 @@ Get currently trending searches.
 
 ```bash
 curl -X GET "https://api.socialflood.com/api/v1/google-trends/trending-now?geo=US" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 #### 6. Trending Now by RSS
@@ -401,7 +401,7 @@ Get trending searches with related news articles.
 
 ```bash
 curl -X GET "https://api.socialflood.com/api/v1/google-trends/trending-now-by-rss?geo=US" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 #### 7. Related News by IDs
@@ -419,7 +419,7 @@ Get news articles related to trending topics.
 
 ```bash
 curl -X GET "https://api.socialflood.com/api/v1/google-trends/trending-now-news-by-ids?news_tokens=token1,token2&max_news=5" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 #### 8. Trending Timeline
@@ -437,7 +437,7 @@ Get trending timeline data for keywords.
 
 ```bash
 curl -X GET "https://api.socialflood.com/api/v1/google-trends/trending-now-showcase-timeline?keywords=python&timeframe=past_24h" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 #### 9. Categories
@@ -455,7 +455,7 @@ Search or list Google Trends categories.
 
 ```bash
 curl -X GET "https://api.socialflood.com/api/v1/google-trends/categories?find=technology" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 #### 10. Geolocation Codes
@@ -472,7 +472,7 @@ Search available geolocation codes.
 
 ```bash
 curl -X GET "https://api.socialflood.com/api/v1/google-trends/geo?find=united" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 ## YouTube Transcripts API
@@ -503,7 +503,7 @@ Get transcript for a YouTube video.
 
 ```bash
 curl -X GET "https://api.socialflood.com/api/v1/youtube-transcripts/get-transcript?video_id=dQw4w9WgXcQ&languages=en" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 **Response:**
@@ -543,7 +543,7 @@ List all available transcripts for a video.
 
 ```bash
 curl -X GET "https://api.socialflood.com/api/v1/youtube-transcripts/list-transcripts?video_id=dQw4w9WgXcQ" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 **Response:**
@@ -581,7 +581,7 @@ Translate a transcript to another language.
 
 ```bash
 curl -X GET "https://api.socialflood.com/api/v1/youtube-transcripts/translate-transcript?video_id=dQw4w9WgXcQ&target_language=es" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 #### 4. Batch Get Transcripts
@@ -600,7 +600,7 @@ Get transcripts for multiple videos.
 
 ```bash
 curl -X POST "https://api.socialflood.com/api/v1/youtube-transcripts/batch-get-transcripts?video_ids=dQw4w9WgXcQ,video2&languages=en" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 #### 5. Format Transcript
@@ -619,7 +619,7 @@ Get transcript in different formats.
 
 ```bash
 curl -X GET "https://api.socialflood.com/api/v1/youtube-transcripts/format-transcript?video_id=dQw4w9WgXcQ&format_type=srt" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 **Response (SRT format):**

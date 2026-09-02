@@ -28,7 +28,7 @@ The API is language-agnostic and works with any HTTP client. We provide official
 All API requests require an API key in the header:
 
 ```http
-Authorization: Bearer YOUR_API_KEY
+X-API-Key: YOUR_API_KEY
 ```
 
 ### Is my data secure?
