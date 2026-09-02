@@ -135,8 +135,10 @@ class TestBootFromDocumentedConfig:
         Loading .env.example must not raise.
 
         Before the fix this raised ValidationError (extra_forbidden) for
-        POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, REDIS_PASSWORD,
-        DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD.
+        every key the file ships that is not a Settings field. The POSTGRES_*
+        keys are gone with the database layer, but DATAFORSEO_LOGIN,
+        DATAFORSEO_PASSWORD and REDIS_PASSWORD remain, so extra="ignore" is
+        still genuinely exercised here.
         """
         from app.core.config import Settings
 

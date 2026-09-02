@@ -67,24 +67,19 @@ settings = get_settings()
 # imported, so the endpoint advertised enforcement that did not exist.
 # Rate limiting is owned entirely by app.core.rate_limiter.
 
-# Try to import prometheus client for metrics
+# Metrics. Instrumentator supplies the http_request_* metrics itself; this
+# module deliberately declares none of its own.
+#
+# There used to be module-level Counter("http_requests_total") and
+# Histogram("http_request_duration_seconds") here. Neither was ever
+# incremented -- Instrumentator already publishes equivalents -- but because
+# prometheus_client registers metrics in a process-global CollectorRegistry at
+# construction, importing this module twice raised DuplicateTimeseries and
+# crashed. That stayed hidden only because the packages were undeclared, so
+# the whole block failed at `import` and METRICS_AVAILABLE was always False.
 try:
-    from prometheus_client import Counter, Histogram
     from prometheus_fastapi_instrumentator import Instrumentator
-    
-    # Create metrics
-    REQUESTS_TOTAL = Counter(
-        "http_requests_total",
-        "Total number of HTTP requests",
-        ["method", "endpoint", "status"]
-    )
-    
-    REQUEST_DURATION = Histogram(
-        "http_request_duration_seconds",
-        "HTTP request duration in seconds",
-        ["method", "endpoint"]
-    )
-    
+
     METRICS_AVAILABLE = True
 except ImportError:
     logger.warning("prometheus-client not installed. Metrics will be disabled.")

@@ -53,6 +53,13 @@ redis[hiredis]==8.1.0
 # The dead path was removed rather than fed. Rate limiting is entirely
 # app/core/rate_limiter.py, which has no third-party limiter dependency.
 
+# Metrics. main.py builds an Instrumentator and exposes /metrics (API-key
+# gated), but both packages were undeclared, so every deployment ran with
+# METRICS_AVAILABLE=False -- the README advertised a feature that had never
+# once executed. Declaring them is what makes the documented behaviour real.
+prometheus-client==0.26.0
+prometheus-fastapi-instrumentator==8.1.0
+
 # Utilities
 loguru==0.7.3
 email-validator==2.3.0

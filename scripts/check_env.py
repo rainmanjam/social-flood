@@ -55,7 +55,6 @@ def check_env_variables():
         "ENABLE_CACHE",
         "CACHE_TTL",
         "REDIS_URL",
-        "DATABASE_URL",
         "ENABLE_PROXY",
         "PROXY_URLS",
         "CORS_ORIGINS",
@@ -183,23 +182,6 @@ def check_api_services():
         except Exception as e:
             print_error(f"Redis connection error: {str(e)}")
     
-    # Check database if URL is provided
-    if os.environ.get("DATABASE_URL"):
-        try:
-            import psycopg2
-            parsed = urlparse(os.environ.get("DATABASE_URL"))
-            conn = psycopg2.connect(
-                dbname=parsed.path[1:],
-                user=parsed.username,
-                password=parsed.password,
-                host=parsed.hostname,
-                port=parsed.port or 5432
-            )
-            conn.close()
-            print_success("Database connection is working")
-        except Exception as e:
-            print_error(f"Database connection error: {str(e)}")
-
 def main():
     """Run all checks."""
     print(f"{BOLD}{BLUE}Social Flood Environment Check{RESET}")

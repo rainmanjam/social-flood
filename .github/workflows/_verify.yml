@@ -426,9 +426,10 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Deliberately started with NO env file: `docker --env-file` does not
-      # expand `${VAR}` references, and .env.example uses them (DATABASE_URL,
-      # REDIS_URL). Booting from .env.example is the `boot` job's contract;
+      # Deliberately started with NO env file: `docker --env-file` has
+      # different quoting/expansion rules from python-dotenv, so feeding it
+      # .env.example proves nothing about the app. Booting from .env.example
+      # is the `boot` job's contract;
       # this job's contract is "the shipped image starts and self-reports
       # healthy on its built-in defaults".
       - name: Run container

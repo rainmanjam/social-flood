@@ -243,11 +243,14 @@ class TestMainApplication:
         mock_instrumented_app = MagicMock()
         mock_instrumentator.instrument.return_value = mock_instrumented_app
 
+        # main.py does `from prometheus_fastapi_instrumentator import
+        # Instrumentator`, binding the name into main's namespace, so
+        # patching the source module would not affect what main uses.
         with patch('main.settings', mock_settings), \
              patch('main.configure_exception_handlers'), \
              patch('main.setup_middleware'), \
              patch('main.METRICS_AVAILABLE', True), \
-             patch('prometheus_fastapi_instrumentator.Instrumentator', return_value=mock_instrumentator):
+             patch('main.Instrumentator', return_value=mock_instrumentator):
 
             from main import create_application
             app = create_application()

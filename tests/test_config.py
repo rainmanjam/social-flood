@@ -59,8 +59,6 @@ class TestSettingsDefaults:
         assert test_settings.CACHE_TTL == 3600
         assert test_settings.REDIS_URL is None
 
-        # Database
-        assert test_settings.DATABASE_URL is None
 
         # Proxy settings
         assert test_settings.ENABLE_PROXY is False
@@ -153,7 +151,6 @@ class TestSettingsEnvironmentLoading:
 
     @patch.dict(os.environ, {
         "REDIS_URL": "redis://localhost:6379",
-        "DATABASE_URL": "postgresql://user:pass@localhost/db",
         "PROXY_URL": "http://proxy.example.com:8080"
     })
     def test_settings_from_env_urls(self):
@@ -161,7 +158,6 @@ class TestSettingsEnvironmentLoading:
         test_settings = Settings()
 
         assert str(test_settings.REDIS_URL) == "redis://localhost:6379/0"
-        assert str(test_settings.DATABASE_URL) == "postgresql://user:pass@localhost/db"
         assert test_settings.PROXY_URL == "http://proxy.example.com:8080"
 
     @patch.dict(os.environ, {
@@ -326,7 +322,6 @@ class TestSettingsIntegration:
         "ENVIRONMENT": "production",
         "SECRET_KEY": "a-real-generated-production-secret-key-value",
         "REDIS_URL": "redis://prod-redis:6379",
-        "DATABASE_URL": "postgresql://prod-user:test-pass@prod-db/prod_db"
     })
     def test_production_settings_configuration(self):
         """Test complete production settings configuration."""
@@ -345,7 +340,6 @@ class TestSettingsIntegration:
 
         # URLs
         assert str(test_settings.REDIS_URL) == "redis://prod-redis:6379/0"
-        assert str(test_settings.DATABASE_URL) == "postgresql://prod-user:test-pass@prod-db/prod_db"
 
     def test_settings_immutability(self):
         """Test that settings instances are mutable after creation."""

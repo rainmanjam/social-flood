@@ -7,7 +7,6 @@ from environment variables using Pydantic's BaseSettings.
 import json
 from typing import Annotated, List, Optional, Union
 from pydantic import (
-    PostgresDsn,
     RedisDsn,
     ValidationError,
     field_validator,
@@ -105,8 +104,6 @@ class Settings(BaseSettings):
     CACHE_TTL: int = 3600  # seconds
     REDIS_URL: Optional[RedisDsn] = None
     
-    # Database
-    DATABASE_URL: Optional[PostgresDsn] = None
     
     # Proxy settings
     ENABLE_PROXY: bool = False
@@ -244,7 +241,7 @@ class Settings(BaseSettings):
         "case_sensitive": False,
         "env_file_encoding": "utf-8",
         # Deployment .env files legitimately carry variables this app does not
-        # own (POSTGRES_USER/PASSWORD/DB, REDIS_PASSWORD, DATAFORSEO_*, and
+        # own (REDIS_PASSWORD, DATAFORSEO_*, and
         # anything docker-compose interpolates). Without "ignore",
         # pydantic-settings defaults to "forbid" and the app cannot boot from
         # its own documented .env.example.
