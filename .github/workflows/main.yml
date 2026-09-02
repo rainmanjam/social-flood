@@ -1,27 +1,70 @@
 # .github/workflows/main.yml
-name: CI/CD Pipeline for Social Flood
+#
+# Continuous integration for pull requests, feature branches and the merge
+# queue. All of the real work lives in the reusable workflow _verify.yml, which
+# release.yml also calls - so a release runs exactly the gates a PR runs.
+#
+# WHAT CHANGED AND WHY (CRT-6):
+#   The previous version of this file declared a single `lint` job that
+#   installed flake8 and then never invoked it, on Python 3.8 - a version that
+#   cannot even install this project's pinned dependencies. Every run was green
+#   in ~19 seconds and validated nothing. There was no pytest job anywhere in
+#   the repository.
+name: CI
 
 on:
-  push:
-    branches: [ main ]
   pull_request:
     branches: [ main ]
+    types: [ opened, synchronize, reopened, ready_for_review ]
+
+  # Pushes to main are handled by release.yml, which calls the same reusable
+  # verify workflow before it bumps or publishes anything. Excluding main here
+  # avoids running the whole pipeline twice for one commit.
+  push:
+    branches-ignore: [ main ]
+
+  merge_group:
+    branches: [ main ]
+
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
-  # Linting Job
-  lint:
-    name: Lint Code with Flake8
+  verify:
+    name: Verify
+    uses: ./.github/workflows/_verify.yml
+    permissions:
+      contents: read
+
+  # Single job to point branch protection at. Because it depends on `verify`
+  # and re-checks the result explicitly, it cannot report success when any
+  # underlying job failed, was cancelled, or was skipped.
+  ci-status:
+    name: CI Status
     runs-on: ubuntu-latest
+    needs: [ verify ]
+    if: always()
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v2
-
-      - name: Set up Python
-        uses: actions/setup-python@v2
-        with:
-          python-version: '3.8'
-
-      - name: Install dependencies
+      - name: Report
+        env:
+          VERIFY_RESULT: ${{ needs.verify.result }}
         run: |
-          python -m pip install --upgrade pip
-          pip install flake8
+          {
+            echo "## CI Status"
+            echo ""
+            echo "| Stage | Result |"
+            echo "|-------|--------|"
+            echo "| Verify (lint, test, boot, docker) | ${VERIFY_RESULT} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$VERIFY_RESULT" != "success" ]; then
+            echo "::error::CI failed (verify=${VERIFY_RESULT})"
+            exit 1
+          fi
+          echo "CI passed."

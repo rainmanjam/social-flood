@@ -20,6 +20,7 @@ from datetime import datetime
 
 from app.core.config import get_settings
 from app.core.proxy import ENABLE_PROXY, get_proxy
+from app.core.log_safety import scrub
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,12 @@ class GoogleMapsService:
     This replaces the previous gosom Docker sidecar approach with direct
     browser automation.
     """
+
+    # Seconds to let a Maps page settle after navigation before reading it.
+    # Class attributes rather than literals so tests can drop them to zero
+    # without patching asyncio.sleep out from under the event loop.
+    PAGE_SETTLE_SECONDS = 3
+    DIRECTIONS_SETTLE_SECONDS = 4
 
     def __init__(self):
         """Initialize the service."""
@@ -82,6 +89,7 @@ class GoogleMapsService:
     async def create_search_job(
         self,
         query: str,
+        owner: str = "anonymous",
         language: str = "en",
         max_results: int = 20,
         depth: int = 1,
@@ -121,7 +129,8 @@ class GoogleMapsService:
                 max_results=max_results,
                 zoom=zoom,
                 geo_coordinates=geo_coordinates,
-                email_extraction=email_extraction
+                email_extraction=email_extraction,
+                owner=owner,
             )
 
             # Store job
@@ -140,7 +149,7 @@ class GoogleMapsService:
                 self._scraper_module.run_scrape_job(job, proxy=proxy)
             )
 
-            logger.info(f"Created job {job_id} for query: {query}")
+            logger.info("Created job %s for query: %s", scrub(job_id), scrub(query))
 
             return {
                 "job_id": job_id,
@@ -156,7 +165,7 @@ class GoogleMapsService:
                 "message": str(e)
             }
 
-    async def get_job_status(self, job_id: str) -> Dict[str, Any]:
+    async def get_job_status(self, job_id: str, owner: str) -> Dict[str, Any]:
         """
         Get the status of a scraping job.
 
@@ -170,7 +179,10 @@ class GoogleMapsService:
             await self._ensure_initialized()
 
             store = await self._scraper_module.get_job_store()
-            job = await store.get(job_id)
+            # Owner is part of the key: another caller's job is not merely
+            # filtered out, it is unreachable, and reports as 404 rather than
+            # 403 so job ids cannot be enumerated.
+            job = await store.get(owner, job_id)
 
             if not job:
                 return {
@@ -207,6 +219,7 @@ class GoogleMapsService:
     async def get_job_results(
         self,
         job_id: str,
+        owner: str,
         format: str = "json"
     ) -> Dict[str, Any]:
         """
@@ -223,7 +236,7 @@ class GoogleMapsService:
             await self._ensure_initialized()
 
             store = await self._scraper_module.get_job_store()
-            job = await store.get(job_id)
+            job = await store.get(owner, job_id)
 
             if not job:
                 return {
@@ -266,6 +279,7 @@ class GoogleMapsService:
 
     async def list_jobs(
         self,
+        owner: str,
         status: Optional[str] = None,
         limit: int = 50,
         offset: int = 0
@@ -285,7 +299,12 @@ class GoogleMapsService:
             await self._ensure_initialized()
 
             store = await self._scraper_module.get_job_store()
-            jobs = await store.list_all(status=status, limit=limit, offset=offset)
+            # list_all() was deliberately removed from the store: it returned
+            # every tenant's jobs regardless of caller, which was the
+            # vulnerability. Only an owner-scoped listing exists now.
+            jobs = await store.list_for_owner(
+                owner, status=status, limit=limit, offset=offset
+            )
 
             # Return in gosom-compatible format
             return [job.to_dict() for job in jobs]
@@ -297,7 +316,7 @@ class GoogleMapsService:
                 "message": str(e)
             }
 
-    async def delete_job(self, job_id: str) -> Dict[str, Any]:
+    async def delete_job(self, job_id: str, owner: str) -> Dict[str, Any]:
         """
         Delete a job and its results.
 
@@ -311,7 +330,7 @@ class GoogleMapsService:
             await self._ensure_initialized()
 
             store = await self._scraper_module.get_job_store()
-            deleted = await store.delete(job_id)
+            deleted = await store.delete(owner, job_id)
 
             if deleted:
                 return {"success": True, "job_id": job_id}
@@ -332,6 +351,7 @@ class GoogleMapsService:
     async def search_and_wait(
         self,
         query: str,
+        owner: str = "anonymous",
         language: str = "en",
         max_results: int = 20,
         depth: int = 1,
@@ -364,6 +384,7 @@ class GoogleMapsService:
         # Create the job
         job_response = await self.create_search_job(
             query=query,
+            owner=owner,
             language=language,
             max_results=max_results,
             depth=depth,
@@ -386,7 +407,7 @@ class GoogleMapsService:
         # Poll for completion
         elapsed = 0
         while elapsed < timeout:
-            status_response = await self.get_job_status(job_id)
+            status_response = await self.get_job_status(job_id, owner=owner)
 
             if status_response.get("error"):
                 # If it's a real error (not just job not found during creation)
@@ -397,7 +418,7 @@ class GoogleMapsService:
 
             if status == "completed":
                 # Get results
-                return await self.get_job_results(job_id)
+                return await self.get_job_results(job_id, owner=owner)
             elif status == "failed":
                 return {
                     "error": True,
@@ -755,8 +776,12 @@ class GoogleMapsService:
 
             all_results = {}
             grid_data = []
+            failed_points = 0
 
-            logger.info(f"Starting grid search: {query} with {len(grid_coords)} grid points")
+            logger.info(
+                    "Starting grid search: %s with %d grid points",
+                    scrub(query), len(grid_coords),
+                )
 
             for idx, (lat, lng) in enumerate(grid_coords):
                 try:
@@ -773,9 +798,28 @@ class GoogleMapsService:
                     )
 
                     results_count = 0
-                    if not result.get("error"):
+                    point = {
+                        "grid_index": idx,
+                        "lat": lat,
+                        "lng": lng,
+                        "results_count": 0,
+                    }
+
+                    if result.get("error"):
+                        # A failing point used to leave results_count at 0 with
+                        # nothing recorded, so a grid where every point failed
+                        # was indistinguishable from a grid that genuinely
+                        # found nothing.
+                        failed_points += 1
+                        point["error"] = "search failed for this grid point"
+                        logger.warning(
+                            "Grid point %s (%s, %s) returned an error: %s",
+                            idx, lat, lng, result.get("message", "unknown"),
+                        )
+                    else:
                         places = result.get("results", [])
                         results_count = len(places)
+                        point["results_count"] = results_count
 
                         # Dedupe by place_id
                         for place in places:
@@ -786,14 +830,10 @@ class GoogleMapsService:
                             elif place_id:
                                 all_results[place_id]["grid_positions"].append(idx)
 
-                    grid_data.append({
-                        "grid_index": idx,
-                        "lat": lat,
-                        "lng": lng,
-                        "results_count": results_count
-                    })
+                    grid_data.append(point)
 
                 except Exception as e:
+                    failed_points += 1
                     logger.warning(f"Grid point {idx} ({lat}, {lng}) failed: {e}")
                     grid_data.append({
                         "grid_index": idx,
@@ -803,8 +843,25 @@ class GoogleMapsService:
                         "error": str(e)
                     })
 
+            # Every point failing is an outage, not an empty neighbourhood.
+            # Returning success with places: [] here is the same class of bug
+            # as the fabricated Maps endpoints: a total failure that looks like
+            # a valid negative answer.
+            if grid_coords and failed_points == len(grid_coords):
+                return {
+                    "error": True,
+                    "status_code": 502,
+                    "message": (
+                        f"All {failed_points} grid points failed; no result is "
+                        "available for this area."
+                    ),
+                    "grid_metadata": grid_data,
+                }
+
             return {
                 "success": True,
+                "partial": failed_points > 0,
+                "failed_grid_points": failed_points,
                 "query": query,
                 "center": {"lat": center_lat, "lng": center_lng},
                 "radius_km": radius_km,
@@ -958,10 +1015,16 @@ class GoogleMapsService:
         include_owner_responses: bool = True
     ) -> Dict[str, Any]:
         """
-        Get reviews for a place.
+        Get the sample of reviews rendered on the place panel.
 
-        Currently returns reviews from the main place data.
-        Full pagination would require additional scraping.
+        The panel renders a sample, not the full review set, so ``limit``,
+        ``offset`` and ``min_rating`` are applied *to that sample* and
+        ``filters_applied`` says exactly which of the requested parameters
+        actually took effect. ``sort_by`` and ``include_owner_responses``
+        cannot be applied -- the panel's order is Google's and owner responses
+        are not separable from the review text we scrape -- so they are
+        reported as not applied rather than silently ignored, which would let a
+        caller believe they received a sorted, filtered page.
         """
         try:
             await self._ensure_initialized()
@@ -974,14 +1037,50 @@ class GoogleMapsService:
 
             place = place_result.get("place", {})
 
+            # None, not 0, when Google did not render a count: "we could not
+            # read the total" is not "this place has no reviews".
+            total_reviews = place.get("review_count")
+            sample = place.get("reviews") or []
+
+            if min_rating is not None:
+                sample = [
+                    r for r in sample
+                    if isinstance(r, dict) and (r.get("rating") or 0) >= min_rating
+                ]
+            sample_size_before_paging = len(sample)
+            sample = sample[offset : offset + limit]
+
             return {
-                "total_reviews": place.get("review_count") or 0,
+                "total_reviews": total_reviews,
                 "average_rating": place.get("rating"),
-                "reviews": place.get("reviews") or [],
+                "reviews": sample,
+                "filters_applied": {
+                    "limit": True,
+                    "offset": True,
+                    "min_rating": min_rating is not None,
+                    # Named explicitly so the caller knows these did nothing.
+                    "sort_by": False,
+                    "include_owner_responses": False,
+                },
+                "sample_size": sample_size_before_paging,
                 "review_summary": place.get("review_summary"),
                 "review_topics": place.get("review_topics"),
-                "has_more": False,
-                "message": "Full review pagination requires place-specific scraping"
+                # Honest: the place panel renders only a sample of reviews, so
+                # "has_more" is whether the sample is smaller than the count
+                # Google reports -- not a flat False that claims we returned
+                # every review. None where the count is unknown, because then
+                # we genuinely cannot tell.
+                "has_more": (
+                    None if total_reviews is None
+                    else (offset + len(sample)) < min(total_reviews, sample_size_before_paging)
+                    or sample_size_before_paging < total_reviews
+                ),
+                "message": (
+                    "Reviews are the sample rendered on the place panel, not the full "
+                    "review set. limit/offset/min_rating were applied to that sample; "
+                    "sort_by and include_owner_responses could not be applied. See "
+                    "filters_applied."
+                ),
             }
 
         except Exception as e:
@@ -1040,6 +1139,67 @@ class GoogleMapsService:
             logger.error(f"Get photos error: {e}")
             return {"error": True, "message": str(e)}
 
+    # Candidate selectors for the Q&A block, tried in order. A miss on all of
+    # them is reported as "not rendered", never as "no questions".
+    _QA_SECTION_SELECTORS = (
+        'div[aria-label*="Questions and answers"]',
+        'div[jsaction*="questions"]',
+    )
+    _QA_ITEM_SELECTORS = (
+        'div[aria-label*="Questions and answers"] div[role="listitem"]',
+        'div[jsaction*="pane.question"]',
+    )
+    _QA_ANSWER_SELECTORS = (
+        'div[jsaction*="pane.answer"]',
+        'div[role="listitem"] div[role="listitem"]',
+    )
+
+    async def _extract_place_qa(
+        self,
+        page,
+        limit: int,
+        include_answers: bool
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Read the Q&A entries on a place page.
+
+        Returns None when no Q&A section was rendered at all, which is
+        different from ``[]`` (a section with no questions in it).
+        """
+        section_present = False
+        for selector in self._QA_SECTION_SELECTORS:
+            if await page.query_selector(selector):
+                section_present = True
+                break
+
+        nodes = []
+        for selector in self._QA_ITEM_SELECTORS:
+            nodes = await page.query_selector_all(selector)
+            if nodes:
+                break
+
+        if not nodes and not section_present:
+            return None
+
+        questions: List[Dict[str, Any]] = []
+        for node in nodes[:limit]:
+            text = " ".join(((await node.inner_text()) or "").split())
+            if not text:
+                continue
+            entry: Dict[str, Any] = {"question": text}
+            if include_answers:
+                answers: List[str] = []
+                for selector in self._QA_ANSWER_SELECTORS:
+                    answer_nodes = await node.query_selector_all(selector)
+                    if answer_nodes:
+                        for answer_node in answer_nodes:
+                            answer_text = " ".join(((await answer_node.inner_text()) or "").split())
+                            if answer_text:
+                                answers.append(answer_text)
+                        break
+                entry["answers"] = answers
+            questions.append(entry)
+        return questions
+
     async def get_place_qa(
         self,
         place_id: str,
@@ -1047,24 +1207,82 @@ class GoogleMapsService:
         include_answers: bool = True
     ) -> Dict[str, Any]:
         """
-        Get Q&A for a place.
+        Get Q&A for a place by scraping the questions rendered on its page.
 
-        Note: Q&A extraction requires navigating to the Q&A tab.
-        Currently returns placeholder - full implementation would need
-        additional scraping logic.
+        This previously returned ``total_questions: 0, questions: []`` for
+        every place without looking at anything -- the same
+        empty-success-as-fact bug as the monitor and menu endpoints. The
+        outcomes are now distinct in ``qa_status``:
+
+        - ``scraped`` -- questions were rendered and read.
+        - ``no_questions`` -- a Q&A section was found and no questions were
+          read from it. The nearest thing to a real "nobody has asked
+          anything" this page supports.
+        - ``not_rendered`` -- Google rendered no Q&A section for this place, so
+          nothing is known either way. Not the same as "no questions".
+
+        Args:
+            place_id: Place whose Q&A is wanted.
+            limit: Maximum questions to return.
+            include_answers: Include each question's answers.
         """
-        try:
-            await self._ensure_initialized()
+        await self._ensure_initialized()
 
+        place_result = await self.get_place_by_id(place_id)
+        if place_result.get("error"):
+            return place_result
+
+        place = place_result.get("place") or {}
+        place_url = place.get("google_maps_url") or f"https://www.google.com/maps/place/?q=place_id:{place_id}"
+
+        from app.services.google_maps_scraper import GoogleMapsScraper
+
+        proxy = None
+        if ENABLE_PROXY:
+            proxy = await get_proxy()
+
+        scraper = GoogleMapsScraper(proxy=proxy, headless=True)
+        try:
+            page, context = await scraper._create_page("en")
+            try:
+                await page.goto(place_url, wait_until="domcontentloaded", timeout=60000)
+                await asyncio.sleep(self.PAGE_SETTLE_SECONDS)
+                questions = await self._extract_place_qa(page, limit, include_answers)
+            finally:
+                await context.close()
+        except Exception as e:
+            logger.error(
+                    "Q&A scrape failed for %s: %s", scrub(place_id), scrub(e),
+                    exc_info=True,
+                )
             return {
-                "total_questions": 0,
+                "error": True,
+                "status_code": 502,
+                "message": f"Could not load the place page to read its Q&A: {e}",
+            }
+        finally:
+            await scraper.close()
+
+        if questions is None:
+            return {
+                # None, not 0: a count of zero alongside "we could not see the
+                # section" contradicts itself, and 0 is the half a client reads.
+                "total_questions": None,
                 "questions": [],
-                "message": "Q&A extraction requires dedicated scraping implementation"
+                "qa_status": "not_rendered",
+                "message": (
+                    "No questions-and-answers section was found on this place's page, "
+                    "so it is unknown whether any questions exist. This is not a count "
+                    "of zero."
+                ),
             }
 
-        except Exception as e:
-            logger.error(f"Get Q&A error: {e}")
-            return {"error": True, "message": str(e)}
+        return {
+            "total_questions": len(questions),
+            "questions": questions,
+            "qa_status": "scraped" if questions else "no_questions",
+            "source": "google_maps_scrape",
+        }
 
     async def autocomplete(
         self,
@@ -1297,81 +1515,347 @@ class GoogleMapsService:
             logger.error(f"Competitor analysis error: {e}")
             return {"error": True, "message": str(e)}
 
+    # =========================================================================
+    # Monitors and webhooks
+    #
+    # These delegate to app.services.google_maps_monitors, which owns the
+    # durable owner-scoped storage and the background scheduler. The service
+    # layer only translates between the API's api_key and the store's owner id,
+    # and between exceptions and the error dicts the router expects.
+    # =========================================================================
+
+    @staticmethod
+    def _owner(api_key: Optional[str]) -> str:
+        """Map an API key to the storage owner id."""
+        from app.services.google_maps_monitors import owner_id_for_api_key
+
+        return owner_id_for_api_key(api_key)
+
     async def create_monitor(
         self,
         place_id: Optional[str] = None,
         url: Optional[str] = None,
         webhook_url: Optional[str] = None,
         check_interval_hours: int = 24,
-        track_fields: List[str] = None
+        track_fields: List[str] = None,
+        api_key: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Create a monitor for a place.
 
-        Note: Full implementation would require background task scheduling
-        and persistent storage.
+        The monitor is persisted and scheduled before this returns, so the
+        reported ``status`` describes durable state: a subsequent
+        :meth:`get_monitor` on the returned id finds it. Previously this
+        returned ``status: "active"`` for a monitor that was never stored.
+
+        Args:
+            place_id: Place to monitor (one of place_id/url required).
+            url: Google Maps URL to monitor.
+            webhook_url: Optional notification target, SSRF-validated.
+            check_interval_hours: Hours between checks.
+            track_fields: Fields to watch; defaults to a standard set.
+            api_key: Caller's API key; scopes the monitor to that owner.
+
+        Returns:
+            The stored monitor, or an error dict.
         """
+        from app.services import google_maps_monitors as monitors
+
         try:
-            await self._ensure_initialized()
-
-            import uuid
-            from datetime import timedelta
-
-            monitor_id = str(uuid.uuid4())
-
-            return {
-                "monitor_id": monitor_id,
-                "place_id": place_id,
-                "status": "active",
-                "next_check": (datetime.now() + timedelta(hours=check_interval_hours)).isoformat(),
-                "message": "Monitor created. Note: Full monitoring requires background scheduler."
-            }
-
-        except Exception as e:
-            logger.error(f"Create monitor error: {e}")
-            return {"error": True, "message": str(e)}
+            return await monitors.create_monitor(
+                owner=self._owner(api_key),
+                place_id=place_id,
+                url=url,
+                webhook_url=webhook_url,
+                check_interval_hours=check_interval_hours,
+                track_fields=track_fields,
+            )
+        except monitors.InvalidWebhookTarget as e:
+            logger.warning(f"Monitor rejected: {e.reason}")
+            return {"error": True, "status_code": 400, "message": e.public_message}
+        except ValueError as e:
+            return {"error": True, "status_code": 400, "message": str(e)}
 
     async def list_monitors(
         self,
         status: Optional[str] = None,
         limit: int = 50,
-        offset: int = 0
+        offset: int = 0,
+        api_key: Optional[str] = None
     ) -> Dict[str, Any]:
-        """List all monitors."""
-        return {"monitors": [], "total": 0, "message": "Monitor storage not implemented"}
+        """List this caller's monitors. Never returns another caller's."""
+        from app.services import google_maps_monitors as monitors
+
+        return await monitors.list_monitors(
+            owner=self._owner(api_key), status=status, limit=limit, offset=offset
+        )
 
     async def get_monitor(
         self,
         monitor_id: str,
-        include_history: bool = True
+        include_history: bool = True,
+        api_key: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Get monitor details."""
-        return {"error": True, "status_code": 404, "message": "Monitor not found"}
+        """Get one monitor, including its recorded snapshot history."""
+        from app.services import google_maps_monitors as monitors
 
-    async def delete_monitor(self, monitor_id: str) -> Dict[str, Any]:
-        """Delete a monitor."""
-        return {"error": True, "status_code": 404, "message": "Monitor not found"}
+        try:
+            monitor = await monitors.get_monitor(
+                owner=self._owner(api_key),
+                monitor_id=monitor_id,
+                include_history=include_history,
+            )
+        except monitors.MonitorNotFound:
+            return {"error": True, "status_code": 404, "message": "Monitor not found"}
+        return {"monitor": monitor}
+
+    async def delete_monitor(
+        self,
+        monitor_id: str,
+        api_key: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Delete one of this caller's monitors."""
+        from app.services import google_maps_monitors as monitors
+
+        try:
+            await monitors.delete_monitor(owner=self._owner(api_key), monitor_id=monitor_id)
+        except monitors.MonitorNotFound:
+            return {"error": True, "status_code": 404, "message": "Monitor not found"}
+        return {"deleted": True, "monitor_id": monitor_id}
+
+    async def check_monitor_now(
+        self,
+        monitor_id: str,
+        api_key: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Run one monitor check immediately, outside the schedule."""
+        from app.services import google_maps_monitors as monitors
+
+        try:
+            return await monitors.check_monitor(
+                owner=self._owner(api_key), monitor_id=monitor_id
+            )
+        except monitors.MonitorNotFound:
+            return {"error": True, "status_code": 404, "message": "Monitor not found"}
 
     async def register_webhook(
         self,
         url: str,
         events: List[str],
-        secret: Optional[str] = None
+        secret: Optional[str] = None,
+        api_key: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Register a webhook."""
-        import uuid
+        """
+        Register a webhook that is actually delivered to.
+
+        The target is SSRF-validated here and again before every delivery.
+        Deliveries are HMAC-SHA256 signed with the returned secret, which is
+        shown once and never echoed by :meth:`list_webhooks`.
+        """
+        from app.services import google_maps_monitors as monitors
+
+        try:
+            return await monitors.register_webhook(
+                owner=self._owner(api_key), url=url, events=events, secret=secret
+            )
+        except monitors.InvalidWebhookTarget as e:
+            logger.warning(f"Webhook target rejected: {e.reason}")
+            return {"error": True, "status_code": 400, "message": e.public_message}
+        except ValueError as e:
+            return {"error": True, "status_code": 400, "message": str(e)}
+
+    async def list_webhooks(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        api_key: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """List this caller's webhooks with their real delivery counters."""
+        from app.services import google_maps_monitors as monitors
+
+        return await monitors.list_webhooks(
+            owner=self._owner(api_key), limit=limit, offset=offset
+        )
+
+    async def delete_webhook(
+        self,
+        webhook_id: str,
+        api_key: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Delete one of this caller's webhooks."""
+        from app.services import google_maps_monitors as monitors
+
+        try:
+            await monitors.delete_webhook(owner=self._owner(api_key), webhook_id=webhook_id)
+        except monitors.WebhookNotFound:
+            return {"error": True, "status_code": 404, "message": "Webhook not found"}
+        return {"deleted": True, "webhook_id": webhook_id}
+
+    # =========================================================================
+    # Directions
+    # =========================================================================
+
+    # Travel modes Google Maps accepts in the `travelmode` URL parameter.
+    TRAVEL_MODES = ("driving", "walking", "bicycling", "transit")
+
+    # Candidate selectors for a route card in the directions pane, tried in
+    # order. Google rewrites its class names regularly, so relying on a single
+    # selector guarantees a silent breakage; a miss on all of them is reported
+    # as a scrape failure rather than papered over.
+    _ROUTE_SELECTORS = (
+        'div[id^="section-directions-trip-"]',
+        "div[data-trip-index]",
+        'div[role="radiogroup"] > div[role="radio"]',
+    )
+
+    _STEP_SELECTORS = (
+        'div[class*="directions-mode-step"]',
+        'div[jsaction*="directions.step"]',
+        'div[id^="section-directions-trip-"] div[role="listitem"]',
+    )
+
+    # Metres per unit, for normalising whatever unit Google renders.
+    _DISTANCE_UNITS = {
+        "km": 1000.0,
+        "m": 1.0,
+        "mi": 1609.344,
+        "ft": 0.3048,
+    }
+
+    @staticmethod
+    def _format_duration(seconds: Optional[int]) -> Optional[str]:
+        """Render a duration in seconds as '1 hr 24 min'."""
+        if not seconds:
+            return None
+        hours, remainder = divmod(int(seconds), 3600)
+        minutes = remainder // 60
+        if hours and minutes:
+            return f"{hours} hr {minutes} min"
+        if hours:
+            return f"{hours} hr"
+        return f"{minutes} min"
+
+    @staticmethod
+    def _parse_duration(text: str) -> Optional[int]:
+        """Parse '1 hr 24 min' / '35 min' / '2 h' into seconds, or None."""
+        import re
+
+        hours = re.search(r"(\d+)\s*(?:hours?|hrs?|h)\b", text, re.IGNORECASE)
+        minutes = re.search(r"(\d+)\s*(?:minutes?|mins?|min)\b", text, re.IGNORECASE)
+        days = re.search(r"(\d+)\s*(?:days?|d)\b", text, re.IGNORECASE)
+        if not (hours or minutes or days):
+            return None
+        total = 0
+        if days:
+            total += int(days.group(1)) * 86400
+        if hours:
+            total += int(hours.group(1)) * 3600
+        if minutes:
+            total += int(minutes.group(1)) * 60
+        return total or None
+
+    @classmethod
+    def _parse_distance(cls, text: str) -> Optional[Tuple[str, float]]:
+        """Parse '12.4 km' / '850 m' / '3.1 mi' into (label, metres), or None."""
+        import re
+
+        match = re.search(
+            r"(\d[\d,]*(?:\.\d+)?)\s*(km|mi|ft|m)\b",
+            text,
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+        try:
+            value = float(match.group(1).replace(",", ""))
+        except ValueError:
+            return None
+        unit = match.group(2).lower()
+        factor = cls._DISTANCE_UNITS.get(unit)
+        if factor is None:
+            return None
+        return match.group(0).strip(), value * factor
+
+    @classmethod
+    def _parse_route_card(cls, text: str) -> Optional[Dict[str, Any]]:
+        """Turn a route card's rendered text into a route, or None if it is not one.
+
+        Returns None when neither a duration nor a distance is present, which
+        is how a non-route element that happened to match a selector is
+        rejected instead of being emitted as a route with null fields.
+        """
+        cleaned = " ".join(text.split())
+        if not cleaned:
+            return None
+
+        duration_seconds = cls._parse_duration(cleaned)
+        distance = cls._parse_distance(cleaned)
+        if duration_seconds is None and distance is None:
+            return None
+
+        # The summary is the "via ..." line Google renders for each route.
+        summary = None
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.lower().startswith("via "):
+                summary = stripped
+                break
+
         return {
-            "webhook_id": str(uuid.uuid4()),
-            "message": "Webhook registered. Note: Full webhook delivery requires background processing."
+            "summary": summary,
+            "distance": distance[0] if distance else None,
+            "distance_meters": round(distance[1]) if distance else None,
+            "duration": cls._format_duration(duration_seconds),
+            "duration_seconds": duration_seconds,
         }
 
-    async def list_webhooks(self) -> Dict[str, Any]:
-        """List registered webhooks."""
-        return {"webhooks": [], "message": "Webhook storage not implemented"}
+    async def _extract_direction_routes(self, page, max_routes: int) -> List[Dict[str, Any]]:
+        """Read the route cards Google rendered. Empty list means none were found."""
+        nodes = []
+        for selector in self._ROUTE_SELECTORS:
+            nodes = await page.query_selector_all(selector)
+            if nodes:
+                break
 
-    async def delete_webhook(self, webhook_id: str) -> Dict[str, Any]:
-        """Delete a webhook."""
-        return {"error": True, "status_code": 404, "message": "Webhook not found"}
+        routes: List[Dict[str, Any]] = []
+        for node in nodes[:max_routes]:
+            text = await node.inner_text()
+            parsed = self._parse_route_card(text or "")
+            if parsed is not None:
+                routes.append(parsed)
+        return routes
+
+    async def _extract_direction_steps(self, page) -> Optional[List[Dict[str, Any]]]:
+        """Read the turn-by-turn steps, or None if Google did not render any.
+
+        None and ``[]`` mean different things and are kept apart: None is "the
+        step list was not present on the page", which the caller reports as
+        ``steps_available: false`` rather than as a route with no turns.
+        """
+        nodes = []
+        for selector in self._STEP_SELECTORS:
+            nodes = await page.query_selector_all(selector)
+            if nodes:
+                break
+        if not nodes:
+            return None
+
+        steps: List[Dict[str, Any]] = []
+        for node in nodes:
+            text = (await node.inner_text()) or ""
+            instruction = " ".join(text.split())
+            if not instruction:
+                continue
+            distance = self._parse_distance(instruction)
+            steps.append(
+                {
+                    "instruction": instruction,
+                    "distance": distance[0] if distance else None,
+                    "distance_meters": round(distance[1]) if distance else None,
+                    "duration_seconds": self._parse_duration(instruction),
+                }
+            )
+        return steps
 
     async def get_directions(
         self,
@@ -1384,86 +1868,201 @@ class GoogleMapsService:
         avoid: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """
-        Get directions between two points.
+        Get directions by scraping the Google Maps directions pane.
 
-        Note: Full implementation would require scraping Google Maps directions
-        or using the Directions API.
+        This previously returned a haversine great-circle distance divided by a
+        hard-coded speed table, presented as a route. That number bore no
+        relation to any road: it ignored roads entirely. It has been removed,
+        and there is deliberately no fallback to it -- a scrape failure returns
+        an error, because a plausible-looking wrong route is worse than no
+        route.
+
+        Args:
+            origin_lat/origin_lng: Start coordinates.
+            destination_lat/destination_lng: End coordinates.
+            mode: One of driving, walking, bicycling, transit.
+            alternatives: Return every route Google offers, not just the first.
+            avoid: Any of tolls, highways, ferries (driving only).
+
+        Returns:
+            ``{"routes": [...], "mode": ..., "source": "google_maps_scrape"}``
+            or an error dict with ``status_code`` 400 or 502.
         """
-        try:
-            await self._ensure_initialized()
+        await self._ensure_initialized()
 
-            # Calculate approximate distance
-            from math import radians, sin, cos, sqrt, atan2
-
-            lat1, lon1 = radians(origin_lat), radians(origin_lng)
-            lat2, lon2 = radians(destination_lat), radians(destination_lng)
-
-            dlat = lat2 - lat1
-            dlon = lon2 - lon1
-
-            a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
-            c = 2 * atan2(sqrt(a), sqrt(1-a))
-            distance_km = 6371 * c
-
-            # Estimate duration based on mode
-            speeds = {"driving": 50, "walking": 5, "bicycling": 15, "transit": 30}
-            speed = speeds.get(mode, 50)
-            duration_hours = distance_km / speed
-
+        mode_key = (mode or "driving").lower()
+        if mode_key not in self.TRAVEL_MODES:
             return {
-                "routes": [{
-                    "summary": f"{mode.title()} route",
-                    "distance": f"{distance_km:.1f} km",
-                    "duration": f"{int(duration_hours * 60)} mins",
-                    "steps": [],
-                    "message": "Approximate calculation. Full directions require Maps Directions API."
-                }]
+                "error": True,
+                "status_code": 400,
+                "message": f"Unsupported travel mode {mode!r}. Expected one of {', '.join(self.TRAVEL_MODES)}.",
             }
 
-        except Exception as e:
-            logger.error(f"Directions error: {e}")
-            return {"error": True, "message": str(e)}
+        url = (
+            "https://www.google.com/maps/dir/?api=1"
+            f"&origin={origin_lat},{origin_lng}"
+            f"&destination={destination_lat},{destination_lng}"
+            f"&travelmode={mode_key}"
+        )
+        if avoid:
+            allowed_avoid = [a for a in avoid if a in ("tolls", "highways", "ferries")]
+            if allowed_avoid:
+                url += "&avoid=" + "|".join(allowed_avoid)
 
-    async def get_streetview(
-        self,
-        place_id: str,
-        width: int = 640,
-        height: int = 480,
-        heading: Optional[int] = None,
-        pitch: Optional[int] = None
-    ) -> Dict[str, Any]:
-        """
-        Get Street View images for a place.
+        from app.services.google_maps_scraper import GoogleMapsScraper
 
-        Note: Full implementation would require Street View API integration.
-        """
+        proxy = None
+        if ENABLE_PROXY:
+            proxy = await get_proxy()
+
+        scraper = GoogleMapsScraper(proxy=proxy, headless=True)
         try:
-            await self._ensure_initialized()
+            page, context = await scraper._create_page("en")
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                await asyncio.sleep(self.DIRECTIONS_SETTLE_SECONDS)
 
-            # Get place to get coordinates
-            place_result = await self.get_place_by_id(place_id)
+                routes = await self._extract_direction_routes(
+                    page, max_routes=5 if alternatives else 1
+                )
+                if not routes:
+                    # No route card was rendered. Could be a consent wall, a
+                    # bot check, a layout change, or genuinely no route between
+                    # these points -- we cannot tell them apart, so we say we
+                    # could not read it rather than inventing a distance.
+                    return {
+                        "error": True,
+                        "status_code": 502,
+                        "message": (
+                            "Could not read a route from Google Maps for these "
+                            "coordinates. No estimate is returned in place of a "
+                            "real route."
+                        ),
+                    }
 
-            if place_result.get("error"):
-                return place_result
+                # Google renders the step list for the *selected* route only.
+                # Attaching it to every alternative would be inventing turns for
+                # routes we never looked at, so alternatives carry no steps and
+                # say so.
+                steps = await self._extract_direction_steps(page)
+                for index, route in enumerate(routes):
+                    if index == 0:
+                        route["steps"] = steps or []
+                        route["steps_available"] = steps is not None
+                    else:
+                        route["steps"] = []
+                        route["steps_available"] = False
 
-            place = place_result.get("place", {})
-
-            if place.get("latitude") and place.get("longitude"):
                 return {
-                    "available": True,
-                    "images": [],
-                    "message": "Street View image URLs require Google Street View API integration"
+                    "routes": routes,
+                    "mode": mode_key,
+                    "source": "google_maps_scrape",
+                    "scraped_at": datetime.now().isoformat(),
                 }
-
-            return {
-                "available": False,
-                "images": [],
-                "message": "Coordinates not available for Street View"
-            }
-
+            finally:
+                await context.close()
         except Exception as e:
-            logger.error(f"Street View error: {e}")
-            return {"error": True, "message": str(e)}
+            logger.error(f"Directions scrape failed: {e}", exc_info=True)
+            return {
+                "error": True,
+                "status_code": 502,
+                "message": f"Directions scrape failed: {e}",
+            }
+        finally:
+            await scraper.close()
+
+    # =========================================================================
+    # Menus
+    # =========================================================================
+
+    # Candidate selectors for a Google-rendered menu item. Tried in order.
+    _MENU_ITEM_SELECTORS = (
+        'div[jsaction*="dish"]',
+        'div[aria-label="Menu"] div[role="listitem"]',
+        'div[role="region"][aria-label*="Menu"] div[role="listitem"]',
+        "div.PZrGGe",
+    )
+
+    _MENU_SECTION_SELECTORS = (
+        'div[role="region"][aria-label*="Menu"]',
+        'div[aria-label="Menu"]',
+        'button[data-tab-index][aria-label*="Menu"]',
+    )
+
+    @staticmethod
+    def _parse_menu_item(text: str, include_prices: bool, include_descriptions: bool) -> Optional[Dict[str, Any]]:
+        """Turn one rendered menu item into a record, or None if it is not one."""
+        import re
+
+        lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+        if not lines:
+            return None
+
+        price = None
+        price_line_index = None
+        price_pattern = re.compile(r"^[^\w]*(?:[$£€¥₹]|USD|EUR|GBP)\s?\d[\d.,]*", re.IGNORECASE)
+        for index, line in enumerate(lines):
+            if price_pattern.search(line):
+                price = line
+                price_line_index = index
+                break
+
+        name = lines[0]
+        if name == price and len(lines) > 1:
+            name = lines[1]
+        if not name:
+            return None
+
+        description = None
+        if include_descriptions:
+            body = [
+                ln
+                for index, ln in enumerate(lines[1:], start=1)
+                if index != price_line_index and ln != name
+            ]
+            if body:
+                description = " ".join(body)
+
+        item: Dict[str, Any] = {"name": name}
+        if include_prices:
+            item["price"] = price
+        if include_descriptions:
+            item["description"] = description
+        return item
+
+    async def _extract_menu_items(
+        self,
+        page,
+        include_prices: bool,
+        include_descriptions: bool
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Read Google's inline menu items.
+
+        Returns None when no menu region was rendered at all -- distinct from
+        ``[]``, which would mean a menu region that contained no items.
+        """
+        section_present = False
+        for selector in self._MENU_SECTION_SELECTORS:
+            if await page.query_selector(selector):
+                section_present = True
+                break
+
+        nodes = []
+        for selector in self._MENU_ITEM_SELECTORS:
+            nodes = await page.query_selector_all(selector)
+            if nodes:
+                break
+
+        if not nodes and not section_present:
+            return None
+
+        items: List[Dict[str, Any]] = []
+        for node in nodes:
+            text = (await node.inner_text()) or ""
+            parsed = self._parse_menu_item(text, include_prices, include_descriptions)
+            if parsed is not None:
+                items.append(parsed)
+        return items
 
     async def extract_menu(
         self,
@@ -1473,34 +2072,124 @@ class GoogleMapsService:
         categorize: bool = True
     ) -> Dict[str, Any]:
         """
-        Extract menu from a place.
+        Extract a place's menu by scraping the menu Google renders.
 
-        Note: Full menu extraction would require navigating to the menu tab
-        and scraping menu items.
+        This previously returned ``{"menu": [], "message": ...}`` for every
+        place, which is indistinguishable from "this place has no menu". The
+        four outcomes are now reported distinctly in ``menu_status``:
+
+        - ``scraped`` -- Google rendered a menu and it was read.
+        - ``no_menu`` -- the place has no menu link and Google rendered no menu
+          section. A legitimately empty result.
+        - ``external_menu_not_scraped`` -- the place's menu lives on a
+          third-party site (the ``menu_link``). We do not scrape arbitrary
+          third-party sites, so the items are *not* available; the link is
+          returned so the caller can follow it. This is not an empty menu.
+        - ``unreadable`` -- a menu section was present but no items could be
+          read from it, i.e. we failed, not the place.
+
+        Args:
+            place_id: Place whose menu is wanted.
+            include_prices: Include a ``price`` field per item.
+            include_descriptions: Include a ``description`` field per item.
+            categorize: Group items under ``categories`` as well as listing them.
+
+        Returns:
+            The menu result, or an error dict on lookup/scrape failure.
         """
+        await self._ensure_initialized()
+
+        place_result = await self.get_place_by_id(place_id)
+        if place_result.get("error"):
+            return place_result
+
+        place = place_result.get("place") or {}
+        menu_link = place.get("menu_link")
+        place_url = place.get("google_maps_url") or f"https://www.google.com/maps/place/?q=place_id:{place_id}"
+
+        from app.services.google_maps_scraper import GoogleMapsScraper
+
+        proxy = None
+        if ENABLE_PROXY:
+            proxy = await get_proxy()
+
+        scraper = GoogleMapsScraper(proxy=proxy, headless=True)
         try:
-            await self._ensure_initialized()
-
-            # Get place to check for menu link
-            place_result = await self.get_place_by_id(place_id)
-
-            if place_result.get("error"):
-                return place_result
-
-            place = place_result.get("place", {})
-            menu_link = place.get("menu_link")
-
+            page, context = await scraper._create_page("en")
+            try:
+                await page.goto(place_url, wait_until="domcontentloaded", timeout=60000)
+                await asyncio.sleep(self.PAGE_SETTLE_SECONDS)
+                items = await self._extract_menu_items(page, include_prices, include_descriptions)
+            finally:
+                await context.close()
+        except Exception as e:
+            logger.error(
+                    "Menu scrape failed for %s: %s", scrub(place_id), scrub(e),
+                    exc_info=True,
+                )
             return {
-                "menu_available": bool(menu_link),
+                "error": True,
+                "status_code": 502,
+                "message": f"Could not load the place page to read its menu: {e}",
+            }
+        finally:
+            await scraper.close()
+
+        if items:
+            categories: Dict[str, List[Dict[str, Any]]] = {}
+            if categorize:
+                # Google's inline menu does not label sections in a form we can
+                # read reliably, so items land in a single "Menu" group rather
+                # than being sorted into invented category names.
+                categories = {"Menu": items}
+            return {
+                "menu_available": True,
+                "menu_status": "scraped",
                 "menu_link": menu_link,
-                "menu": [],
-                "categories": [],
-                "message": "Full menu extraction requires dedicated scraping of menu pages"
+                "menu": items,
+                "categories": categories if categorize else {},
+                "source": "google_maps_scrape",
             }
 
-        except Exception as e:
-            logger.error(f"Menu extraction error: {e}")
-            return {"error": True, "message": str(e)}
+        if items == []:
+            return {
+                "menu_available": True,
+                "menu_status": "unreadable",
+                "menu_link": menu_link,
+                "menu": [],
+                "categories": {},
+                "message": (
+                    "A menu section was present on the place page but no items could be "
+                    "read from it. This is a scrape failure, not an empty menu."
+                ),
+            }
+
+        if menu_link:
+            return {
+                "menu_available": True,
+                "menu_status": "external_menu_not_scraped",
+                "menu_link": menu_link,
+                "menu": [],
+                "categories": {},
+                "message": (
+                    "This place's menu is hosted on a third-party site, which is not "
+                    "scraped. Follow menu_link for the items. The empty menu list does "
+                    "not mean the place has no menu."
+                ),
+            }
+
+        return {
+            "menu_available": False,
+            "menu_status": "no_menu",
+            "menu_link": None,
+            "menu": [],
+            "categories": {},
+            "message": (
+                "No menu link and no menu section were found on this place's Google "
+                "Maps page. That is the basis for the empty result -- a dedicated "
+                "menu tab was not opened."
+            ),
+        }
 
     async def batch_geocode(
         self,
@@ -1604,17 +2293,92 @@ class GoogleMapsService:
         place_id: str,
         field: Optional[str] = None,
         start_date: Optional[str] = None,
-        end_date: Optional[str] = None
+        end_date: Optional[str] = None,
+        api_key: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Get historical data for a place.
+        Get recorded change history for a place.
 
-        Note: Requires active monitor with historical data storage.
+        History is real: it is the snapshot trail the monitor scheduler writes
+        each time it re-scrapes a place and sees a tracked field change. It is
+        owner-scoped -- only this caller's monitors are consulted.
+
+        Where no monitor has ever covered the place, the response says so
+        (``monitored: false``) instead of returning an empty list that would
+        read as "we looked and nothing changed".
+
+        Args:
+            place_id: Place whose history is wanted.
+            field: Only entries in which this field changed.
+            start_date: ISO-8601 lower bound (inclusive).
+            end_date: ISO-8601 upper bound (inclusive; a bare date covers the
+                whole of that day).
+            api_key: Caller's API key; scopes the lookup to that owner.
         """
-        return {
-            "history": [],
-            "message": "Historical data requires active monitor with persistent storage"
-        }
+        from app.services import google_maps_monitors as monitors
+
+        try:
+            return await monitors.get_place_history(
+                owner=self._owner(api_key),
+                place_id=place_id,
+                field=field,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        except ValueError as e:
+            return {"error": True, "status_code": 400, "message": str(e)}
+
+    # =========================================================================
+    # Reservation availability
+    # =========================================================================
+
+    _RESERVE_MODULE_SELECTORS = (
+        '[data-item-id="reserve"]',
+        'div[aria-label*="Reserve a table"]',
+        'a[href*="reserve.google.com"]',
+    )
+
+    _RESERVE_SLOT_SELECTORS = (
+        'div[jsaction*="reserve"] button[aria-label*=":"]',
+        'div[aria-label*="Reserve a table"] button',
+        'button[jsaction*="slot"]',
+    )
+
+    @staticmethod
+    def _parse_slot_label(text: str) -> Optional[str]:
+        """Pull a clock time out of a slot button's label, or None."""
+        import re
+
+        match = re.search(r"\b\d{1,2}:\d{2}\s*(?:AM|PM)?\b", text or "", re.IGNORECASE)
+        return match.group(0).strip() if match else None
+
+    async def _extract_reservation_slots(self, page) -> Optional[List[str]]:
+        """Read rendered reservation slots.
+
+        Returns None when no reservation module was rendered at all, which is
+        different from ``[]`` (a module that offers no slots).
+        """
+        module_present = False
+        for selector in self._RESERVE_MODULE_SELECTORS:
+            if await page.query_selector(selector):
+                module_present = True
+                break
+
+        nodes = []
+        for selector in self._RESERVE_SLOT_SELECTORS:
+            nodes = await page.query_selector_all(selector)
+            if nodes:
+                break
+
+        if not nodes and not module_present:
+            return None
+
+        slots: List[str] = []
+        for node in nodes:
+            label = self._parse_slot_label((await node.inner_text()) or "")
+            if label and label not in slots:
+                slots.append(label)
+        return slots
 
     async def check_availability(
         self,
@@ -1623,32 +2387,132 @@ class GoogleMapsService:
         party_size: int
     ) -> Dict[str, Any]:
         """
-        Check reservation availability.
+        Check reservation availability by scraping the place page.
 
-        Note: Would require integration with Reserve with Google.
+        This previously returned ``time_slots: []`` with an explanatory message
+        for every place, which reads to a client as "fully booked". The
+        outcomes are now distinct in ``availability_status``:
+
+        - ``slots_found`` -- Google rendered bookable slots and they were read.
+        - ``no_slots`` -- a reservation module was rendered but offered no
+          slots. A real "nothing available" answer.
+        - ``external_provider`` -- the place books through a partner whose
+          widget Google does not render inline. Slots are not readable and the
+          empty list must not be read as "fully booked"; ``booking_url`` is
+          returned instead.
+        - ``no_reservation_integration`` -- this place takes no online
+          reservations at all.
+
+        Caveat, stated rather than hidden: ``date`` and ``party_size`` cannot
+        be applied to Google's inline module, which renders the provider's
+        default view. ``filters_applied`` is false whenever slots come back, so
+        a caller is never told the slots match a party size we could not
+        request.
+
+        Args:
+            place_id: Place to check.
+            date: Requested date (ISO-8601), echoed back; see the caveat.
+            party_size: Requested party size, echoed back; see the caveat.
         """
+        await self._ensure_initialized()
+
+        place_result = await self.get_place_by_id(place_id)
+        if place_result.get("error"):
+            return place_result
+
+        place = place_result.get("place") or {}
+        reserve_link = place.get("reserve_link")
+        place_url = place.get("google_maps_url") or f"https://www.google.com/maps/place/?q=place_id:{place_id}"
+
+        from app.services.google_maps_scraper import GoogleMapsScraper
+
+        proxy = None
+        if ENABLE_PROXY:
+            proxy = await get_proxy()
+
+        scraper = GoogleMapsScraper(proxy=proxy, headless=True)
         try:
-            await self._ensure_initialized()
-
-            # Get place to check for reserve link
-            place_result = await self.get_place_by_id(place_id)
-
-            if place_result.get("error"):
-                return place_result
-
-            place = place_result.get("place", {})
-            reserve_link = place.get("reserve_link")
-
+            page, context = await scraper._create_page("en")
+            try:
+                await page.goto(place_url, wait_until="domcontentloaded", timeout=60000)
+                await asyncio.sleep(self.PAGE_SETTLE_SECONDS)
+                slots = await self._extract_reservation_slots(page)
+            finally:
+                await context.close()
+        except Exception as e:
+            logger.error(
+                    "Availability scrape failed for %s: %s", scrub(place_id), scrub(e),
+                    exc_info=True,
+                )
             return {
-                "reservations_available": bool(reserve_link),
-                "booking_url": reserve_link,
-                "time_slots": [],
-                "message": "Real-time availability requires Reserve with Google integration"
+                "error": True,
+                "status_code": 502,
+                "message": f"Could not load the place page to check availability: {e}",
+            }
+        finally:
+            await scraper.close()
+
+        base = {
+            "place_id": place_id,
+            "requested_date": date,
+            "requested_party_size": party_size,
+            "booking_url": reserve_link,
+        }
+
+        if slots:
+            return {
+                **base,
+                "reservations_available": True,
+                "availability_status": "slots_found",
+                "time_slots": slots,
+                "filters_applied": False,
+                "message": (
+                    "Slots read from the reservation module on the place page. The "
+                    "requested date and party size were not applied to it, so these "
+                    "are the provider's default slots."
+                ),
             }
 
-        except Exception as e:
-            logger.error(f"Check availability error: {e}")
-            return {"error": True, "message": str(e)}
+        if slots == []:
+            return {
+                **base,
+                "reservations_available": True,
+                "availability_status": "no_slots",
+                "time_slots": [],
+                "filters_applied": False,
+                "message": (
+                    "A reservation module was found on the page and no bookable slots "
+                    "were read from it. The requested date and party size were not "
+                    "applied, so this reflects the provider's default view."
+                ),
+            }
+
+        if reserve_link:
+            return {
+                **base,
+                "reservations_available": True,
+                "availability_status": "external_provider",
+                "time_slots": [],
+                "filters_applied": False,
+                "message": (
+                    "This place books through a partner whose slots are not rendered on "
+                    "the Google Maps page, so no slots could be read. The empty list "
+                    "does not mean the place is fully booked -- follow booking_url."
+                ),
+            }
+
+        return {
+            **base,
+            "reservations_available": False,
+            "availability_status": "no_reservation_integration",
+            "time_slots": [],
+            "filters_applied": False,
+            "message": (
+                "No reservation link and no reservation module were found on this "
+                "place's Google Maps page, so no online booking through Google was "
+                "detected."
+            ),
+        }
 
 
 # Singleton instance

@@ -5,7 +5,18 @@
 # =============================================================================
 # Stage 1: Builder - Install dependencies and build assets
 # =============================================================================
-FROM python:3.11-slim-bookworm AS builder
+# Base image is digest-pinned so the weekly update-base-image workflow has a
+# concrete reference to diff against; a bare tag silently floats and gives the
+# workflow nothing to update. Moved 3.11 -> 3.12 to match the interpreter the
+# test suite and requirements.lock are resolved against (3.12), and because
+# 3.12 has a year more upstream security support than 3.11.
+#
+# ACTION REQUIRED (owner of scripts/): scripts/update_base_image.sh:10 still
+# defaults BASE_IMAGE_TAG to "3.11-slim-bookworm" and .github/workflows/
+# update-base-image.yml invokes it with no --tag, so its grep will not match
+# the FROM lines below until that default becomes "3.12-slim-bookworm".
+# python:3.12-slim-bookworm as of 2026-09-01
+FROM python:3.12-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254 AS builder
 
 WORKDIR /build
 
@@ -19,9 +30,14 @@ RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Install Python dependencies (separate layer for caching)
-COPY requirements.txt .
+# Install from the fully-resolved, hash-pinned lock file rather than the
+# loose spec so the image's transitive closure is reproducible and auditable.
+# Regenerate with:
+#   uv pip compile requirements.txt --python-version 3.12 --universal \
+#       --generate-hashes --no-header -o requirements.lock
+COPY requirements.lock .
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir --require-hashes -r requirements.lock
 
 # Download NLTK data to a portable location
 RUN python -c "import nltk; \
@@ -32,7 +48,8 @@ RUN python -c "import nltk; \
 # =============================================================================
 # Stage 2: Production - Minimal runtime image with Playwright
 # =============================================================================
-FROM python:3.11-slim-bookworm AS production
+# python:3.12-slim-bookworm as of 2026-09-01 (keep in sync with the builder stage)
+FROM python:3.12-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254 AS production
 
 # Security: Set environment variables early
 ENV PYTHONDONTWRITEBYTECODE=1 \

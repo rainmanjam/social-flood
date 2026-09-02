@@ -1,0 +1,31 @@
+# Gitleaks configuration.
+#
+# The default rules flag every `Authorization:` header in the documentation's
+# curl examples. Those are placeholders (`YOUR_API_KEY`, `your_api_key`), not
+# credentials -- all findings had identical entropy because they are the same
+# literal string repeated.
+#
+# The allowlist is written as a regex over the matched SECRET, not as a blanket
+# path exclusion: excluding docs/ wholesale would also stop gitleaks catching a
+# real key that someone pastes into a doc, which is a realistic accident.
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "curl-auth-header"
+description = "Authorization header in a shell example"
+regex = '''(?i)authorization:\s*(bearer|token)\s+([a-z0-9._\-]{8,})'''
+[rules.allowlist]
+regexTarget = "match"
+regexes = [
+  '''(?i)(your[_-]?api[_-]?key|your[_-]?token|<[^>]+>|\$\{?[A-Z_]+\}?|xxx+|example|placeholder|redacted|changeme)''',
+]
+
+[allowlist]
+description = "Repository-wide allowlist"
+paths = [
+  # The template file exists to be copied; its values are placeholders by
+  # definition and are asserted to be placeholders by tests/test_boot.py.
+  '''\.env\.example$''',
+]

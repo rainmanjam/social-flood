@@ -1,0 +1,155 @@
+# Tooling configuration for Social Flood.
+#
+# This file is the SINGLE home for ruff, pytest, coverage and bandit settings.
+# There is deliberately no pytest.ini / setup.cfg / .flake8: when both exist,
+# pytest.ini silently wins over [tool.pytest.ini_options] and the pyproject
+# settings become dead config that looks live. One file, one truth.
+#
+# There is also deliberately no [project] table with a dependency list. The
+# runtime and dev dependencies live in requirements.txt / requirements-dev.txt
+# and are owned elsewhere; duplicating them here would create two sources of
+# truth for pins.
+
+# =============================================================================
+# pytest
+# =============================================================================
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+# Coverage flags are NOT in addopts on purpose. They are passed explicitly by
+# CI (see .github/workflows/_verify.yml) so that a plain local `pytest` stays
+# fast and does not require pytest-cov to be installed.
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+]
+
+# `strict` matches the current behaviour of the suite: every async test in
+# tests/ already carries an explicit @pytest.mark.asyncio. Switching to "auto"
+# would start collecting async helpers that are currently not run, changing the
+# pass/fail baseline for reasons unrelated to any code change.
+asyncio_mode = "strict"
+
+markers = [
+    "unit: fast, isolated unit test",
+    "integration: exercises more than one component",
+    "e2e: end-to-end test against a running application",
+    "smoke: minimal check that the system is alive",
+    "slow: takes more than a couple of seconds",
+    "security: security-focused test",
+    "allow_network: opt out of the outbound-network guard in tests/conftest.py",
+]
+
+filterwarnings = [
+    "default",
+    # Third-party deprecations we cannot fix from this repository.
+    "ignore::DeprecationWarning:pandas.*",
+    "ignore::DeprecationWarning:nltk.*",
+]
+
+# =============================================================================
+# coverage
+# =============================================================================
+[tool.coverage.run]
+source = ["app"]
+branch = false
+omit = [
+    "tests/*",
+    "**/__pycache__/*",
+    "**/site-packages/*",
+]
+
+[tool.coverage.report]
+precision = 2
+show_missing = true
+skip_covered = false
+# The CI floor (--cov-fail-under) is set in .github/workflows/_verify.yml, not
+# here, so that the ratchet value is visible next to the job that enforces it.
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@(abc\\.)?abstractmethod",
+]
+
+# =============================================================================
+# ruff
+# =============================================================================
+# The full rule set below currently reports ~1242 findings on this codebase, so
+# CI runs it with --exit-zero and publishes the count (see _verify.yml). The
+# blocking gate in CI is the much narrower `E9,F63,F7,F82` selection - syntax
+# errors and undefined names - which the repository is already clean on.
+#
+# RATCHET: shrink `ignore` below, or drop --exit-zero from the CI step, as the
+# count comes down. Never widen `ignore` to make a red build green.
+[tool.ruff]
+# Matches the Dockerfile base image (python:3.11-slim-bookworm), which is the
+# oldest interpreter this code has to run on.
+target-version = "py311"
+line-length = 120
+indent-width = 4
+extend-exclude = [
+    "nltk_data",
+    "examples",
+    "build",
+    "dist",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",  # line length - the formatter owns this
+    "B008",  # function call in argument default: this is how FastAPI Depends works
+    "B904",  # raise ... from err - worth fixing, too noisy to block on today
+    "UP007", # X | Y annotations - deferred until the 3.11 floor is confirmed
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]              # re-exports
+"tests/**/*" = ["ARG", "SIM", "B011"] # tests get more latitude
+"scripts/**/*" = ["T201"]             # scripts are allowed to print
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+# =============================================================================
+# bandit (used by .github/workflows/security.yml and the pre-commit hook)
+# =============================================================================
+[tool.bandit]
+exclude_dirs = ["tests", "scripts", "examples", "nltk_data"]
+skips = [
+    "B101",  # assert_used
+    "B601",  # paramiko calls - not used here
+]
+
+
+[tool.mypy]
+# The pydantic plugin is required for useful output on this codebase: without
+# it mypy cannot see that Field(None) supplies a default, and reports every
+# optional model field as a missing required argument at each construction
+# site. Those were false positives, verified at runtime.
+plugins = ["pydantic.mypy"]

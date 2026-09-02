@@ -55,9 +55,8 @@ def check_env_variables():
         "ENABLE_CACHE",
         "CACHE_TTL",
         "REDIS_URL",
-        "DATABASE_URL",
         "ENABLE_PROXY",
-        "PROXY_URL",
+        "PROXY_URLS",
         "CORS_ORIGINS",
         "SECRET_KEY",
     ]
@@ -95,8 +94,8 @@ def check_env_variables():
             print_success(f"API variable {var} is set")
     
     # Check proxy configuration
-    if os.environ.get("ENABLE_PROXY") == "True" and not os.environ.get("PROXY_URL"):
-        print_error("Proxy is enabled but PROXY_URL is not set")
+    if os.environ.get("ENABLE_PROXY", "").lower() == "true" and not os.environ.get("PROXY_URLS"):
+        print_error("Proxy is enabled but PROXY_URLS is not set")
     
     return {
         "missing_required": missing_required,
@@ -141,8 +140,8 @@ def check_network():
         print_error("Internet connection is not available")
     
     # Check proxy if enabled
-    if os.environ.get("ENABLE_PROXY") == "True" and os.environ.get("PROXY_URL"):
-        proxy_url = os.environ.get("PROXY_URL")
+    if os.environ.get("ENABLE_PROXY", "").lower() == "true" and os.environ.get("PROXY_URLS"):
+        proxy_url = os.environ.get("PROXY_URLS", "").split(",")[0].strip()
         try:
             # Parse proxy URL
             parsed = urlparse(proxy_url)
@@ -183,23 +182,6 @@ def check_api_services():
         except Exception as e:
             print_error(f"Redis connection error: {str(e)}")
     
-    # Check database if URL is provided
-    if os.environ.get("DATABASE_URL"):
-        try:
-            import psycopg2
-            parsed = urlparse(os.environ.get("DATABASE_URL"))
-            conn = psycopg2.connect(
-                dbname=parsed.path[1:],
-                user=parsed.username,
-                password=parsed.password,
-                host=parsed.hostname,
-                port=parsed.port or 5432
-            )
-            conn.close()
-            print_success("Database connection is working")
-        except Exception as e:
-            print_error(f"Database connection error: {str(e)}")
-
 def main():
     """Run all checks."""
     print(f"{BOLD}{BLUE}Social Flood Environment Check{RESET}")

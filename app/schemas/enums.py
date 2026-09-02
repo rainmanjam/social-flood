@@ -20,7 +20,27 @@ class TimeframeEnum(IntEnum):
 
 
 class HumanFriendlyBatchPeriod(str, Enum):
-    """Human-readable batch period options for Google Trends."""
+    """Human-readable batch period options for Google Trends.
+
+    The canonical member names deliberately mirror their wire values
+    (``past_4h`` -> ``"past_4h"``). These values are part of the public query
+    string of ``/google-trends/trending-now-showcase-timeline``, and keeping
+    name and value identical removes a whole class of bug: a mapping keyed on
+    ``HumanFriendlyBatchPeriod.past_4h`` cannot silently disagree with the
+    string a caller sends. That disagreement is exactly what made the
+    timeline endpoint return 500 on every request (the router referenced
+    ``past_4h`` while the enum only defined ``PAST_4H``).
+
+    Upper-case aliases are retained so existing ``PAST_4H``-style references
+    keep working; they resolve to the same members.
+    """
+    past_4h = "past_4h"
+    past_24h = "past_24h"
+    past_48h = "past_48h"
+    past_7d = "past_7d"
+
+    # Aliases (same values -> same members), for callers using the
+    # SCREAMING_CASE spelling.
     PAST_4H = "past_4h"
     PAST_24H = "past_24h"
     PAST_48H = "past_48h"

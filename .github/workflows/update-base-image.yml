@@ -1,19 +1,45 @@
+# .github/workflows/update-base-image.yml
+#
+# NOTE (CRT-6): this workflow has never had anything to do. `scripts/
+# update_base_image.sh` looks for a digest-pinned base image, but the Dockerfile
+# uses the floating tag `python:3.11-slim-bookworm`, so there is no digest to
+# compare against and the check is always a no-op.
+#
+# Digest-pinning the Dockerfile is owned by another change (the Dockerfile is
+# not this branch's to edit). Until that lands, the workflow is kept but its
+# actions are modernised (checkout@v3 -> v4, buildx@v2 -> v3) and it now says
+# out loud when it found nothing to do, instead of reporting a silent success.
+#
+# Dependabot's `docker` ecosystem entry in .github/dependabot.yml also watches
+# the base image, so this workflow is a backstop rather than the only mechanism.
 name: Update Base Image
 
 on:
   schedule:
-    - cron: '0 0 * * 1'  # Weekly on Monday at midnight
-  workflow_dispatch:  # Allow manual triggering
+    - cron: '0 0 * * 1'   # Weekly, Monday 00:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   update-base-image:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Set up Docker
-        uses: docker/setup-buildx-action@v2
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Warn if the Dockerfile is not digest-pinned
+        run: |
+          if ! grep -qE '^FROM .*@sha256:' Dockerfile; then
+            echo "::warning::Dockerfile is not digest-pinned; this workflow cannot detect base image drift. Pin FROM lines to @sha256:... to enable it."
+          fi
 
       - name: Check for base image updates
         id: check-updates
@@ -21,28 +47,27 @@ jobs:
           chmod +x ./scripts/update_base_image.sh
           if ./scripts/update_base_image.sh --check-only; then
             echo "Base image is already up-to-date"
-            echo "updated=false" >> $GITHUB_OUTPUT
+            echo "updated=false" >> "$GITHUB_OUTPUT"
           else
             echo "Base image needs to be updated"
-            echo "updated=true" >> $GITHUB_OUTPUT
+            echo "updated=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Update base image
         if: steps.check-updates.outputs.updated == 'true'
-        run: |
-          ./scripts/update_base_image.sh
-          
+        run: ./scripts/update_base_image.sh
+
       - name: Create Pull Request
         if: steps.check-updates.outputs.updated == 'true'
-        uses: peter-evans/create-pull-request@v5
+        uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: 'chore: update base image to latest digest'
           title: 'chore: update base image to latest digest'
           body: |
             This PR updates the base image in the Dockerfile to the latest digest.
-            
-            This is an automated PR created by the "Update Base Image" workflow.
+
+            Opened automatically by the "Update Base Image" workflow.
           branch: update-base-image
           delete-branch: true
           labels: |

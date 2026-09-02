@@ -24,12 +24,29 @@ from app.core.config import (
 class TestSettingsDefaults:
     """Test Settings class with default values."""
 
-    def test_settings_default_values(self):
-        """Test that Settings has correct default values."""
-        test_settings = Settings()
+    def test_settings_default_values(self, monkeypatch):
+        """
+        Test that Settings has correct default values.
+
+        This must be isolated from BOTH ambient sources:
+        - ``_env_file=None`` -- several assertions here previously encoded
+          values that only existed in one developer's local .env ("From .env
+          file"), so the test passed on that machine and nowhere else.
+        - a scrubbed os.environ -- other test modules set variables such as
+          ENVIRONMENT=testing without cleaning up, which made this test's
+          result depend on collection order.
+        """
+        from app.__version__ import __version__ as expected_version
+
+        for field_name in Settings.model_fields:
+            monkeypatch.delenv(field_name, raising=False)
+            monkeypatch.delenv(field_name.lower(), raising=False)
+
+        test_settings = Settings(_env_file=None)
 
         # API settings
         assert test_settings.API_KEYS == []
+        assert test_settings.API_KEY is None
         assert test_settings.ENABLE_API_KEY_AUTH is True
 
         # Rate limiting
@@ -38,16 +55,15 @@ class TestSettingsDefaults:
         assert test_settings.RATE_LIMIT_TIMEFRAME == 3600
 
         # Caching
-        assert test_settings.ENABLE_CACHE is False
+        assert test_settings.ENABLE_CACHE is True
         assert test_settings.CACHE_TTL == 3600
-        assert str(test_settings.REDIS_URL) == "redis://localhost:6379/0"  # From .env file
+        assert test_settings.REDIS_URL is None
 
-        # Database
-        assert str(test_settings.DATABASE_URL) == "postgresql://user:password@localhost:5432/social_flood"  # From .env file
 
         # Proxy settings
-        assert test_settings.ENABLE_PROXY is True  # From .env file
+        assert test_settings.ENABLE_PROXY is False
         assert test_settings.PROXY_URL is None
+        assert test_settings.PROXY_URLS is None
 
         # CORS settings
         assert test_settings.CORS_ORIGINS == ["*"]
@@ -58,7 +74,7 @@ class TestSettingsDefaults:
         assert test_settings.DEBUG is False
         assert test_settings.ENVIRONMENT == "development"
         assert test_settings.PROJECT_NAME == "Social Flood"
-        assert test_settings.VERSION == "1.2.0"  # From __version__.py
+        assert test_settings.VERSION == expected_version
 
     def test_settings_autocomplete_defaults(self):
         """Test autocomplete-related default values."""
@@ -117,7 +133,11 @@ class TestSettingsEnvironmentLoading:
         "ENABLE_API_KEY_AUTH": "false",
         "RATE_LIMIT_REQUESTS": "50",
         "DEBUG": "true",
-        "ENVIRONMENT": "production"
+        "ENVIRONMENT": "production",
+        # A production environment must supply a real secret: Settings now
+        # refuses to boot outside development while a credential still holds
+        # the placeholder value published in .env.example / config.py.
+        "SECRET_KEY": "a-real-generated-production-secret-key-value"
     })
     def test_settings_from_env_basic(self):
         """Test loading basic settings from environment."""
@@ -131,7 +151,6 @@ class TestSettingsEnvironmentLoading:
 
     @patch.dict(os.environ, {
         "REDIS_URL": "redis://localhost:6379",
-        "DATABASE_URL": "postgresql://user:pass@localhost/db",
         "PROXY_URL": "http://proxy.example.com:8080"
     })
     def test_settings_from_env_urls(self):
@@ -139,7 +158,6 @@ class TestSettingsEnvironmentLoading:
         test_settings = Settings()
 
         assert str(test_settings.REDIS_URL) == "redis://localhost:6379/0"
-        assert str(test_settings.DATABASE_URL) == "postgresql://user:pass@localhost/db"
         assert test_settings.PROXY_URL == "http://proxy.example.com:8080"
 
     @patch.dict(os.environ, {
@@ -173,52 +191,52 @@ class TestFieldValidators:
     def test_api_keys_validator_string_input(self):
         """Test API_KEYS validator with string input."""
         # Test comma-separated string
-        result = Settings.assemble_api_keys("key1,key2,key3")
+        result = Settings.assemble_list_setting("key1,key2,key3")
         assert result == ["key1", "key2", "key3"]
 
     def test_api_keys_validator_whitespace_handling(self):
         """Test API_KEYS validator handles whitespace."""
-        result = Settings.assemble_api_keys("  key1  ,  key2,key3  ")
+        result = Settings.assemble_list_setting("  key1  ,  key2,key3  ")
         assert result == ["key1", "key2", "key3"]
 
     def test_api_keys_validator_empty_values(self):
         """Test API_KEYS validator handles empty values."""
-        result = Settings.assemble_api_keys("key1,,key2,")
+        result = Settings.assemble_list_setting("key1,,key2,")
         assert result == ["key1", "key2"]
 
     def test_api_keys_validator_list_input(self):
         """Test API_KEYS validator with list input."""
-        result = Settings.assemble_api_keys(["key1", "key2", "key3"])
+        result = Settings.assemble_list_setting(["key1", "key2", "key3"])
         assert result == ["key1", "key2", "key3"]
 
     def test_api_keys_validator_empty_string(self):
         """Test API_KEYS validator with empty string."""
-        result = Settings.assemble_api_keys("")
+        result = Settings.assemble_list_setting("")
         assert result == []
 
     def test_api_keys_validator_none_input(self):
         """Test API_KEYS validator with None input."""
-        result = Settings.assemble_api_keys(None)
+        result = Settings.assemble_list_setting(None)
         assert result == []
 
     def test_cors_origins_validator_string_input(self):
         """Test CORS_ORIGINS validator with string input."""
-        result = Settings.assemble_cors_origins("https://example.com,https://app.example.com")
+        result = Settings.assemble_list_setting("https://example.com,https://app.example.com")
         assert result == ["https://example.com", "https://app.example.com"]
 
     def test_cors_origins_validator_whitespace_handling(self):
         """Test CORS_ORIGINS validator handles whitespace."""
-        result = Settings.assemble_cors_origins("  https://example.com  ,  https://app.example.com  ")
+        result = Settings.assemble_list_setting("  https://example.com  ,  https://app.example.com  ")
         assert result == ["https://example.com", "https://app.example.com"]
 
     def test_cors_origins_validator_list_input(self):
         """Test CORS_ORIGINS validator with list input."""
-        result = Settings.assemble_cors_origins(["https://example.com", "https://app.example.com"])
+        result = Settings.assemble_list_setting(["https://example.com", "https://app.example.com"])
         assert result == ["https://example.com", "https://app.example.com"]
 
     def test_cors_origins_validator_empty_string(self):
         """Test CORS_ORIGINS validator with empty string."""
-        result = Settings.assemble_cors_origins("")
+        result = Settings.assemble_list_setting("")
         assert result == []
 
 
@@ -227,7 +245,11 @@ class TestSettingsValidation:
 
     def test_settings_case_insensitive_env(self):
         """Test that environment variables are case insensitive."""
-        with patch.dict(os.environ, {"debug": "true", "environment": "production"}):
+        with patch.dict(os.environ, {
+            "debug": "true",
+            "environment": "production",
+            "secret_key": "a-real-generated-production-secret-key-value",
+        }):
             test_settings = Settings()
             assert test_settings.DEBUG is True
             assert test_settings.ENVIRONMENT == "production"
@@ -298,8 +320,8 @@ class TestSettingsIntegration:
         "RATE_LIMIT_REQUESTS": "200",
         "DEBUG": "false",
         "ENVIRONMENT": "production",
+        "SECRET_KEY": "a-real-generated-production-secret-key-value",
         "REDIS_URL": "redis://prod-redis:6379",
-        "DATABASE_URL": "postgresql://prod-user:test-pass@prod-db/prod_db"
     })
     def test_production_settings_configuration(self):
         """Test complete production settings configuration."""
@@ -318,7 +340,6 @@ class TestSettingsIntegration:
 
         # URLs
         assert str(test_settings.REDIS_URL) == "redis://prod-redis:6379/0"
-        assert str(test_settings.DATABASE_URL) == "postgresql://prod-user:test-pass@prod-db/prod_db"
 
     def test_settings_immutability(self):
         """Test that settings instances are mutable after creation."""

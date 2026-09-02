@@ -72,8 +72,13 @@ dump.rdb
 # config/config.py removed - use app/core/config.py instead
 
 # Environment variable files
+# NOTE: `*.env` matches `.env` itself. Do NOT re-include with a broad `!.env.*`
+# negation -- that un-ignores `.env.bak`, `.env.local`, `.env.production`, etc.
+# Only the placeholder template is tracked.
 *.env
-!.env.*
+.env
+.env.*
+!.env.example
 
 # Coverage
 .coverage
@@ -94,4 +99,23 @@ cosign.key
 cosign.pub
 
 # Documentation
-docs/
+# docs/ is tracked: README links into docs/features/ and docs/comparisons/,
+# which 404 for anyone cloning while the whole tree is ignored.
+# These two subtrees stay out -- they are scraped third-party business data
+# and enrichment-tool research notes, not project documentation.
+docs/reports/
+docs/research/
+
+# Committed NLTK corpora are not needed: the Dockerfile downloads its own copy
+# into /opt/nltk_data, and google_news_api.py downloads on demand when absent.
+nltk_data/
+
+# Scratch output
+test_output.txt
+
+# Agent / code-intelligence tool output (session-local, not project state)
+.claude/
+.serena/
+.gitnexus/
+graphify-out/
+AGENTS.md

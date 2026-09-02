@@ -1,0 +1,468 @@
+# Reusable verification pipeline for Social Flood.
+#
+# This is the single definition of "does this code actually work?".
+# It is called by:
+#   - main.yml    (pull requests, non-main pushes, merge queue, manual)
+#   - release.yml (pushes to main, before any version bump or publish)
+#
+# Keeping it in one reusable workflow means a release can never publish an
+# artifact that has not passed exactly the same gates a pull request passes.
+name: Verify
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: 'Python version used for lint / test / boot jobs.'
+        required: false
+        type: string
+        default: '3.12'
+      coverage-floor:
+        description: >-
+          Minimum statement coverage of app/. A ratchet: raise it as coverage
+          improves, never lower it to make a red build green.
+
+          The default below is the REAL measured value on the integrated tree,
+          not an aspiration. Note the 2026-09-01 stability review quoted 53%;
+          that figure does not reproduce and was never accurate -- a clean
+          `pytest --cov=app` on the pre-remediation tree reports 44.17% (5459
+          statements, 3048 missed), with and without the coverage config.
+
+          Measured on the merged tree after remediation: 65.19% (7202
+          statements, 2507 missed), rounded DOWN to 65. The statement count
+          grew because the Maps modules, url_guard and record_store gained
+          tests where they previously had none.
+
+          The `test` job prints measured coverage to the run summary, so
+          raising this is a one-line change as coverage improves.
+        required: false
+        type: number
+        default: 65
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Lint
+  # ---------------------------------------------------------------------------
+  # Ratchet, deliberately in two steps:
+  #
+  #   1. "Ruff (blocking)" runs only the rules that flag genuinely broken code:
+  #      E9  syntax errors, F63 invalid comparisons, F7  misplaced statements,
+  #      F82 undefined names. The repository is currently CLEAN on these
+  #      (verified: 0 findings), so this gate blocks today and catches the
+  #      class of mistake that would otherwise reach production as a NameError.
+  #
+  #   2. "Ruff (full, advisory)" runs the whole configured rule set with
+  #      --exit-zero. WHY: the full rule set currently reports ~1242 findings
+  #      across the existing codebase. Making that blocking on day one would
+  #      turn every pull request red for pre-existing debt and force everyone to
+  #      bypass CI, which is how the pipeline became meaningless in the first
+  #      place. Instead the count is published to the job summary every run so
+  #      the trend is visible.
+  #
+  #   RATCHET PLAN: as the count is driven down, move rule groups out of
+  #   `lint.ignore` in pyproject.toml, or drop `--exit-zero` from step 2 once
+  #   the count reaches 0. Do not weaken step 1.
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      # ruff is intentionally installed standalone rather than via
+      # requirements-dev.txt: that file is owned elsewhere and does not list it.
+      - name: Install ruff
+        run: python -m pip install --upgrade pip && pip install 'ruff==0.16.4'
+
+      - name: Ruff (blocking - real errors only)
+        run: ruff check --output-format=github --select E9,F63,F7,F82 .
+
+      - name: Ruff (full rule set, advisory)
+        run: |
+          set -euo pipefail
+          ruff check --exit-zero --statistics . | tee ruff-report.txt
+          COUNT=$(ruff check --exit-zero --output-format=concise . | wc -l | tr -d ' ')
+          {
+            echo "## Ruff findings (advisory)"
+            echo ""
+            echo "**Total: ${COUNT}**  (baseline at gate introduction: 1242)"
+            echo ""
+            echo '```'
+            cat ruff-report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload ruff report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruff-report
+          path: ruff-report.txt
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Dependency audit
+  # ---------------------------------------------------------------------------
+  # BLOCKING, on purpose. The dependency work that produced requirements.lock
+  # took pip-audit from 52 known vulnerabilities across 8 packages down to 0,
+  # on both the direct pins and the full 77-package closure. Zero is a state
+  # that only stays true if something defends it: an advisory job would let the
+  # next vulnerable pin sail in and the work would have to be redone in six
+  # months. Because the current count is 0, this gate costs nothing today and
+  # only fires on a genuine regression.
+  #
+  # A NEW advisory published against an unchanged dependency will also turn this
+  # red, which is correct - but it means the fix is "bump the pin", not "disable
+  # the job". `pip-audit --ignore-vuln <ID>` with a comment and an expiry is the
+  # escape hatch if a fix genuinely is not available yet.
+  #
+  # The scheduled/weekly sweep lives in security.yml; this one gates changes.
+  deps-audit:
+    name: Dependency audit (pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: 'pip'
+          cache-dependency-path: requirements-dev.txt
+
+      # The version comes from requirements-dev.txt so there is one source of
+      # truth for the pin rather than a second copy hardcoded here. If the pin
+      # is missing, say so in one line instead of failing on a bare `grep`
+      # exit code that reads like an unrelated shell error. Deliberately NOT
+      # falling back to an unpinned `pip install pip-audit`: an audit whose own
+      # version drifts silently is the kind of gate that stops meaning anything.
+      - name: Install pip-audit at the pinned version
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if ! PIN=$(grep -E '^pip-audit==' requirements-dev.txt); then
+            echo "::error file=requirements-dev.txt::No 'pip-audit==<version>' pin found in requirements-dev.txt. Add one (the audit gate reads the version from there), or change this step to pin it directly."
+            exit 1
+          fi
+          echo "Installing ${PIN}"
+          pip install "${PIN}"
+
+      - name: Audit the direct pins
+        run: pip-audit --requirement requirements.txt --strict --progress-spinner=off
+
+      # --no-deps because requirements.lock is already the complete resolved
+      # closure; letting pip-audit re-resolve it would also make pip enforce
+      # --require-hashes during resolution, which is slow and can fail for
+      # reasons that have nothing to do with vulnerabilities.
+      - name: Audit the full locked closure
+        run: pip-audit --requirement requirements.lock --no-deps --strict --progress-spinner=off
+
+  # ---------------------------------------------------------------------------
+  # Test
+  # ---------------------------------------------------------------------------
+  # This job has NO `|| true` and NO `continue-on-error`. A failing test fails
+  # the pipeline. That is the entire point of this rewrite.
+  test:
+    name: Test (pytest + coverage)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.lock
+            requirements.txt
+            requirements-dev.txt
+
+      # Installs the hash-pinned closure the Docker image ships, THEN the test
+      # tooling. See the note above `assert-lock-parity` for why the order and
+      # the follow-up check matter.
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install --require-hashes --requirement requirements.lock
+          pip install --requirement requirements-dev.txt
+
+      # requirements-dev.txt pulls in requirements.txt, and pip is free to
+      # resolve a *different* version of a shared transitive dependency than the
+      # lock pinned. If that happens, CI would be testing a package set nobody
+      # deploys - the exact failure mode the lock exists to prevent - so fail
+      # loudly instead of discovering it in production.
+      - name: Assert the installed closure still matches requirements.lock
+        run: |
+          python - <<'PY'
+          import re
+          import subprocess
+          import sys
+
+          def norm(name):
+              return re.sub(r"[-_.]+", "-", name).lower()
+
+          locked = {}
+          with open("requirements.lock") as handle:
+              for line in handle:
+                  match = re.match(r"^([A-Za-z0-9._-]+)==([^\s\\;]+)", line)
+                  if match:
+                      locked[norm(match.group(1))] = match.group(2)
+
+          frozen = {}
+          output = subprocess.check_output(
+              [sys.executable, "-m", "pip", "freeze"], text=True
+          )
+          for line in output.splitlines():
+              if "==" in line and not line.startswith("-"):
+                  name, _, version = line.partition("==")
+                  frozen[norm(name)] = version.strip()
+
+          # Only flag VERSION MISMATCHES, not absences. requirements.lock is
+          # compiled with `uv pip compile --universal`, so it carries entries
+          # that apply to other platforms -- colorama, tzdata and
+          # win32-setctime are Windows-only and are correctly absent on the
+          # Linux runner. Treating "missing" as drift makes a universal lock
+          # unusable; a wrong VERSION is the failure this check exists for.
+          drift = {
+              name: (want, frozen[name])
+              for name, want in locked.items()
+              if name in frozen and frozen[name] != want
+          }
+          if drift:
+              print("::error::Installed packages drifted from requirements.lock")
+              for name, (want, got) in sorted(drift.items()):
+                  print(f"  {name}: lock={want} installed={got or '<missing>'}")
+              sys.exit(1)
+
+          print(f"OK: all {len(locked)} locked packages installed at the locked version")
+          PY
+
+      - name: Download NLTK data
+        run: python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab')"
+
+      # No .env is created here. tests/conftest.py pins the settings source so
+      # the suite behaves identically whether or not a .env exists on disk.
+      - name: Run test suite
+        run: |
+          pytest \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-fail-under=${{ inputs.coverage-floor }} \
+            --junitxml=junit.xml \
+            -ra
+
+      # Makes raising the ratchet a one-line change: the number to put in
+      # `coverage-floor` is printed on every run.
+      - name: Report measured coverage
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -f coverage.xml ]; then
+            echo "No coverage.xml produced." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          MEASURED=$(python - <<'PY'
+          import xml.etree.ElementTree as ET
+          rate = float(ET.parse("coverage.xml").getroot().get("line-rate", 0))
+          print(f"{rate * 100:.2f}")
+          PY
+          )
+          {
+            echo "## Coverage"
+            echo ""
+            echo "Measured: **${MEASURED}%**"
+            echo "Enforced floor: **${{ inputs.coverage-floor }}%**"
+            echo ""
+            echo "If measured is comfortably above the floor, raise"
+            echo "\`coverage-floor\` in .github/workflows/_verify.yml."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage and test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            coverage.xml
+            junit.xml
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Boot
+  # ---------------------------------------------------------------------------
+  # The exit criterion the owner asked for: a pull request that breaks boot must
+  # fail CI. This job copies .env.example to .env VERBATIM (which is what a new
+  # contributor does on day one), starts the real ASGI app with uvicorn, and
+  # requires a 2xx from /health.
+  #
+  # It also runs the full pytest suite a second time in "boot" configuration so
+  # that tests/test_boot.py is picked up automatically the moment it lands -
+  # nothing here needs editing when that file appears.
+  boot:
+    name: Boot from .env.example
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.lock
+            requirements.txt
+            requirements-dev.txt
+
+      # Same hash-pinned closure the image ships: booting against a different
+      # package set would prove nothing about the artifact we deploy.
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install --require-hashes --requirement requirements.lock
+          pip install --requirement requirements-dev.txt
+
+      - name: Download NLTK data
+        run: python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab')"
+
+      # VERBATIM. Do not edit, filter or template this file. If the shipped
+      # example config cannot boot the app, that is a bug in the app or in the
+      # example - not something CI should paper over.
+      - name: Create .env from .env.example (verbatim)
+        run: cp .env.example .env
+
+      - name: Import the application
+        run: python -c "import main; print('imported app:', main.app.title)"
+
+      - name: Start the application
+        run: |
+          nohup python -m uvicorn main:app --host 127.0.0.1 --port 8000 \
+            > uvicorn.log 2>&1 &
+          echo $! > uvicorn.pid
+
+      - name: Wait for /health
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/health > health.json; then
+              echo "App answered /health after ${i}s:"
+              cat health.json
+              exit 0
+            fi
+            # Fail fast if the process already died.
+            if ! kill -0 "$(cat uvicorn.pid)" 2>/dev/null; then
+              echo "::error::uvicorn exited before serving /health"
+              cat uvicorn.log
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "::error::App did not serve /health within 30s"
+          cat uvicorn.log
+          exit 1
+
+      - name: Check the OpenAPI schema is generated
+        run: curl -fsS http://127.0.0.1:8000/openapi.json > /dev/null
+
+      - name: Stop the application
+        if: always()
+        run: |
+          if [ -f uvicorn.pid ]; then kill "$(cat uvicorn.pid)" 2>/dev/null || true; fi
+
+      - name: Show application log
+        if: always()
+        run: cat uvicorn.log || true
+
+      # Picks up tests/test_boot.py automatically once that file exists.
+      # Runs against the .env created above, so it also proves the suite is
+      # insensitive to a developer's local .env (see tests/conftest.py).
+      - name: Run test suite with a .env present
+        run: pytest -ra -q
+
+  # ---------------------------------------------------------------------------
+  # Docker smoke test
+  # ---------------------------------------------------------------------------
+  # Builds the production image and requires the image's own HEALTHCHECK to
+  # report `healthy`, then hits /health from outside the container.
+  docker:
+    name: Docker build + health check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Single-arch on purpose: a multi-arch build cannot be `load`ed into the
+      # local daemon, and we need a runnable image to smoke test. The release
+      # workflow still publishes amd64 + arm64.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: social-flood:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Deliberately started with NO env file: `docker --env-file` has
+      # different quoting/expansion rules from python-dotenv, so feeding it
+      # .env.example proves nothing about the app. Booting from .env.example
+      # is the `boot` job's contract;
+      # this job's contract is "the shipped image starts and self-reports
+      # healthy on its built-in defaults".
+      - name: Run container
+        run: docker run -d --name social-flood-ci -p 8000:8000 social-flood:ci
+
+      - name: Wait for the container HEALTHCHECK to pass
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            STATUS=$(docker inspect -f '{{.State.Health.Status}}' social-flood-ci 2>/dev/null || echo "missing")
+            RUNNING=$(docker inspect -f '{{.State.Running}}' social-flood-ci 2>/dev/null || echo "false")
+            echo "t=${i}s health=${STATUS} running=${RUNNING}"
+            if [ "$STATUS" = "healthy" ]; then
+              exit 0
+            fi
+            if [ "$RUNNING" != "true" ]; then
+              echo "::error::container exited before becoming healthy"
+              docker logs social-flood-ci
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "::error::container never reported healthy"
+          docker logs social-flood-ci
+          exit 1
+
+      - name: Hit /health from the host
+        run: curl -fsS http://127.0.0.1:8000/health
+
+      - name: Container logs
+        if: always()
+        run: docker logs social-flood-ci || true
+
+      - name: Tear down
+        if: always()
+        run: docker rm -f social-flood-ci || true

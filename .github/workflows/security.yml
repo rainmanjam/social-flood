@@ -1,0 +1,280 @@
+# .github/workflows/security.yml
+#
+# Taken from the abandoned branch
+# `origin/claude/review-project-updates-011CUsCr2DU59u88cneyTm6D`, which had
+# CodeQL + Trivy + dependency review wired up but was never merged.
+#
+# Re-targeted for main:
+#   * Python 3.13 -> 3.12 (the version the rest of CI and the test suite use).
+#   * `safety check` replaced with `pip-audit`: `safety check` is deprecated and
+#     now requires an authenticated account, so it silently degraded to a no-op.
+#   * Scans are reported to the Security tab; only Trivy CRITICAL findings on a
+#     pull request block the merge. Everything else is advisory for now - the
+#     same ratchet reasoning as ruff in _verify.yml.
+name: Security Scanning
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '0 9 * * 1'   # Mondays 09:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  codeql:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          queries: +security-extended,security-and-quality
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"
+
+  trivy-container:
+    name: Trivy Container Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image for scanning
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: social-flood:scan
+          cache-from: type=gha
+
+      - name: Trivy scan (SARIF for the Security tab)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: 'social-flood:scan'
+          format: 'sarif'
+          output: 'trivy-container.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-container.sarif'
+          category: 'trivy-container'
+
+      # The only blocking security gate: a new CRITICAL vulnerability in the
+      # image that we are about to ship stops the pull request.
+      - name: Fail on CRITICAL findings
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: 'social-flood:scan'
+          format: 'table'
+          severity: 'CRITICAL'
+          ignore-unfixed: true
+          exit-code: '1'
+
+  trivy-fs:
+    name: Trivy Filesystem Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-fs.sarif'
+          category: 'trivy-fs'
+
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Dependency Review
+        # Requires the repository's Dependency graph to be enabled
+        # (Settings -> Code security -> Dependency graph). Without it the
+        # action hard-fails, so it is advisory rather than permanently red.
+        # pip-audit in _verify.yml is the blocking dependency gate.
+        continue-on-error: true
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          deny-licenses: GPL-3.0, AGPL-3.0
+
+  # The BLOCKING dependency audit that gates every change lives in
+  # _verify.yml (`deps-audit`). This job is the time-based sweep: a new advisory
+  # can be published against a dependency nobody touched, so the closure needs
+  # re-checking on a schedule even when no pull request is open.
+  #
+  # Skipped on pull_request to avoid auditing the same thing twice in one PR.
+  pip-audit:
+    name: pip-audit (scheduled sweep)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements-dev.txt
+
+      # Same single-source-of-truth pin lookup as the blocking `deps-audit` job
+      # in _verify.yml, with the same explicit error if the pin is missing.
+      - name: Install pip-audit at the pinned version
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if ! PIN=$(grep -E '^pip-audit==' requirements-dev.txt); then
+            echo "::error file=requirements-dev.txt::No 'pip-audit==<version>' pin found in requirements-dev.txt."
+            exit 1
+          fi
+          echo "Installing ${PIN}"
+          pip install "${PIN}"
+
+      - name: Audit the locked closure
+        run: |
+          set -euo pipefail
+          pip-audit --requirement requirements.lock --no-deps \
+            --format json --output pip-audit.json --progress-spinner=off || true
+          pip-audit --requirement requirements.lock --no-deps \
+            --strict --progress-spinner=off
+
+      - name: Upload pip-audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-report
+          path: pip-audit.json
+          if-no-files-found: ignore
+
+  bandit:
+    name: Bandit Security Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Bandit
+        run: python -m pip install --upgrade pip && pip install 'bandit[toml]'
+
+      # Configuration lives in pyproject.toml ([tool.bandit]).
+      - name: Run Bandit
+        run: |
+          bandit -r app/ -c pyproject.toml -f json -o bandit-report.json || true
+          bandit -r app/ -c pyproject.toml || true
+
+      - name: Upload Bandit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report
+          path: bandit-report.json
+          if-no-files-found: ignore
+
+  gitleaks:
+    name: Gitleaks Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Only required for GitHub Organisation accounts. Personal repos are
+          # free and the variable can stay unset.
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  security-summary:
+    name: Security Summary
+    runs-on: ubuntu-latest
+    needs: [ codeql, trivy-container, trivy-fs, pip-audit, bandit, gitleaks ]
+    if: always()
+    steps:
+      - name: Summarise
+        env:
+          R_CODEQL: ${{ needs.codeql.result }}
+          R_TRIVY_C: ${{ needs.trivy-container.result }}
+          R_TRIVY_FS: ${{ needs.trivy-fs.result }}
+          R_PIP_AUDIT: ${{ needs.pip-audit.result }}
+          R_BANDIT: ${{ needs.bandit.result }}
+          R_GITLEAKS: ${{ needs.gitleaks.result }}
+        run: |
+          {
+            echo "## Security Scan Summary"
+            echo ""
+            echo "| Scan | Result |"
+            echo "|------|--------|"
+            echo "| CodeQL | ${R_CODEQL} |"
+            echo "| Trivy (container) | ${R_TRIVY_C} |"
+            echo "| Trivy (filesystem) | ${R_TRIVY_FS} |"
+            echo "| pip-audit | ${R_PIP_AUDIT} |"
+            echo "| Bandit | ${R_BANDIT} |"
+            echo "| Gitleaks | ${R_GITLEAKS} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Only the blocking scans decide the overall result.
+          if [ "$R_TRIVY_C" = "failure" ] || [ "$R_CODEQL" = "failure" ]; then
+            echo "::error::Blocking security scan failed"
+            exit 1
+          fi

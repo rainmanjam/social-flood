@@ -73,6 +73,13 @@ class RedisManager:
                 str(redis_url),
                 encoding="utf-8",
                 decode_responses=True,
+                # Pin RESP2 explicitly. redis-py 8.x flips DEFAULT_RESP_VERSION
+                # from 2 to 3, which changes reply types under this client
+                # without any test catching it (the suite runs with
+                # REDIS_URL unset, so this path is never exercised in CI).
+                # Being explicit makes the 8.x upgrade a deliberate choice
+                # rather than a silent behaviour change.
+                protocol=2,
                 max_connections=20,
                 socket_connect_timeout=5.0,
                 socket_timeout=5.0,

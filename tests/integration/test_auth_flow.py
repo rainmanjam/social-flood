@@ -6,7 +6,6 @@ across the application.
 """
 import pytest
 from fastapi.testclient import TestClient
-from unittest.mock import patch
 import os
 
 
@@ -52,26 +51,66 @@ def auth_enabled_app():
     get_settings.cache_clear()
 
 
+PROTECTED_PROBE = "/__auth_probe__"
+
+
+def _attach_probe(app):
+    """
+    Register a route guarded by the real auth dependency.
+
+    Several tests below asserted 401 against ``/api-config``, which is a
+    PUBLIC endpoint (main.py registers it with no dependency), so they could
+    never pass. Point them at a route that really is protected instead, and
+    keep them off the network at the same time.
+    """
+    from fastapi import Depends
+    from app.core.auth import get_api_key
+
+    @app.get(PROTECTED_PROBE)
+    async def _probe(api_key: str = Depends(get_api_key)):
+        return {"api_key": api_key}
+
+    return app
+
+
 @pytest.fixture
 def auth_client(auth_enabled_app):
     """Create test client for auth-enabled app."""
-    return TestClient(auth_enabled_app)
+    return TestClient(_attach_probe(auth_enabled_app))
 
 
 class TestApiKeyAuthentication:
     """Integration tests for API key authentication."""
 
     def test_public_endpoints_without_auth(self, auth_client):
-        """Test that public endpoints don't require authentication."""
-        # Health endpoints should be public
+        """Liveness probes stay public; nothing else does.
+
+        /health and /ping exist for load balancers and container health
+        checks, which cannot present a key. /health is liveness ONLY -- it
+        used to return version and environment, which is why /status below is
+        no longer in this list.
+        """
         response = auth_client.get("/health")
         assert response.status_code == 200
 
         response = auth_client.get("/ping")
         assert response.status_code == 200
 
+    def test_status_requires_auth(self, auth_client):
+        """/status discloses the running version and environment.
+
+        This test previously asserted /status was public. That was the bug,
+        not the contract: an unauthenticated caller could read the deployed
+        version and environment, which is a free reconnaissance step toward
+        matching a deployment against known CVEs. It is now key-gated.
+        """
         response = auth_client.get("/status")
-        assert response.status_code == 200
+        assert response.status_code == 401
+
+        response = auth_client.get(
+            "/status", headers={"X-API-Key": "valid-test-key-123"}
+        )
+        assert response.status_code == 200, response.text
 
     def test_docs_endpoints_without_auth(self, auth_client):
         """Test that documentation endpoints don't require authentication."""
@@ -87,27 +126,41 @@ class TestApiKeyAuthentication:
     def test_valid_api_key_in_header(self, auth_client):
         """Test that valid API key in header is accepted."""
         response = auth_client.get(
-            "/api-config",
+            PROTECTED_PROBE,
             headers={"X-API-Key": "valid-test-key-123"}
         )
-        assert response.status_code == 200
+        assert response.status_code == 200, response.text
 
     def test_another_valid_api_key(self, auth_client):
         """Test that another valid API key is accepted."""
         response = auth_client.get(
-            "/api-config",
+            PROTECTED_PROBE,
             headers={"X-API-Key": "another-valid-key-456"}
         )
-        assert response.status_code == 200
+        assert response.status_code == 200, response.text
 
     def test_invalid_api_key_rejected(self, auth_client):
-        """Test that invalid API key is rejected."""
+        """Test that invalid API key is rejected on a protected route."""
         response = auth_client.get(
-            "/api-config",
+            PROTECTED_PROBE,
             headers={"X-API-Key": "invalid-key"}
         )
         # Should return 401 or 403
-        assert response.status_code in [401, 403]
+        assert response.status_code in [401, 403], response.text
+
+    def test_valid_api_key_on_protected_route(self, auth_client):
+        """A configured key must actually authenticate, not 500."""
+        response = auth_client.get(
+            PROTECTED_PROBE,
+            headers={"X-API-Key": "valid-test-key-123"}
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["api_key"] == "valid-test-key-123"
+
+    def test_missing_api_key_rejected_on_protected_route(self, auth_client):
+        """No header on a protected route must be 401, not 500 and not 200."""
+        response = auth_client.get(PROTECTED_PROBE)
+        assert response.status_code == 401, response.text
 
     def test_missing_api_key_rejected(self, auth_client):
         """Test that missing API key is rejected for protected endpoints."""
@@ -128,15 +181,15 @@ class TestApiKeyAuthentication:
         """Test that header name is handled correctly."""
         # Standard header name
         response = auth_client.get(
-            "/api-config",
+            PROTECTED_PROBE,
             headers={"X-API-Key": "valid-test-key-123"}
         )
-        assert response.status_code == 200
+        assert response.status_code == 200, response.text
 
     def test_whitespace_in_api_key_handled(self, auth_client):
         """Test that whitespace around API key is handled."""
         response = auth_client.get(
-            "/api-config",
+            PROTECTED_PROBE,
             headers={"X-API-Key": " valid-test-key-123 "}
         )
         # Depends on implementation - might strip whitespace or reject
@@ -173,6 +226,21 @@ class TestAuthenticationDisabled:
         client = TestClient(no_auth_app)
         response = client.get("/api-config")
         assert response.status_code == 200
+
+    def test_protected_route_accessible_without_header(self, no_auth_app):
+        """
+        With auth disabled, a protected route must accept a request that
+        sends NO X-API-Key header at all.
+
+        APIKeyHeader(auto_error=True) used to reject the header-less request
+        inside FastAPI before the "auth disabled" branch could run, so
+        disabling auth inverted it: header-less probes looked locked while
+        `X-API-Key: anything` returned 200 with real data.
+        """
+        client = TestClient(_attach_probe(no_auth_app))
+        response = client.get(PROTECTED_PROBE)
+        assert response.status_code == 200, response.text
+        assert response.json()["api_key"] == "authentication-disabled"
 
 
 class TestAuthErrorResponses:

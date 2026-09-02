@@ -5,6 +5,7 @@ Provides endpoints for Google Trends data including trending topics,
 interest over time, and related queries.
 """
 from fastapi import APIRouter, Query, HTTPException, Depends
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
 from datetime import date
 import logging
@@ -93,6 +94,204 @@ def get_random_headers():
     return headers
 
 # -------------------------------------------------------------------------
+# Timeframe mapping
+#
+# Built once at import rather than per request. The completeness check below
+# turns a wrong or missing enum member into an immediate, loud import failure
+# instead of a 500 that only shows up when somebody calls the endpoint -- the
+# exact shape of the bug that left /trending-now-showcase-timeline broken (the
+# router referenced ``HumanFriendlyBatchPeriod.past_4h`` when the enum only
+# defined ``PAST_4H``).
+# -------------------------------------------------------------------------
+BATCH_PERIOD_BY_TIMEFRAME = {
+    HumanFriendlyBatchPeriod.past_4h: BatchPeriod.Past4H,
+    HumanFriendlyBatchPeriod.past_24h: BatchPeriod.Past24H,
+    HumanFriendlyBatchPeriod.past_48h: BatchPeriod.Past48H,
+    HumanFriendlyBatchPeriod.past_7d: BatchPeriod.Past7D,
+}
+
+_unmapped_timeframes = set(HumanFriendlyBatchPeriod) - set(BATCH_PERIOD_BY_TIMEFRAME)
+if _unmapped_timeframes:
+    raise RuntimeError(
+        "BATCH_PERIOD_BY_TIMEFRAME is missing HumanFriendlyBatchPeriod members: "
+        + ", ".join(sorted(member.value for member in _unmapped_timeframes))
+    )
+
+
+# -------------------------------------------------------------------------
+# Upstream failure handling
+#
+# Every endpoint below used to wrap its trendspy call in a bare
+# ``except Exception: return None`` and then answer ``{"data": []}`` with
+# HTTP 200. Because that 200 went through ``get_cached_or_fetch``, a single
+# upstream blip was written into the cache and served to every caller for the
+# full TTL. Two distinct situations were collapsed into one response:
+#
+#   * Google Trends answered, and the answer was empty  -> 200, "no data"
+#   * The call to Google Trends failed                  -> must be 502
+#
+# ``run_trends_call`` keeps them apart. It returns the upstream result (which
+# may legitimately be empty) and raises ``UpstreamUnavailable`` when the call
+# itself failed. ``get_cached_or_fetch`` re-raises rather than caching, so a
+# failure is never stored.
+# -------------------------------------------------------------------------
+
+# Identical for every cause, so the response body cannot be used to probe what
+# went wrong upstream. The detail lives in the logs.
+UPSTREAM_UNAVAILABLE_DETAIL = "Upstream Google Trends request failed. Please retry."
+UPSTREAM_UNUSABLE_DETAIL = "Upstream Google Trends returned an unusable response."
+
+
+class UpstreamUnavailable(Exception):
+    """Raised when a call to Google Trends fails or returns something unusable.
+
+    Distinct from "Google Trends returned nothing": this means we never got a
+    usable answer, so the result must not be cached and must not be presented
+    to the caller as a successful empty response.
+
+    Attributes:
+        operation: Name of the trendspy call, for logs.
+        detail: Message safe to return in the HTTP response body.
+    """
+
+    def __init__(self, operation: str, detail: str = UPSTREAM_UNAVAILABLE_DETAIL):
+        super().__init__(f"{operation}: {detail}")
+        self.operation = operation
+        self.detail = detail
+
+
+async def run_trends_call(operation: str, call):
+    """Run a blocking trendspy call off the event loop.
+
+    Args:
+        operation: Name used in log messages (e.g. ``"interest_over_time"``).
+        call: Zero-argument callable performing the trendspy request.
+
+    Returns:
+        Whatever trendspy returned, including empty results.
+
+    Raises:
+        UpstreamUnavailable: if the trendspy call raised. The original
+            exception is logged, never returned to the caller.
+    """
+    loop = asyncio.get_event_loop()
+    try:
+        return await loop.run_in_executor(None, call)
+    except Exception as exc:  # noqa: BLE001 - re-raised as UpstreamUnavailable
+        logger.error("Google Trends call %s failed: %s", operation, exc, exc_info=True)
+        raise UpstreamUnavailable(operation) from exc
+
+
+async def cached_trends_response(cache_key: str, fetch_func, ttl: Optional[int] = None):
+    """Serve a Trends endpoint from cache, mapping upstream failure to 502.
+
+    ``get_cached_or_fetch`` re-raises instead of caching when ``fetch_func``
+    raises, so an upstream failure leaves the cache untouched and the next
+    request tries again.
+    """
+    try:
+        return await get_cached_or_fetch(cache_key, fetch_func, ttl=ttl)
+    except UpstreamUnavailable as exc:
+        raise HTTPException(status_code=502, detail=exc.detail) from exc
+
+
+def is_empty_result(value) -> bool:
+    """Return True when the upstream answer carries no rows.
+
+    Empty is a legitimate answer (a keyword nobody searched for), so it is
+    reported as 200 with an explanatory message -- never as a failure.
+
+    ``None`` is counted as empty deliberately: trendspy returns it for "no
+    data", and every way of *failing* now raises instead (see
+    :func:`run_trends_call`), so ``None`` no longer doubles as a swallowed
+    error the way it did when each endpoint caught ``Exception`` and returned
+    ``None`` itself. If a future trendspy release starts returning ``None``
+    for errors as well, this is the line that has to change.
+    """
+    if value is None:
+        return True
+    if isinstance(value, pd.DataFrame):
+        return value.empty
+    if isinstance(value, (list, tuple, dict, str, set)):
+        return len(value) == 0
+    return False
+
+
+def encode_trends_payload(operation: str, raw):
+    """Convert an upstream result into a JSON-serialisable payload.
+
+    Raises:
+        UpstreamUnavailable: if the result cannot be encoded. Returning
+            ``{"data": []}`` here would cache an unusable upstream answer as a
+            success, which is the failure mode this module exists to avoid.
+    """
+    try:
+        return jsonable_encoder(to_jsonable(raw))
+    except Exception as exc:  # noqa: BLE001 - re-raised as UpstreamUnavailable
+        logger.error(
+            "Could not serialise Google Trends %s response: %s",
+            operation, exc, exc_info=True,
+        )
+        raise UpstreamUnavailable(operation, UPSTREAM_UNUSABLE_DETAIL) from exc
+
+
+def normalise_trending_news(raw):
+    """Validate and normalise a ``trending_now_news_by_ids`` response.
+
+    trendspy returns a list of rows whose third element carries the news
+    payload, sometimes as a JSON string. Anything that does not fit that shape
+    means the upstream contract changed.
+
+    Raises:
+        UpstreamUnavailable: on any unrecognised shape. Previously each of
+            these branches answered 200 with ``{"data": []}``, which cached a
+            broken upstream response for the full TTL.
+    """
+    operation = "trending_now_news_by_ids"
+
+    if not isinstance(raw, list):
+        logger.error("Google Trends %s returned %s, expected list", operation, type(raw))
+        raise UpstreamUnavailable(operation, UPSTREAM_UNUSABLE_DETAIL)
+
+    rows = list(raw)
+    for index, row in enumerate(rows):
+        if row is None or not isinstance(row, (list, tuple)) or len(row) < 3:
+            logger.error("Google Trends %s row %d has unexpected shape", operation, index)
+            raise UpstreamUnavailable(operation, UPSTREAM_UNUSABLE_DETAIL)
+
+        row = list(row)
+        news_data = row[2]
+        if news_data is None:
+            logger.error("Google Trends %s row %d carries no news payload", operation, index)
+            raise UpstreamUnavailable(operation, UPSTREAM_UNUSABLE_DETAIL)
+
+        if isinstance(news_data, str):
+            try:
+                row[2] = json.loads(news_data)
+            except json.JSONDecodeError as exc:
+                logger.error(
+                    "Google Trends %s row %d has unparseable JSON: %s",
+                    operation, index, exc,
+                )
+                raise UpstreamUnavailable(operation, UPSTREAM_UNUSABLE_DETAIL) from exc
+        elif not isinstance(news_data, (dict, list)):
+            logger.error(
+                "Google Trends %s row %d news payload is %s",
+                operation, index, type(news_data),
+            )
+            raise UpstreamUnavailable(operation, UPSTREAM_UNUSABLE_DETAIL)
+
+        rows[index] = row
+
+    return rows
+
+
+def empty_trends_response(message: str) -> dict:
+    """Build the 200 response used when Google Trends genuinely had no data."""
+    return {"data": [], "message": message}
+
+
+# -------------------------------------------------------------------------
 # Helper: Create a new Trends instance per request
 # -------------------------------------------------------------------------
 async def get_trends_instance():
@@ -142,49 +341,27 @@ async def interest_over_time(
 
         async def fetch_interest_over_time():
             trends_obj = await get_trends_instance()
-            logger.debug("TrendSpy instance created successfully")
 
-            def safe_get_interest_over_time():
-                try:
-                    logger.debug(f"Calling TrendSpy API with keywords: {kw_list}, timeframe: {timeframe}, geo: {geo}, cat: {cat}, gprop: {gprop}")
-                    df = trends_obj.interest_over_time(
-                        kw_list,
-                        timeframe=timeframe,
-                        geo=geo,
-                        cat=cat,
-                        gprop=gprop
-                    )
-                    logger.debug(f"Raw API response: {df}")
+            raw_results = await run_trends_call(
+                "interest_over_time",
+                lambda: trends_obj.interest_over_time(
+                    kw_list,
+                    timeframe=timeframe,
+                    geo=geo,
+                    cat=cat,
+                    gprop=gprop,
+                ),
+            )
 
-                    if df is None or df.empty:
-                        logger.warning("TrendSpy API returned no data for interest_over_time")
-                        return None
+            if is_empty_result(raw_results):
+                logger.info("Google Trends returned no interest_over_time rows")
+                return empty_trends_response("No data returned from Google Trends.")
 
-                    return df
+            return {"data": encode_trends_payload("interest_over_time", raw_results)}
 
-                except Exception as e:
-                    logger.error(f"Error processing interest_over_time data: {e}", exc_info=True)
-                    return None
-
-            loop = asyncio.get_event_loop()
-            logger.debug("Executing TrendSpy API call asynchronously")
-            raw_results = await loop.run_in_executor(None, safe_get_interest_over_time)
-
-            if raw_results is None:
-                logger.warning("No data returned from TrendSpy API for interest_over_time")
-                return {"data": [], "message": "No data returned from Google Trends."}
-
-            try:
-                logger.debug("Converting results to JSON-serializable format")
-                data = to_jsonable(raw_results)
-                logger.debug(f"Successfully converted data: {data}")
-                return {"data": data}
-            except Exception as json_err:
-                logger.error(f"Error converting results to JSON: {json_err}", exc_info=True)
-                return {"data": [], "message": "Failed to process interest over time data."}
-
-        # Get cached result or fetch and cache
-        return await get_cached_or_fetch(cache_key, fetch_interest_over_time)
+        # Get cached result or fetch and cache. An upstream failure raises out
+        # of the fetcher, so nothing is written to the cache.
+        return await cached_trends_response(cache_key, fetch_interest_over_time)
 
     except HTTPException as http_exc:
         raise http_exc
@@ -222,50 +399,29 @@ async def interest_by_region(
 
         async def fetch_interest_by_region():
             trends_obj = await get_trends_instance()
-            logger.debug("TrendSpy instance created successfully")
 
-            def safe_get_interest_by_region():
-                try:
-                    logger.debug(f"Calling TrendSpy API with keyword: {keyword}, timeframe: {timeframe}, geo: {geo}, cat: {cat}, resolution: {resolution}")
-                    df = trends_obj.interest_by_region(
-                        keyword,
-                        timeframe=timeframe,
-                        geo=geo,
-                        cat=cat,
-                        resolution=resolution
-                    )
-                    logger.debug(f"Raw API response: {df}")
+            raw_results = await run_trends_call(
+                "interest_by_region",
+                lambda: trends_obj.interest_by_region(
+                    keyword,
+                    timeframe=timeframe,
+                    geo=geo,
+                    cat=cat,
+                    resolution=resolution,
+                ),
+            )
 
-                    if df is None or df.empty:
-                        logger.warning("TrendSpy API returned no data for interest_by_region")
-                        return None
+            if is_empty_result(raw_results):
+                logger.info("Google Trends returned no interest_by_region rows")
+                return empty_trends_response("No data returned from Google Trends.")
 
-                    return df
-
-                except Exception as e:
-                    logger.error(f"Error processing interest_by_region data: {e}", exc_info=True)
-                    return None
-
-            loop = asyncio.get_event_loop()
-            logger.debug("Executing TrendSpy API call asynchronously")
-            raw_results = await loop.run_in_executor(None, safe_get_interest_by_region)
-
-            if raw_results is None:
-                logger.warning("No data returned from TrendSpy API for interest_by_region")
-                return {"data": [], "message": "No data returned from Google Trends."}
-
-            try:
-                logger.debug("Converting results to JSON-serializable format")
-                data = to_jsonable(raw_results)
-                logger.debug(f"Successfully converted data: {data}")
-                return {"data": data}
-            except Exception as json_err:
-                logger.error(f"Error converting results to JSON: {json_err}", exc_info=True)
-                return {"data": [], "message": "Failed to process interest by region data."}
+            return {"data": encode_trends_payload("interest_by_region", raw_results)}
 
         # Get cached result or fetch and cache
-        return await get_cached_or_fetch(cache_key, fetch_interest_by_region)
+        return await cached_trends_response(cache_key, fetch_interest_by_region)
 
+    except HTTPException as http_exc:
+        raise http_exc
     except Exception as e:
         logger.error(f"Error in interest_by_region: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error")
@@ -300,50 +456,29 @@ async def related_queries(
 
         async def fetch_related_queries():
             trends_obj = await get_trends_instance()
-            logger.debug("TrendSpy instance created successfully")
 
-            def safe_get_related_queries():
-                try:
-                    logger.debug(f"Calling TrendSpy API with keyword: {keyword}, timeframe: {timeframe}, geo: {geo}, cat: {cat}, gprop: {gprop}")
-                    data = trends_obj.related_queries(
-                        keyword,
-                        timeframe=timeframe,
-                        geo=geo,
-                        cat=cat,
-                        gprop=gprop
-                    )
-                    logger.debug(f"Raw API response: {data}")
+            raw_results = await run_trends_call(
+                "related_queries",
+                lambda: trends_obj.related_queries(
+                    keyword,
+                    timeframe=timeframe,
+                    geo=geo,
+                    cat=cat,
+                    gprop=gprop,
+                ),
+            )
 
-                    if data is None:
-                        logger.warning("TrendSpy API returned no data for related_queries")
-                        return None
+            if is_empty_result(raw_results):
+                logger.info("Google Trends returned no related_queries rows")
+                return empty_trends_response("No related queries data was returned.")
 
-                    return data
-
-                except Exception as e:
-                    logger.error(f"Error processing related_queries data: {e}", exc_info=True)
-                    return None
-
-            loop = asyncio.get_event_loop()
-            logger.debug("Executing TrendSpy API call asynchronously")
-            raw_results = await loop.run_in_executor(None, safe_get_related_queries)
-
-            if raw_results is None:
-                logger.warning("No related queries data returned from TrendSpy API")
-                return {"data": [], "message": "No related queries data was returned."}
-
-            try:
-                logger.debug("Converting results to JSON-serializable format")
-                data = to_jsonable(raw_results)
-                logger.debug(f"Successfully converted data: {data}")
-                return {"data": data}
-            except Exception as json_err:
-                logger.error(f"Error converting results to JSON: {json_err}", exc_info=True)
-                return {"data": [], "message": "Failed to process related queries data."}
+            return {"data": encode_trends_payload("related_queries", raw_results)}
 
         # Get cached result or fetch and cache
-        return await get_cached_or_fetch(cache_key, fetch_related_queries)
+        return await cached_trends_response(cache_key, fetch_related_queries)
 
+    except HTTPException as http_exc:
+        raise http_exc
     except Exception as e:
         logger.error(f"Error in related_queries: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error")
@@ -378,50 +513,29 @@ async def related_topics(
 
         async def fetch_related_topics():
             trends_obj = await get_trends_instance()
-            logger.debug("TrendSpy instance created successfully")
 
-            def safe_get_related_topics():
-                try:
-                    logger.debug(f"Calling TrendSpy API with keyword: {keyword}, timeframe: {timeframe}, geo: {geo}, cat: {cat}, gprop: {gprop}")
-                    data = trends_obj.related_topics(
-                        keyword,
-                        timeframe=timeframe,
-                        geo=geo,
-                        cat=cat,
-                        gprop=gprop
-                    )
-                    logger.debug(f"Raw API response: {data}")
+            raw_results = await run_trends_call(
+                "related_topics",
+                lambda: trends_obj.related_topics(
+                    keyword,
+                    timeframe=timeframe,
+                    geo=geo,
+                    cat=cat,
+                    gprop=gprop,
+                ),
+            )
 
-                    if data is None:
-                        logger.warning("TrendSpy API returned no data for related_topics")
-                        return None
+            if is_empty_result(raw_results):
+                logger.info("Google Trends returned no related_topics rows")
+                return empty_trends_response("No related topics data was returned.")
 
-                    return data
-
-                except Exception as e:
-                    logger.error(f"Error processing related_topics data: {e}", exc_info=True)
-                    return None
-
-            loop = asyncio.get_event_loop()
-            logger.debug("Executing TrendSpy API call asynchronously")
-            raw_results = await loop.run_in_executor(None, safe_get_related_topics)
-
-            if raw_results is None:
-                logger.warning("No related topics data returned from TrendSpy API")
-                return {"data": [], "message": "No related topics data was returned."}
-
-            try:
-                logger.debug("Converting results to JSON-serializable format")
-                data = to_jsonable(raw_results)
-                logger.debug(f"Successfully converted data: {data}")
-                return {"data": data}
-            except Exception as json_err:
-                logger.error(f"Error converting results to JSON: {json_err}", exc_info=True)
-                return {"data": [], "message": "Failed to process related topics data."}
+            return {"data": encode_trends_payload("related_topics", raw_results)}
 
         # Get cached result or fetch and cache
-        return await get_cached_or_fetch(cache_key, fetch_related_topics)
+        return await cached_trends_response(cache_key, fetch_related_topics)
 
+    except HTTPException as http_exc:
+        raise http_exc
     except Exception as e:
         logger.error(f"Error in related_topics: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error")
@@ -446,44 +560,23 @@ async def trending_now(
 
         async def fetch_trending_now():
             trends_obj = await get_trends_instance()
-            logger.debug("TrendSpy instance created successfully")
 
-            def safe_get_trending_now():
-                try:
-                    logger.debug(f"Calling TrendSpy API with geo: {geo}")
-                    data = trends_obj.trending_now(geo=geo)
-                    logger.debug(f"Raw API response: {data}")
+            raw_results = await run_trends_call(
+                "trending_now",
+                lambda: trends_obj.trending_now(geo=geo),
+            )
 
-                    if data is None:
-                        logger.warning("TrendSpy API returned no data for trending_now")
-                        return None
+            if is_empty_result(raw_results):
+                logger.info("Google Trends returned no trending_now rows")
+                return empty_trends_response("No trending now data was returned.")
 
-                    return data
-
-                except Exception as e:
-                    logger.error(f"Error processing trending_now data: {e}", exc_info=True)
-                    return None
-
-            loop = asyncio.get_event_loop()
-            logger.debug("Executing TrendSpy API call asynchronously")
-            raw_results = await loop.run_in_executor(None, safe_get_trending_now)
-
-            if raw_results is None:
-                logger.warning("No trending now data returned from TrendSpy API")
-                return {"data": [], "message": "No trending now data was returned."}
-
-            try:
-                logger.debug("Converting results to JSON-serializable format")
-                data = to_jsonable(raw_results)
-                logger.debug(f"Successfully converted data: {data}")
-                return {"data": data}
-            except Exception as json_err:
-                logger.error(f"Error converting results to JSON: {json_err}", exc_info=True)
-                return {"data": [], "message": "Failed to process trending now data."}
+            return {"data": encode_trends_payload("trending_now", raw_results)}
 
         # Get cached result or fetch and cache
-        return await get_cached_or_fetch(cache_key, fetch_trending_now)
+        return await cached_trends_response(cache_key, fetch_trending_now)
 
+    except HTTPException as http_exc:
+        raise http_exc
     except Exception as e:
         logger.error(f"Error in trending_now: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error")
@@ -508,44 +601,23 @@ async def trending_now_by_rss(
 
         async def fetch_trending_now_by_rss():
             trends_obj = await get_trends_instance()
-            logger.debug("TrendSpy instance created successfully")
 
-            def safe_get_trending_now_by_rss():
-                try:
-                    logger.debug(f"Calling TrendSpy API with geo: {geo}")
-                    data = trends_obj.trending_now_by_rss(geo=geo)
-                    logger.debug(f"Raw API response: {data}")
+            raw_results = await run_trends_call(
+                "trending_now_by_rss",
+                lambda: trends_obj.trending_now_by_rss(geo=geo),
+            )
 
-                    if data is None:
-                        logger.warning("TrendSpy API returned no data for trending_now_by_rss")
-                        return None
+            if is_empty_result(raw_results):
+                logger.info("Google Trends returned no trending_now_by_rss rows")
+                return empty_trends_response("No trending now by RSS data was returned.")
 
-                    return data
-
-                except Exception as e:
-                    logger.error(f"Error processing trending_now_by_rss data: {e}", exc_info=True)
-                    return None
-
-            loop = asyncio.get_event_loop()
-            logger.debug("Executing TrendSpy API call asynchronously")
-            raw_results = await loop.run_in_executor(None, safe_get_trending_now_by_rss)
-
-            if raw_results is None:
-                logger.warning("No trending now by RSS data returned from TrendSpy API")
-                return {"data": [], "message": "No trending now by RSS data was returned."}
-
-            try:
-                logger.debug("Converting results to JSON-serializable format")
-                data = to_jsonable(raw_results)
-                logger.debug(f"Successfully converted data: {data}")
-                return {"data": data}
-            except Exception as json_err:
-                logger.error(f"Error converting results to JSON: {json_err}", exc_info=True)
-                return {"data": [], "message": "Failed to process trending now by RSS data."}
+            return {"data": encode_trends_payload("trending_now_by_rss", raw_results)}
 
         # Get cached result or fetch and cache
-        return await get_cached_or_fetch(cache_key, fetch_trending_now_by_rss)
+        return await cached_trends_response(cache_key, fetch_trending_now_by_rss)
 
+    except HTTPException as http_exc:
+        raise http_exc
     except Exception as e:
         logger.error(f"Error in trending_now_by_rss: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error")
@@ -582,87 +654,24 @@ async def trending_now_news_by_ids(
 
         async def fetch_trending_now_news_by_ids():
             trends_obj = await get_trends_instance()
-            logger.debug("TrendSpy instance created successfully")
 
-            def safe_get_news():
-                try:
-                    logger.debug(f"Calling TrendSpy API with tokens: {token_list}, max_news: {max_news}")
-                    data = trends_obj.trending_now_news_by_ids(token_list, max_news=max_news)
-                    logger.debug(f"Raw API response: {data}")
+            raw_results = await run_trends_call(
+                "trending_now_news_by_ids",
+                lambda: trends_obj.trending_now_news_by_ids(token_list, max_news=max_news),
+            )
 
-                    # Check if data is None or empty
-                    if not data:
-                        logger.warning("TrendSpy API returned empty data for trending_now_news_by_ids")
-                        return None
+            if is_empty_result(raw_results):
+                logger.info("Google Trends returned no trending_now_news_by_ids rows")
+                return empty_trends_response("No news data was returned.")
 
-                    if not isinstance(data, list):
-                        logger.warning(f"TrendSpy API returned non-list data type: {type(data)}")
-                        return None
+            # A response in an unrecognised shape is an upstream problem, not
+            # "no news": answering 200 with [] would cache the bad response.
+            normalised = normalise_trending_news(raw_results)
 
-                    if len(data) == 0:
-                        logger.warning("TrendSpy API returned empty list for trending_now_news_by_ids")
-                        return None
-
-                    logger.debug(f"First element type: {type(data[0])}")
-                    logger.debug(f"First element content: {data[0]}")
-
-                    if data[0] is None:
-                        logger.warning("First element of API response is None")
-                        return None
-
-                    if len(data[0]) < 3:
-                        logger.warning(f"First element has insufficient length: {len(data[0])}")
-                        return None
-
-                    logger.debug(f"Element at data[0][2] type: {type(data[0][2])}")
-                    logger.debug(f"Element at data[0][2] content: {data[0][2]}")
-
-                    news_data = data[0][2]
-                    if news_data is None:
-                        logger.warning("Required news data element is None")
-                        return None
-
-                    # Handle different response types
-                    if isinstance(news_data, str):
-                        try:
-                            parsed_json = json.loads(news_data)
-                            data[0][2] = parsed_json
-                            logger.debug(f"Successfully parsed JSON data: {parsed_json}")
-                        except json.JSONDecodeError as je:
-                            logger.error(f"Failed to parse JSON: {je}")
-                            return None
-                    elif isinstance(news_data, (dict, list)):
-                        logger.debug("News data already in JSON format")
-                    else:
-                        logger.warning(f"Unexpected news data type: {type(news_data)}")
-                        return None
-
-                    logger.debug(f"Final validated data structure: {data}")
-                    return data
-
-                except (IndexError, TypeError, AttributeError) as e:
-                    logger.error(f"Error processing API response: {e}", exc_info=True)
-                    return None
-
-            loop = asyncio.get_event_loop()
-            logger.debug("Executing API call asynchronously")
-            raw_results = await loop.run_in_executor(None, safe_get_news)
-
-            if raw_results is None:
-                logger.warning("No valid news data returned from TrendSpy API call")
-                return {"data": [], "message": "No news data was returned."}
-
-            try:
-                logger.debug("Converting results to JSON-serializable format")
-                data = to_jsonable(raw_results)
-                logger.debug(f"Successfully converted data: {data}")
-                return {"data": data}
-            except Exception as json_err:
-                logger.error(f"Error converting results to JSON: {json_err}", exc_info=True)
-                return {"data": [], "message": "Failed to process news data."}
+            return {"data": encode_trends_payload("trending_now_news_by_ids", normalised)}
 
         # Get cached result or fetch and cache
-        return await get_cached_or_fetch(cache_key, fetch_trending_now_news_by_ids)
+        return await cached_trends_response(cache_key, fetch_trending_now_news_by_ids)
 
     except HTTPException as http_exc:
         raise http_exc
@@ -689,18 +698,10 @@ async def trending_now_showcase_timeline(
             logger.warning("No valid keywords provided")
             raise HTTPException(status_code=400, detail="No valid keywords provided")
 
-        # Map human-friendly timeframe to BatchPeriod
-        timeframe_mapping = {
-            HumanFriendlyBatchPeriod.past_4h: BatchPeriod.Past4H,
-            HumanFriendlyBatchPeriod.past_24h: BatchPeriod.Past24H,
-            HumanFriendlyBatchPeriod.past_48h: BatchPeriod.Past48H,
-            HumanFriendlyBatchPeriod.past_7d: BatchPeriod.Past7D
-        }
-
-        mapped_timeframe = timeframe_mapping.get(timeframe)
-        if not mapped_timeframe:
-            logger.warning(f"Invalid timeframe provided: {timeframe}")
-            raise HTTPException(status_code=400, detail="Invalid timeframe provided.")
+        # FastAPI has already rejected anything outside the enum, and
+        # BATCH_PERIOD_BY_TIMEFRAME is checked for completeness at import time,
+        # so this lookup cannot miss.
+        mapped_timeframe = BATCH_PERIOD_BY_TIMEFRAME[timeframe]
 
         # Generate cache key
         cache_key = generate_cache_key(
@@ -711,46 +712,29 @@ async def trending_now_showcase_timeline(
 
         async def fetch_trending_now_showcase_timeline():
             trends_obj = await get_trends_instance()
-            logger.debug("TrendSpy instance created successfully")
 
-            def safe_get_timeline():
-                try:
-                    logger.debug(f"Calling TrendSpy API with keywords: {keyword_list}, timeframe: {mapped_timeframe}")
-                    data = trends_obj.trending_now_showcase_timeline(
-                        keyword_list,
-                        timeframe=mapped_timeframe
-                    )
-                    logger.debug(f"Raw API response: {data}")
+            raw_results = await run_trends_call(
+                "trending_now_showcase_timeline",
+                lambda: trends_obj.trending_now_showcase_timeline(
+                    keyword_list,
+                    timeframe=mapped_timeframe,
+                ),
+            )
 
-                    if data is None:
-                        logger.warning("TrendSpy API returned no data for trending_now_showcase_timeline")
-                        return None
+            if is_empty_result(raw_results):
+                logger.info("Google Trends returned no showcase timeline rows")
+                return empty_trends_response("No timeline data was returned.")
 
-                    return data
-
-                except Exception as e:
-                    logger.error(f"Error processing trending_now_showcase_timeline data: {e}", exc_info=True)
-                    return None
-
-            loop = asyncio.get_event_loop()
-            logger.debug("Executing TrendSpy API call asynchronously")
-            raw_results = await loop.run_in_executor(None, safe_get_timeline)
-
-            if raw_results is None:
-                logger.warning("No timeline data returned from TrendSpy API call")
-                return {"data": [], "message": "No timeline data was returned."}
-
-            try:
-                logger.debug("Converting results to JSON-serializable format")
-                data = to_jsonable(raw_results)
-                logger.debug(f"Successfully converted data: {data}")
-                return {"data": data}
-            except Exception as json_err:
-                logger.error(f"Error converting results to JSON: {json_err}", exc_info=True)
-                return {"data": [], "message": "Failed to process timeline data."}
+            return {
+                "data": encode_trends_payload(
+                    "trending_now_showcase_timeline", raw_results
+                )
+            }
 
         # Get cached result or fetch and cache
-        return await get_cached_or_fetch(cache_key, fetch_trending_now_showcase_timeline)
+        return await cached_trends_response(
+            cache_key, fetch_trending_now_showcase_timeline
+        )
 
     except HTTPException as http_exc:
         raise http_exc
@@ -780,44 +764,23 @@ async def get_categories(
 
         async def fetch_categories():
             trends_obj = await get_trends_instance()
-            logger.debug("TrendSpy instance created successfully")
 
-            def safe_get_categories():
-                try:
-                    logger.debug(f"Calling TrendSpy API with find: {find}, root: {root}")
-                    data = trends_obj.categories(find=find)
-                    logger.debug(f"Raw API response: {data}")
+            raw_results = await run_trends_call(
+                "categories",
+                lambda: trends_obj.categories(find=find),
+            )
 
-                    if data is None:
-                        logger.warning("TrendSpy API returned no data for categories")
-                        return None
+            if is_empty_result(raw_results):
+                logger.info("Google Trends returned no categories rows")
+                return empty_trends_response("No categories data was returned.")
 
-                    return data
-
-                except Exception as e:
-                    logger.error(f"Error processing categories data: {e}", exc_info=True)
-                    return None
-
-            loop = asyncio.get_event_loop()
-            logger.debug("Executing TrendSpy API call asynchronously")
-            raw_results = await loop.run_in_executor(None, safe_get_categories)
-
-            if raw_results is None:
-                logger.warning("No categories data returned from TrendSpy API")
-                return {"data": [], "message": "No categories data was returned."}
-
-            try:
-                logger.debug("Converting results to JSON-serializable format")
-                data = to_jsonable(raw_results)
-                logger.debug(f"Successfully converted data: {data}")
-                return {"data": data}
-            except Exception as json_err:
-                logger.error(f"Error converting results to JSON: {json_err}", exc_info=True)
-                return {"data": [], "message": "Failed to process categories data."}
+            return {"data": encode_trends_payload("categories", raw_results)}
 
         # Get cached result or fetch and cache
-        return await get_cached_or_fetch(cache_key, fetch_categories)
+        return await cached_trends_response(cache_key, fetch_categories)
 
+    except HTTPException as http_exc:
+        raise http_exc
     except Exception as e:
         logger.error(f"Error in get_categories: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error")
@@ -842,44 +805,23 @@ async def get_geo(
 
         async def fetch_geo():
             trends_obj = await get_trends_instance()
-            logger.debug("TrendSpy instance created successfully")
 
-            def safe_get_geo():
-                try:
-                    logger.debug(f"Calling TrendSpy API with find: {find}")
-                    data = trends_obj.geo(find=find)
-                    logger.debug(f"Raw API response: {data}")
+            raw_results = await run_trends_call(
+                "geo",
+                lambda: trends_obj.geo(find=find),
+            )
 
-                    if data is None:
-                        logger.warning("TrendSpy API returned no data for geo")
-                        return None
+            if is_empty_result(raw_results):
+                logger.info("Google Trends returned no geo rows")
+                return empty_trends_response("No geo data was returned.")
 
-                    return data
-
-                except Exception as e:
-                    logger.error(f"Error processing geo data: {e}", exc_info=True)
-                    return None
-
-            loop = asyncio.get_event_loop()
-            logger.debug("Executing TrendSpy API call asynchronously")
-            raw_results = await loop.run_in_executor(None, safe_get_geo)
-
-            if raw_results is None:
-                logger.warning("No geo data returned from TrendSpy API")
-                return {"data": [], "message": "No geo data was returned."}
-
-            try:
-                logger.debug("Converting results to JSON-serializable format")
-                data = to_jsonable(raw_results)
-                logger.debug(f"Successfully converted data: {data}")
-                return {"data": data}
-            except Exception as json_err:
-                logger.error(f"Error converting results to JSON: {json_err}", exc_info=True)
-                return {"data": [], "message": "Failed to process geo data."}
+            return {"data": encode_trends_payload("geo", raw_results)}
 
         # Get cached result or fetch and cache
-        return await get_cached_or_fetch(cache_key, fetch_geo)
+        return await cached_trends_response(cache_key, fetch_geo)
 
+    except HTTPException as http_exc:
+        raise http_exc
     except Exception as e:
         logger.error(f"Error in get_geo: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error")

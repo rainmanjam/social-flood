@@ -7,7 +7,15 @@ set -e
 # Default values
 DOCKERFILE="Dockerfile"
 BASE_IMAGE_NAME="python"
-BASE_IMAGE_TAG="3.11-slim-bookworm"
+# Derived from the Dockerfile rather than hardcoded. A literal default silently
+# breaks the moment the Dockerfile's Python version moves: line 79 greps for
+# "FROM $BASE_IMAGE_NAME:$BASE_IMAGE_TAG", so a stale tag matches nothing and
+# the workflow reports success while updating no digest at all. Override with
+# --tag when you genuinely mean a different base.
+BASE_IMAGE_TAG="$(
+  sed -n 's|^FROM[[:space:]]\{1,\}python:\([^@[:space:]]*\).*|\1|p' Dockerfile 2>/dev/null | head -1
+)"
+BASE_IMAGE_TAG="${BASE_IMAGE_TAG:-3.12-slim-bookworm}"
 CHECK_ONLY=false
 
 # Function to display usage information

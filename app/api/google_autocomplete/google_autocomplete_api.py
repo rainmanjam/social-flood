@@ -563,9 +563,18 @@ async def get_autocomplete(
                                 detail=f"Failed to parse response as XML or JSON. Parameter conflict may exist between output={output.value} and client={client.value if client else 'None'}"
                             )
                     else:
-                        # Return raw text if both JSON and XML parsing failed
-                        logger.warning("Both JSON and XML parsing failed, returning raw response")
-                        return {"raw_response": response_text}
+                        # Both parsers failed: the upstream payload is not
+                        # something we can interpret. Returning it as a 200
+                        # with a raw_response field made an upstream format
+                        # change look like a successful call to every client.
+                        logger.error(
+                            "Both JSON and XML parsing failed for autocomplete; "
+                            "first 500 chars: %s", response_text[:500]
+                        )
+                        raise HTTPException(
+                            status_code=502,
+                            detail="Upstream returned a response we could not parse.",
+                        )
             else:
                 # Try XML parsing first for toolbar/XML output formats
                 try:

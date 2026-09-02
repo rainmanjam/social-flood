@@ -1,13 +1,27 @@
+# Reads .env twice, in two different ways:
+#   * `env_file: .env` injects every line VERBATIM into the web container --
+#     no ${VAR} expansion. Write full values in .env, never interpolations.
+#   * `${VAR}` below is expanded by docker compose itself from .env / the shell.
+#
+# .env.example is the source of truth for variable names. The app reads
+# API_KEYS (comma-separated) via app/core/config.py;
+# REDIS_PASSWORD are consumed here and ignored by the app.
 services:
   web:
     build: .
     container_name: social_flood_app
     env_file: .env
+    environment:
+      # `environment:` overrides `env_file:`, so container-only hostnames live
+      # HERE rather than in .env.example. Putting `redis:6379` in the example
+      # file made `cp .env.example .env && uvicorn main:app` return 503 on
+      # every request: the hostname only resolves inside this compose network,
+      # and the rate limiter correctly fails closed when its backend is
+      # unreachable. The example file now stays runnable standalone.
+      REDIS_URL: "redis://:${REDIS_PASSWORD:-changeme}@redis:6379"
     ports:
       - "8000:8000"
     depends_on:
-      db:
-        condition: service_healthy
       redis:
         condition: service_healthy
     deploy:
@@ -25,31 +39,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
-
-  db:
-    image: postgres:16-alpine
-    container_name: social_flood_db
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:?Database user required}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Database password required}
-      POSTGRES_DB: ${POSTGRES_DB:-social_flood}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    deploy:
-      resources:
-        limits:
-          cpus: '1.0'
-          memory: 512M
-        reservations:
-          cpus: '0.25'
-          memory: 128M
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-user} -d ${POSTGRES_DB:-social_flood}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
 
   redis:
     image: redis:7-alpine
@@ -74,5 +63,4 @@ services:
       start_period: 5s
 
 volumes:
-  postgres_data:
   redis_data:

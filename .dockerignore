@@ -1,12 +1,79 @@
 # .dockerignore
+#
+# The Dockerfile ends with `COPY . .`, so anything not excluded here is baked
+# into a published image. Secrets and signing keys MUST stay listed.
+
+# --- Secrets and signing material (never ship these) ---
 .env
-__pycache__
-*.pyc
+.env.*
+*.env
+cosign.key
+cosign.pub
+*.pem
+*.key
+id_rsa*
+secrets/
+
+# --- Version control and CI ---
 .git
+.git*
+.github/
+.gitattributes
 .gitignore
-.vscode
-.DS_Store
+.dockerignore
+
+# --- Python build/cache artifacts ---
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+venv/
+.venv/
+env/
+ENV/
+
+# --- Test, lint and type-check artifacts ---
+tests/
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+.coverage
+coverage/
+htmlcov/
+test_output/
+test_output.txt
+
+# --- Docs and examples (not needed at runtime) ---
+docs/
+examples/
+*.md
+!README.md
+LICENSE
+
+# --- NLTK corpora: the Dockerfile downloads its own copy in the builder stage ---
+nltk_data/
+
+# --- Tooling / editor / OS noise ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
 .ipynb_checkpoints/
-venv/
+.editorconfig
+
+# --- Agent / analysis tool output ---
+.claude/
+.serena/
+.gitnexus/
+.remember/
+graphify-out/
+
+# --- Local compose overrides and scratch ---
+docker-compose.override.yml
+demo_parallel_autocomplete.py
+Makefile
