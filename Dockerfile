@@ -16,7 +16,7 @@
 # update-base-image.yml invokes it with no --tag, so its grep will not match
 # the FROM lines below until that default becomes "3.12-slim-bookworm".
 # python:3.12-slim-bookworm as of 2026-09-01
-FROM python:3.12-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254 AS builder
+FROM python:3.14-slim-bookworm@sha256:9ab8d9c8514b44f90cf0029dd42fdd7e9e211e639c8b995304cc04568dee900f AS builder
 
 WORKDIR /build
 
@@ -49,7 +49,7 @@ RUN python -c "import nltk; \
 # Stage 2: Production - Minimal runtime image with Playwright
 # =============================================================================
 # python:3.12-slim-bookworm as of 2026-09-01 (keep in sync with the builder stage)
-FROM python:3.12-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254 AS production
+FROM python:3.14-slim-bookworm@sha256:9ab8d9c8514b44f90cf0029dd42fdd7e9e211e639c8b995304cc04568dee900f AS production
 
 # Security: Set environment variables early
 ENV PYTHONDONTWRITEBYTECODE=1 \
