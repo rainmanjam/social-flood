@@ -1569,9 +1569,9 @@ starlette==1.7.0 \
     #   -r requirements.txt
     #   fastapi
     #   prometheus-fastapi-instrumentator
-tldextract==5.3.2 \
-    --hash=sha256:6c90d2a259f5c89f4fcf01f97af15708416a59ffedddff006d67222ab30d0fb0 \
-    --hash=sha256:c017431bc0800f2d3d1b57cce36e06668f0930f60a6d8c4615d4e2b8da298fa9
+tldextract==5.4.0 \
+    --hash=sha256:6c9223212c15c25c0da2bf7313893c14f175cb36b64a0c42da67a468e0c61ee3 \
+    --hash=sha256:7f02aed30bd3b6ad5717192eb859a39b20aafc7caf3917d9cf6cb00a58efb34f
     # via
     #   -r requirements.txt
     #   newspaper4k
